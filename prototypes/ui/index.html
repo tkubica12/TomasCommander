@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en" data-theme="dark" data-accent="blue" data-design="commander">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>TomasCommander / UI lab</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header class="lab">
+    <div class="lab-heading"><strong>UI LAB <span>/ 01</span></strong><span class="lab-tag">Design exploration · mock files only</span></div>
+    <nav id="designs" aria-label="Design alternatives"></nav>
+    <div class="lab-actions"><button id="feedback-open">Design notes</button><button id="accent" aria-label="Accent blue; switch to red-orange">Accent: blue</button><button id="theme" aria-label="Switch to light theme">Light mode</button></div>
+  </header>
+  <div class="design-caption"><span id="design-description"></span><span>Same commands. Five different workspaces.</span></div>
+  <main class="workspace">
+    <header class="app-header">
+      <div class="identity"><span class="brand-mark" aria-hidden="true">[t_]</span><div><h1>TomasCommander</h1><span class="app-subtitle">A little more command. A little less friction.</span></div></div>
+      <div class="app-header-actions"><button data-command="reset">Reset demo</button><button data-command="search">Search files <kbd>Ctrl Shift F</kbd></button><button class="accent-button" data-command="palette">Command palette <kbd>Ctrl Shift P</kbd></button></div>
+    </header>
+    <div class="workspace-body">
+      <aside class="places"><div class="eyebrow">PINNED LOCATIONS</div><div id="places-list"></div><div class="rail-note"><span class="eyebrow">LOCAL / SYNTHETIC</span><p>Everything here lives in memory. Your computer's files are never accessed.</p></div></aside>
+      <section class="center" aria-label="File workspace">
+        <div class="context-bar"><span><span class="eyebrow">WORKSPACE</span> Personal / workbench</span><span id="context-count"></span></div>
+        <div class="panes" id="panes">
+          <section class="pane" id="pane-left" aria-label="Left file pane"></section>
+          <div class="divider"><button id="divider" role="slider" aria-label="Left pane width" aria-valuemin="30" aria-valuemax="70" aria-valuenow="50" title="Drag or use Left/Right arrows">‖</button></div>
+          <section class="pane" id="pane-right" aria-label="Right file pane"></section>
+        </div>
+        <div class="action-bar"><div id="file-actions"></div><span class="keyboard-hint">Tab switch pane · Space select · Enter open</span></div>
+      </section>
+      <aside class="inspector"><div class="eyebrow">CONTEXT / ACTIVITY</div><div id="inspection"></div><div class="eyebrow activity-title">RECENT OPERATIONS</div><ol id="activity"></ol></aside>
+    </div>
+    <footer class="statusbar"><span id="status" role="status" aria-live="polite">Ready. Browse with arrows; open with Enter.</span><span class="status-safety">MOCK ADAPTER / NO DISK ACCESS</span></footer>
+    <div class="prompt-dock"><button data-command="palette"><span class="prompt-symbol">&gt;_</span><span>What would you like to do?</span><kbd>Ctrl Shift P</kbd></button></div>
+  </main>
+  <dialog id="modal" aria-labelledby="modal-title"><div class="modal-head"><div><div class="eyebrow" id="modal-label">COMMAND</div><h2 id="modal-title"></h2></div><button id="modal-close" aria-label="Close dialog">Esc / close</button></div><div id="modal-body"></div></dialog>
+  <script type="module" src="app.mjs"></script>
+</body>
+</html>

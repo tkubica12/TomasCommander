@@ -1,0 +1,60 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import {ROOT,createState,entries,navigate,toggle,planOperation,executePlan,search} from "./model.mjs";
+
+test("shared navigation, normalized filtering, selection and search",()=>{
+  const state=createState();
+  navigate(state,0,`${ROOT}\\Pictures`);
+  state.panes[0].filter="dovolena";
+  assert.equal(entries(state,0)[0].name,"Dovolená Srbsko");
+  toggle(state,0,"Dovolená Srbsko");
+  assert.equal(state.panes[0].selected.size,1);
+  assert.equal(search(state,"penta").length,1);
+  assert.equal(search(state,"Dovolene Srbsko",true).length,3);
+  assert.equal(search(state,"nothing-matches").length,0);
+});
+test("copy preserves source, creates destination and rejects collisions",()=>{
+  const state=createState();
+  navigate(state,0,`${ROOT}\\Presentations`);
+  state.panes[0].selected.add("Penta-hackathon-2026.pptx");
+  const plan=planOperation(state,"copy");
+  executePlan(state,plan);
+  const source=state.files[plan.source].find(item=>item.name===plan.names[0]);
+  const destination=state.files[plan.destination].find(item=>item.name===plan.names[0]);
+  assert.deepEqual(destination,source);
+  assert.notEqual(destination,source);
+  state.panes[0].selected.add(plan.names[0]);
+  assert.throws(()=>planOperation(state,"copy"),/Conflict/);
+  assert.throws(()=>executePlan(state,plan),/Workspace changed/);
+});
+test("recursive folder copy and move have correct in-memory effects",()=>{
+  const state=createState();
+  state.panes[0].selected.add("TomasCommander");
+  executePlan(state,planOperation(state,"copy"));
+  assert.ok(state.files[`${ROOT}\\Kosik\\TomasCommander\\prototypes`]);
+  assert.ok(state.files[`${ROOT}\\Projects\\TomasCommander\\prototypes`]);
+  state.panes[0].selected.add("Hackathon");
+  executePlan(state,planOperation(state,"move"));
+  assert.ok(state.files[`${ROOT}\\Kosik\\Hackathon`]);
+  assert.equal(state.files[`${ROOT}\\Projects\\Hackathon`],undefined);
+});
+test("delete, planning cancellation, stale plans and path guards",()=>{
+  const state=createState();
+  const before=JSON.stringify(state.files);
+  state.panes[0].selected.add("TomasCommander");
+  const plan=planOperation(state,"delete");
+  assert.equal(JSON.stringify(state.files),before);
+  executePlan(state,plan);
+  assert.equal(state.files[`${ROOT}\\Projects\\TomasCommander`],undefined);
+  assert.equal(state.files[`${ROOT}\\Projects\\TomasCommander\\prototypes`],undefined);
+  navigate(state,1,state.panes[0].path);
+  state.active=0;
+  assert.throws(()=>planOperation(state,"copy"),/same folder/);
+  navigate(state,1,`${ROOT}\\Projects\\Hackathon`);
+  state.active=0;
+  state.panes[0].selected.add("Hackathon");
+  assert.throws(()=>planOperation(state,"move"),/into itself/);
+  navigate(state,1,`${ROOT}\\Restricted`);
+  state.active=0;
+  assert.throws(()=>planOperation(state,"copy"),/permission denied/);
+});
