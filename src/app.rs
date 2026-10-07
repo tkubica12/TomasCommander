@@ -17,7 +17,62 @@ use tomas_commander::{
     preferences::Preferences,
 };
 
-const ROW_HEIGHT: f32 = 28.0;
+const ROW_HEIGHT: f32 = 29.0;
+const SCROLL_GUTTER: f32 = 12.0;
+
+fn reveal_row(offset: f32, position: usize, viewport_height: f32) -> f32 {
+    let top = position as f32 * ROW_HEIGHT;
+    let bottom = top + ROW_HEIGHT;
+    if top < offset {
+        top
+    } else if bottom > offset + viewport_height {
+        (bottom - viewport_height).max(0.0)
+    } else {
+        offset
+    }
+}
+
+fn tint(surface: Color32, accent: Color32, amount: u8) -> Color32 {
+    let blend = |a: u8, b: u8| {
+        ((u16::from(a) * u16::from(255 - amount) + u16::from(b) * u16::from(amount)) / 255) as u8
+    };
+    Color32::from_rgb(
+        blend(surface.r(), accent.r()),
+        blend(surface.g(), accent.g()),
+        blend(surface.b(), accent.b()),
+    )
+}
+
+struct RowColumns {
+    name: egui::Rect,
+    size: egui::Rect,
+    age: egui::Rect,
+}
+
+impl RowColumns {
+    fn new(rect: egui::Rect) -> Self {
+        let age_width = 48.0;
+        let size_width = 68.0;
+        let right = rect.right() - 10.0;
+        Self {
+            name: egui::Rect::from_min_max(
+                egui::pos2(rect.left() + 56.0, rect.top()),
+                egui::pos2(
+                    (right - age_width - size_width - 16.0).max(rect.left() + 56.0),
+                    rect.bottom(),
+                ),
+            ),
+            size: egui::Rect::from_min_max(
+                egui::pos2(right - age_width - size_width - 8.0, rect.top()),
+                egui::pos2(right - age_width - 8.0, rect.bottom()),
+            ),
+            age: egui::Rect::from_min_max(
+                egui::pos2(right - age_width, rect.top()),
+                egui::pos2(right, rect.bottom()),
+            ),
+        }
+    }
+}
 const ACCENTS: [(&str, [u8; 3], [u8; 3]); 4] = [
     ("Blue", [0, 109, 160], [0, 164, 239]),
     ("Red-orange", [188, 58, 22], [242, 80, 34]),
@@ -36,6 +91,7 @@ struct Pane {
     selected: BTreeSet<PathBuf>,
     anchor: usize,
     scroll_to_focus: bool,
+    scroll_offset: f32,
     busy: bool,
     warning: Option<String>,
 }
@@ -53,6 +109,7 @@ impl Pane {
             selected: BTreeSet::new(),
             anchor: 0,
             scroll_to_focus: false,
+            scroll_offset: 0.0,
             busy: true,
             warning: None,
         }
@@ -77,6 +134,7 @@ impl Pane {
                 .first()
                 .map(|index| self.entries[*index].path.clone());
             self.anchor = 0;
+            self.scroll_to_focus = true;
         }
         self.anchor = self.anchor.min(self.visible.len().saturating_sub(1));
     }
@@ -205,7 +263,9 @@ pub struct Ledger {
     palette_index: usize,
     approval_focus: bool,
     editor_focus: Option<Id>,
+    file_focus_requested: bool,
     left_width: f32,
+    workspace_width: f32,
     resize_requested: bool,
     balance_requested: bool,
     started: Instant,
@@ -343,15 +403,48 @@ impl Ledger {
             palette_index: 0,
             approval_focus: false,
             editor_focus: None,
+            file_focus_requested: false,
             left_width: 450.0,
+            workspace_width: 0.0,
             resize_requested: false,
-            balance_requested: false,
+            balance_requested: true,
             started,
             first_frame: true,
             appearance_dirty: false,
         };
         if app.preferences.favorites.is_empty() {
             app.preferences.favorites.push(initial.clone());
+        }
+        #[cfg(windows)]
+        {
+            let mut fonts = egui::FontDefinitions::default();
+            if let Some(windows) = std::env::var_os("WINDIR") {
+                for (family, name, file) in [
+                    (egui::FontFamily::Proportional, "ledger-sans", "segoeui.ttf"),
+                    (egui::FontFamily::Monospace, "ledger-mono", "consola.ttf"),
+                ] {
+                    let path = PathBuf::from(&windows).join("Fonts").join(file);
+                    match std::fs::read(&path) {
+                        Ok(bytes) => {
+                            fonts
+                                .font_data
+                                .insert(name.into(), Arc::new(egui::FontData::from_owned(bytes)));
+                            fonts
+                                .families
+                                .entry(family)
+                                .or_default()
+                                .insert(0, name.into());
+                        }
+                        Err(error) => app.log(format!(
+                            "Appearance: could not read {}: {error}. Using bundled fallback fonts.",
+                            path.display(),
+                        )),
+                    }
+                }
+                creation.egui_ctx.set_fonts(fonts);
+            } else {
+                app.log("Appearance: WINDIR is not defined. Using bundled fallback fonts.");
+            }
         }
         app.apply_theme(&creation.egui_ctx);
         app.navigate(0, initial.clone());
@@ -381,6 +474,40 @@ impl Ledger {
             Color32::WHITE
         };
         visuals.window_fill = visuals.panel_fill;
+        let border = if self.preferences.dark {
+            Color32::from_gray(54)
+        } else {
+            Color32::from_gray(222)
+        };
+        let muted = if self.preferences.dark {
+            Color32::from_gray(181)
+        } else {
+            Color32::from_gray(86)
+        };
+        visuals.override_text_color = Some(if self.preferences.dark {
+            Color32::from_gray(242)
+        } else {
+            Color32::from_gray(22)
+        });
+        visuals.weak_text_color = Some(muted);
+        visuals.faint_bg_color = if self.preferences.dark {
+            Color32::from_gray(31)
+        } else {
+            Color32::from_gray(249)
+        };
+        visuals.extreme_bg_color = if self.preferences.dark {
+            Color32::from_gray(16)
+        } else {
+            Color32::from_gray(250)
+        };
+        visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0, border);
+        visuals.widgets.inactive.bg_fill = visuals.panel_fill;
+        visuals.widgets.inactive.weak_bg_fill = visuals.panel_fill;
+        visuals.widgets.inactive.bg_stroke = Stroke::new(1.0, border);
+        visuals.widgets.hovered.bg_fill = visuals.faint_bg_color;
+        visuals.widgets.hovered.weak_bg_fill = visuals.faint_bg_color;
+        visuals.widgets.hovered.bg_stroke = Stroke::new(1.0, muted);
+        visuals.widgets.active.bg_stroke = Stroke::new(1.0, color);
         let theme = if self.preferences.dark {
             egui::Theme::Dark
         } else {
@@ -389,8 +516,28 @@ impl Ledger {
         ctx.set_theme(theme);
         ctx.set_visuals(visuals);
         ctx.style_mut_of(theme, |style| {
-            style.spacing.item_spacing = Vec2::new(8.0, 7.0);
-            style.spacing.button_padding = Vec2::new(10.0, 6.0);
+            style.spacing.item_spacing = Vec2::new(8.0, 6.0);
+            style.spacing.button_padding = Vec2::new(10.0, 5.0);
+            style.spacing.interact_size.y = 28.0;
+            style.spacing.scroll.bar_width = 8.0;
+            style.spacing.scroll.bar_inner_margin = 2.0;
+            style.spacing.scroll.bar_outer_margin = 2.0;
+            style.spacing.scroll.floating = false;
+            style
+                .text_styles
+                .insert(egui::TextStyle::Body, egui::FontId::proportional(13.0));
+            style
+                .text_styles
+                .insert(egui::TextStyle::Button, egui::FontId::proportional(12.0));
+            style
+                .text_styles
+                .insert(egui::TextStyle::Monospace, egui::FontId::monospace(12.0));
+            style
+                .text_styles
+                .insert(egui::TextStyle::Small, egui::FontId::proportional(11.0));
+            style
+                .text_styles
+                .insert(egui::TextStyle::Heading, egui::FontId::proportional(18.0));
         });
     }
 
@@ -424,6 +571,8 @@ impl Ledger {
             pane.visible.clear();
             pane.selected.clear();
             pane.focused = None;
+            pane.scroll_offset = 0.0;
+            pane.scroll_to_focus = true;
         }
         pane.busy = true;
         pane.warning = None;
@@ -616,7 +765,9 @@ impl Ledger {
             self.resize_requested = true;
         }
         if ctx.input_mut(|input| input.consume_key(Modifiers::NONE, Key::Tab)) {
+            ctx.memory_mut(|memory| memory.move_focus(egui::FocusDirection::None));
             self.active = 1 - self.active;
+            self.file_focus_requested = true;
         }
         if ctx.input_mut(|input| input.consume_key(Modifiers::NONE, Key::Enter)) {
             self.open_focused();
@@ -656,6 +807,8 @@ impl Ledger {
             {
                 continue;
             }
+            // egui resolves focus traversal from raw input before consume_key.
+            ctx.memory_mut(|memory| memory.move_focus(egui::FocusDirection::None));
             let previous = pane.focus_position();
             let position = match key {
                 Key::ArrowUp => previous.saturating_sub(1),
@@ -673,6 +826,7 @@ impl Ledger {
                 pane.anchor = position;
             }
             pane.scroll_to_focus = true;
+            self.file_focus_requested = true;
         }
     }
 
@@ -801,10 +955,15 @@ impl Ledger {
     fn pane_ui(&mut self, ui: &mut egui::Ui, index: usize) {
         let accent = self.accent();
         let active = self.active == index;
+        let surface = ui.visuals().panel_fill;
+        let muted = ui.visuals().weak_text_color();
+        let stripe = ui.visuals().faint_bg_color;
+        let border = ui.visuals().widgets.noninteractive.bg_stroke;
         let mut parent = false;
         let mut go = false;
         let mut pin = false;
         let mut open = false;
+        ui.spacing_mut().item_spacing.y = 0.0;
         let pane = &mut self.panes[index];
         let editable = self.plan.is_none() && self.error.is_none() && !self.palette;
         if editable {
@@ -814,101 +973,148 @@ impl Ledger {
                 pane.rebuild();
             }
         }
-        ui.horizontal(|ui| {
-            ui.label(
-                RichText::new(if index == 0 {
-                    "01 / LEFT PANE"
-                } else {
-                    "02 / RIGHT PANE"
+        let heading = egui::Frame::new()
+            .fill(stripe)
+            .inner_margin(egui::Margin::symmetric(12, 9))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new(if index == 0 {
+                            "01 / LEFT PANE"
+                        } else {
+                            "02 / RIGHT PANE"
+                        })
+                        .monospace()
+                        .size(11.0)
+                        .color(if active {
+                            accent
+                        } else {
+                            ui.visuals().weak_text_color()
+                        }),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        pin = ui.small_button("+ pin").clicked();
+                        parent = ui
+                            .small_button("..")
+                            .on_hover_text("Parent folder / Backspace")
+                            .clicked();
+                    });
                 })
-                .monospace()
-                .color(if active {
-                    accent
-                } else {
-                    ui.visuals().weak_text_color()
-                }),
+            });
+        if active {
+            let rect = heading.response.rect;
+            ui.painter().rect_filled(
+                egui::Rect::from_min_size(rect.min, Vec2::new(3.0, rect.height())),
+                0.0,
+                accent,
             );
-            if active {
-                ui.label(RichText::new("[active]").monospace().color(accent));
-            }
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                pin = ui.small_button("+ pin").clicked();
-                parent = ui
-                    .small_button("..")
-                    .on_hover_text("Parent folder / Backspace")
-                    .clicked();
-            });
-        });
-        ui.horizontal(|ui| {
-            let response = ui.add(
-                egui::TextEdit::singleline(&mut pane.path_text)
-                    .id(Id::new(("path", index)))
-                    .desired_width(ui.available_width() - 55.0),
-            );
-            if response.has_focus() {
-                self.active = index;
-                self.rail_index = None;
-            }
-            ui.ctx().accesskit_node_builder(response.id, |node| {
-                node.add_action(egui::accesskit::Action::SetValue)
-            });
-            go = ui.button("Go").clicked()
-                || (response.lost_focus() && ui.input(|input| input.key_pressed(Key::Enter)));
-        });
-        ui.horizontal(|ui| {
-            let label = ui.label("Filter");
-            let response = ui
-                .add(
-                    egui::TextEdit::singleline(&mut pane.filter)
-                        .id(Id::new(("filter", index)))
-                        .hint_text("Find in this folder...")
-                        .desired_width(ui.available_width() - 110.0),
-                )
-                .labelled_by(label.id);
-            if response.changed() {
-                pane.rebuild();
-            }
-            ui.ctx().accesskit_node_builder(response.id, |node| {
-                node.add_action(egui::accesskit::Action::SetValue)
-            });
-            if response.has_focus() {
-                self.active = index;
-                self.rail_index = None;
-            }
-            if self.editor_focus == Some(response.id) {
-                response.request_focus();
-                self.editor_focus = None;
-            }
-            let previous = pane.sort;
-            let combo = egui::ComboBox::from_id_salt(("sort", index))
-                .selected_text(match pane.sort {
-                    Sort::Name => "Name",
-                    Sort::Size => "Size",
-                    Sort::Modified => "Modified",
-                })
-                .width(80.0)
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut pane.sort, Sort::Name, "Name");
-                    ui.selectable_value(&mut pane.sort, Sort::Size, "Size");
-                    ui.selectable_value(&mut pane.sort, Sort::Modified, "Modified");
+        }
+        egui::Frame::new()
+            .inner_margin(egui::Margin::symmetric(12, 10))
+            .show(ui, |ui| {
+                ui.spacing_mut().item_spacing.y = 6.0;
+                ui.horizontal(|ui| {
+                    let response = ui.add(
+                        egui::TextEdit::singleline(&mut pane.path_text)
+                            .id(Id::new(("path", index)))
+                            .font(egui::TextStyle::Monospace)
+                            .margin(Vec2::new(7.0, 6.0))
+                            .desired_width((ui.available_width() - 68.0).max(40.0)),
+                    );
+                    if response.has_focus() {
+                        self.active = index;
+                        self.rail_index = None;
+                    }
+                    ui.ctx().accesskit_node_builder(response.id, |node| {
+                        node.add_action(egui::accesskit::Action::SetValue)
+                    });
+                    go = ui.button("Go").clicked()
+                        || (response.lost_focus()
+                            && ui.input(|input| input.key_pressed(Key::Enter)));
                 });
-            if self.editor_focus == Some(Id::new(("sort", index))) {
-                combo.response.request_focus();
-                self.editor_focus = None;
-            }
-            if previous != pane.sort {
-                files::sort_entries(&mut pane.entries, pane.sort);
-                pane.rebuild();
-            }
-        });
-        ui.separator();
-        ui.horizontal(|ui| {
-            ui.label(RichText::new("NAME").monospace().weak());
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.label(RichText::new("SIZE / AGE").monospace().weak());
+                ui.horizontal(|ui| {
+                    let response = ui.add(
+                        egui::TextEdit::singleline(&mut pane.filter)
+                            .id(Id::new(("filter", index)))
+                            .hint_text("Filter this folder...")
+                            .font(egui::TextStyle::Monospace)
+                            .margin(Vec2::new(7.0, 6.0))
+                            .desired_width((ui.available_width() - 105.0).max(40.0)),
+                    );
+                    if response.changed() {
+                        pane.rebuild();
+                    }
+                    ui.ctx().accesskit_node_builder(response.id, |node| {
+                        node.set_label(if index == 0 {
+                            "Filter left pane"
+                        } else {
+                            "Filter right pane"
+                        });
+                        node.add_action(egui::accesskit::Action::SetValue)
+                    });
+                    if response.has_focus() {
+                        self.active = index;
+                        self.rail_index = None;
+                    }
+                    if self.editor_focus == Some(response.id) {
+                        response.request_focus();
+                        self.editor_focus = None;
+                    }
+                    let previous = pane.sort;
+                    let combo = egui::ComboBox::from_id_salt(("sort", index))
+                        .selected_text(match pane.sort {
+                            Sort::Name => "Name",
+                            Sort::Size => "Size",
+                            Sort::Modified => "Modified",
+                        })
+                        .width(80.0)
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut pane.sort, Sort::Name, "Name");
+                            ui.selectable_value(&mut pane.sort, Sort::Size, "Size");
+                            ui.selectable_value(&mut pane.sort, Sort::Modified, "Modified");
+                        });
+                    if self.editor_focus == Some(Id::new(("sort", index))) {
+                        combo.response.request_focus();
+                        self.editor_focus = None;
+                    }
+                    if previous != pane.sort {
+                        files::sort_entries(&mut pane.entries, pane.sort);
+                        pane.rebuild();
+                    }
+                });
             });
+        let (head, head_response) =
+            ui.allocate_exact_size(Vec2::new(ui.available_width(), 26.0), egui::Sense::hover());
+        head_response.widget_info(|| {
+            egui::WidgetInfo::labeled(
+                egui::WidgetType::Label,
+                ui.is_enabled(),
+                "NAME / SIZE / AGE",
+            )
         });
-        ui.separator();
+        ui.painter().rect_filled(head, 0.0, stripe);
+        ui.painter().hline(head.x_range(), head.top(), border);
+        ui.painter().hline(head.x_range(), head.bottom(), border);
+        let mut head_content = head;
+        head_content.max.x -= SCROLL_GUTTER;
+        let columns = RowColumns::new(head_content);
+        for (rect, text, align) in [
+            (columns.name, "NAME", egui::Align2::LEFT_CENTER),
+            (columns.size, "SIZE", egui::Align2::RIGHT_CENTER),
+            (columns.age, "AGE", egui::Align2::RIGHT_CENTER),
+        ] {
+            ui.painter().text(
+                if align == egui::Align2::LEFT_CENTER {
+                    rect.left_center()
+                } else {
+                    rect.right_center()
+                },
+                align,
+                text,
+                egui::FontId::monospace(10.0),
+                muted,
+            );
+        }
         if pane.busy {
             ui.horizontal(|ui| {
                 ui.spinner();
@@ -919,121 +1125,226 @@ impl Ledger {
             ui.label(RichText::new("PARTIAL / ERROR").color(accent));
             ui.label(warning);
         }
-        let height = (ui.available_height() - 35.0).max(70.0);
+        let height = (ui.available_height() - 32.0).max(50.0);
         let mut scroll = egui::ScrollArea::vertical()
             .id_salt(("rows", index))
             .auto_shrink([false, false])
+            .animated(false)
+            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
             .max_height(height);
         if pane.scroll_to_focus {
-            scroll = scroll.vertical_scroll_offset(
-                pane.focus_position().saturating_sub(3) as f32
-                    * (ROW_HEIGHT + ui.spacing().item_spacing.y),
-            );
+            scroll = scroll.vertical_scroll_offset(reveal_row(
+                pane.scroll_offset,
+                pane.focus_position(),
+                height,
+            ));
             pane.scroll_to_focus = false;
         }
-        scroll.show_rows(ui, ROW_HEIGHT, pane.visible.len(), |ui, range| {
-            for position in range {
-                let entry_index = pane.visible[position];
-                let entry = &pane.entries[entry_index];
-                let path = entry.path.clone();
-                let focused = pane.focused.as_ref() == Some(&path);
-                let selected = pane.selected.contains(&path);
-                let name = entry.name.clone();
-                let label = format!(
-                    "{} {name}{}",
-                    if entry.link {
-                        "[link]"
-                    } else if entry.directory {
-                        "[/]"
-                    } else {
-                        "[.]"
-                    },
-                    if selected { "  [selected]" } else { "" }
-                );
-                let size = if entry.directory {
-                    "<DIR>".into()
-                } else {
-                    format_size(entry.size)
-                };
-                let age = entry
-                    .modified
-                    .and_then(|time| SystemTime::now().duration_since(time).ok())
-                    .map(|age| format!("{}d", age.as_secs() / 86400))
-                    .unwrap_or_else(|| "unknown".into());
-                ui.push_id(&path, |ui| {
-                    ui.horizontal(|ui| {
-                        let mut checked = selected;
-                        let checkbox = ui
-                            .checkbox(&mut checked, "")
-                            .on_hover_text(format!("Select {name}"));
-                        if checkbox.changed() {
-                            if checked {
-                                pane.selected.insert(path.clone());
-                            } else {
-                                pane.selected.remove(&path);
+        let output = ui
+            .scope(|ui| {
+                ui.spacing_mut().item_spacing.y = 0.0;
+                scroll.show_rows(ui, ROW_HEIGHT, pane.visible.len(), |ui, range| {
+                    for position in range {
+                        let entry_index = pane.visible[position];
+                        let entry = &pane.entries[entry_index];
+                        let path = entry.path.clone();
+                        let focused = pane.focused.as_ref() == Some(&path);
+                        let selected = pane.selected.contains(&path);
+                        let name = entry.name.clone();
+                        let icon = if entry.link {
+                            "[link]"
+                        } else if entry.directory {
+                            "[/]"
+                        } else {
+                            "[.]"
+                        };
+                        let label = format!("{icon} {name}");
+                        let size = if entry.directory {
+                            "<DIR>".into()
+                        } else {
+                            format_size(entry.size)
+                        };
+                        let age = entry
+                            .modified
+                            .and_then(|time| SystemTime::now().duration_since(time).ok())
+                            .map(|age| format!("{}d", age.as_secs() / 86400))
+                            .unwrap_or_else(|| "unknown".into());
+                        ui.push_id(&path, |ui| {
+                            let (rect, _) = ui.allocate_exact_size(
+                                Vec2::new(ui.available_width(), ROW_HEIGHT),
+                                egui::Sense::hover(),
+                            );
+                            let row = egui::Rect::from_min_max(
+                                egui::pos2(rect.left() + 30.0, rect.top()),
+                                rect.max,
+                            );
+                            let response = ui
+                                .interact(row, ui.id().with("file"), egui::Sense::click())
+                                .on_hover_text(path.display().to_string());
+                            response.widget_info(|| {
+                                egui::WidgetInfo::selected(
+                                    egui::WidgetType::Button,
+                                    ui.is_enabled(),
+                                    selected,
+                                    &label,
+                                )
+                            });
+                            if focused && active && editable && self.file_focus_requested {
+                                response.request_focus();
+                                self.file_focus_requested = false;
                             }
-                            self.active = index;
-                        }
-                        let width = (ui.available_width() - 100.0).max(100.0);
-                        let response = ui.add_sized(
-                            [width, ROW_HEIGHT],
-                            egui::Button::new(RichText::new(label).monospace())
-                                .selected(selected || focused && active)
-                                .frame(false)
-                                .wrap_mode(egui::TextWrapMode::Truncate),
-                        );
-                        if response.clicked() {
-                            self.active = index;
-                            self.rail_index = None;
-                            pane.focused = Some(path.clone());
-                            let modifiers = ui.input(|input| input.modifiers);
-                            if modifiers.ctrl {
-                                if !pane.selected.remove(&path) {
-                                    pane.selected.insert(path.clone());
-                                }
-                            } else if modifiers.shift {
-                                pane.selected = (pane.anchor.min(position)
-                                    ..=pane.anchor.max(position))
-                                    .filter_map(|position| pane.visible.get(position))
-                                    .map(|index| pane.entries[*index].path.clone())
-                                    .collect();
+                            ui.ctx().accesskit_node_builder(response.id, |node| {
+                                node.set_description(format!(
+                                    "{size}, age {age}{}",
+                                    if focused && active {
+                                        ", current file"
+                                    } else {
+                                        ""
+                                    }
+                                ));
+                            });
+                            let fill = if selected {
+                                tint(surface, accent, if focused && active { 40 } else { 28 })
+                            } else if focused || response.hovered() || position % 2 == 1 {
+                                stripe
                             } else {
+                                surface
+                            };
+                            ui.painter().rect_filled(rect, 0.0, fill);
+                            if focused {
+                                ui.painter().rect_stroke(
+                                    rect.shrink(0.5),
+                                    0.0,
+                                    if active {
+                                        Stroke::new(1.0, accent)
+                                    } else {
+                                        border
+                                    },
+                                    egui::StrokeKind::Inside,
+                                );
+                            }
+                            let mut checked = selected;
+                            let checkbox = ui
+                                .place(
+                                    egui::Rect::from_center_size(
+                                        egui::pos2(rect.left() + 16.0, rect.center().y),
+                                        Vec2::splat(28.0),
+                                    ),
+                                    egui::Checkbox::without_text(&mut checked),
+                                )
+                                .on_hover_text(format!("Select {name}"));
+                            checkbox.widget_info(|| {
+                                egui::WidgetInfo::selected(
+                                    egui::WidgetType::Checkbox,
+                                    ui.is_enabled(),
+                                    checked,
+                                    format!("Select {name}"),
+                                )
+                            });
+                            if checkbox.changed() {
+                                if checked {
+                                    pane.selected.insert(path.clone());
+                                } else {
+                                    pane.selected.remove(&path);
+                                }
+                                self.active = index;
+                                self.rail_index = None;
+                                pane.focused = Some(path.clone());
                                 pane.anchor = position;
                             }
-                        }
-                        if response.double_clicked() {
-                            self.active = index;
-                            pane.focused = Some(path.clone());
-                            open = true;
-                        }
+                            let columns = RowColumns::new(rect);
+                            ui.painter().text(
+                                egui::pos2(rect.left() + 32.0, rect.center().y),
+                                egui::Align2::LEFT_CENTER,
+                                if entry.link { "@" } else { icon },
+                                egui::FontId::monospace(10.0),
+                                if entry.directory { accent } else { muted },
+                            );
+                            ui.scope_builder(
+                                egui::UiBuilder::new()
+                                    .max_rect(columns.name)
+                                    .layout(egui::Layout::left_to_right(egui::Align::Center)),
+                                |ui| {
+                                    ui.add(
+                                        egui::Label::new(
+                                            RichText::new(&name).monospace().size(12.0),
+                                        )
+                                        .truncate(),
+                                    );
+                                },
+                            );
+                            for (rect, text) in [(columns.size, &size), (columns.age, &age)] {
+                                ui.painter().text(
+                                    rect.right_center(),
+                                    egui::Align2::RIGHT_CENTER,
+                                    text,
+                                    egui::FontId::monospace(11.0),
+                                    muted,
+                                );
+                            }
+                            if response.clicked() {
+                                self.active = index;
+                                self.rail_index = None;
+                                pane.focused = Some(path.clone());
+                                let modifiers = ui.input(|input| input.modifiers);
+                                if modifiers.ctrl {
+                                    if !pane.selected.remove(&path) {
+                                        pane.selected.insert(path.clone());
+                                    }
+                                } else if modifiers.shift {
+                                    pane.selected = (pane.anchor.min(position)
+                                        ..=pane.anchor.max(position))
+                                        .filter_map(|position| pane.visible.get(position))
+                                        .map(|index| pane.entries[*index].path.clone())
+                                        .collect();
+                                } else {
+                                    pane.anchor = position;
+                                }
+                            }
+                            if response.double_clicked() {
+                                self.active = index;
+                                pane.focused = Some(path.clone());
+                                open = true;
+                            }
+                        });
+                    }
+                    if pane.visible.is_empty() && !pane.busy {
+                        ui.label(if pane.filter.is_empty() {
+                            "Empty folder"
+                        } else {
+                            "No matching names"
+                        });
+                    }
+                })
+            })
+            .inner;
+        pane.scroll_offset = output.state.offset.y;
+        ui.painter()
+            .hline(ui.max_rect().x_range(), ui.cursor().top(), border);
+        egui::Frame::new()
+            .inner_margin(egui::Margin::symmetric(12, 6))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new(format!(
+                            "{} visible / {} selected",
+                            pane.visible.len(),
+                            pane.selected.len()
+                        ))
+                        .monospace()
+                        .small()
+                        .weak(),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.label(
-                            RichText::new(format!("{size} / {age}"))
+                            RichText::new(if active { "READY / FOCUSED" } else { "READY" })
                                 .monospace()
-                                .small()
-                                .weak(),
+                                .size(10.0)
+                                .color(if active { accent } else { muted }),
                         );
                     });
-                });
-            }
-            if pane.visible.is_empty() && !pane.busy {
-                ui.label(if pane.filter.is_empty() {
-                    "Empty folder"
-                } else {
-                    "No matching names"
-                });
-            }
-        });
-        ui.separator();
-        ui.label(
-            RichText::new(format!(
-                "{} visible / {} selected",
-                pane.visible.len(),
-                pane.selected.len()
-            ))
-            .monospace()
-            .small()
-            .weak(),
-        );
+                })
+            });
         if go {
             self.active = index;
             self.navigate(index, PathBuf::from(self.panes[index].path_text.trim()));
@@ -1060,6 +1371,18 @@ impl Ledger {
             let modal = egui::Modal::new(Id::new("palette")).show(ctx, |ui| {
                 ui.set_width(580.0);
                 ui.heading("Command palette / Ctrl Shift P");
+                let query_id = Id::new("palette-query");
+                let keyboard = ui.memory(|memory| memory.has_focus(query_id));
+                let enter = keyboard
+                    && ui.input_mut(|input| input.consume_key(Modifiers::NONE, Key::Enter));
+                if keyboard {
+                    if ui.input_mut(|input| input.consume_key(Modifiers::NONE, Key::ArrowDown)) {
+                        self.palette_index += 1;
+                    }
+                    if ui.input_mut(|input| input.consume_key(Modifiers::NONE, Key::ArrowUp)) {
+                        self.palette_index = self.palette_index.saturating_sub(1);
+                    }
+                }
                 if accessible_text_value(
                     ui.ctx(),
                     Id::new("palette-query"),
@@ -1069,7 +1392,7 @@ impl Ledger {
                 }
                 let response = ui.add(
                     egui::TextEdit::singleline(&mut self.palette_query)
-                        .id(Id::new("palette-query"))
+                        .id(query_id)
                         .hint_text("Find a command...")
                         .desired_width(f32::INFINITY),
                 );
@@ -1088,30 +1411,30 @@ impl Ledger {
                     .iter()
                     .filter(|(_, name, _)| name.to_lowercase().contains(&query))
                     .collect();
-                if response.has_focus() {
-                    if ui.input_mut(|input| input.consume_key(Modifiers::NONE, Key::ArrowDown)) {
-                        self.palette_index += 1;
-                    }
-                    if ui.input_mut(|input| input.consume_key(Modifiers::NONE, Key::ArrowUp)) {
-                        self.palette_index = self.palette_index.saturating_sub(1);
-                    }
-                }
                 self.palette_index = self.palette_index.min(matches.len().saturating_sub(1));
-                for (index, (command, name, hint)) in matches.iter().enumerate() {
-                    if ui
-                        .add(
-                            egui::Button::new(format!("{name}    {hint}"))
-                                .selected(index == self.palette_index),
-                        )
-                        .clicked()
-                    {
-                        chosen = Some(*command);
-                    }
-                }
-                if response.has_focus()
-                    && ui.input_mut(|input| input.consume_key(Modifiers::NONE, Key::Enter))
-                    && let Some((command, _, _)) = matches.get(self.palette_index)
-                {
+                egui::ScrollArea::vertical()
+                    .id_salt("palette-commands")
+                    .max_height(300.0)
+                    .show(ui, |ui| {
+                        for (index, (command, name, hint)) in matches.iter().enumerate() {
+                            let response = ui.add(
+                                egui::Button::new(*name)
+                                    .shortcut_text(RichText::new(*hint).monospace().size(11.0))
+                                    .min_size(Vec2::new(ui.available_width(), 32.0))
+                                    .selected(index == self.palette_index),
+                            );
+                            ui.ctx().accesskit_node_builder(response.id, |node| {
+                                node.set_label(format!("{name}    {hint}"));
+                            });
+                            if index == self.palette_index {
+                                response.scroll_to_me(None);
+                            }
+                            if response.clicked() {
+                                chosen = Some(*command);
+                            }
+                        }
+                    });
+                if enter && let Some((command, _, _)) = matches.get(self.palette_index) {
                     chosen = Some(*command);
                 }
                 ui.separator();
@@ -1210,50 +1533,53 @@ impl eframe::App for Ledger {
                 self.started.elapsed().as_secs_f64() * 1000.0
             ));
         }
-        egui::Panel::top("header").show(ui, |ui| {
-            ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                ui.label(
-                    RichText::new("[t_]")
-                        .monospace()
-                        .size(27.0)
-                        .color(self.accent()),
-                );
-                ui.vertical(|ui| {
-                    ui.heading("TomasCommander");
+        egui::Panel::top("header")
+            .frame(
+                egui::Frame::new()
+                    .fill(ui.visuals().panel_fill)
+                    .inner_margin(egui::Margin::symmetric(18, 14)),
+            )
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
                     ui.label(
-                        RichText::new("LEDGER / NATIVE RUST")
+                        RichText::new("[t_]")
                             .monospace()
-                            .small()
-                            .weak(),
+                            .size(23.0)
+                            .color(self.accent()),
                     );
-                });
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("Commands  Ctrl Shift P").clicked() {
-                        self.palette = true;
-                        self.palette_focus = true;
-                        self.palette_query.clear();
-                    }
-                    if ui
-                        .button(if self.preferences.dark {
-                            "Light mode"
-                        } else {
-                            "Dark mode"
-                        })
-                        .clicked()
-                    {
-                        self.dispatch(Command::Theme);
-                    }
-                    if ui
-                        .button(format!("Accent: {}", ACCENTS[self.preferences.accent].0))
-                        .clicked()
-                    {
-                        self.dispatch(Command::Accent);
-                    }
+                    ui.vertical(|ui| {
+                        ui.heading("TomasCommander");
+                        ui.label(
+                            RichText::new("A little more command. A little less friction.")
+                                .small()
+                                .weak(),
+                        );
+                    });
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("Commands  Ctrl Shift P").clicked() {
+                            self.palette = true;
+                            self.palette_focus = true;
+                            self.palette_query.clear();
+                        }
+                        if ui
+                            .button(if self.preferences.dark {
+                                "Light mode"
+                            } else {
+                                "Dark mode"
+                            })
+                            .clicked()
+                        {
+                            self.dispatch(Command::Theme);
+                        }
+                        if ui
+                            .button(format!("Accent: {}", ACCENTS[self.preferences.accent].0))
+                            .clicked()
+                        {
+                            self.dispatch(Command::Accent);
+                        }
+                    });
                 });
             });
-            ui.add_space(8.0);
-        });
         egui::Panel::bottom("status").show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.label(RichText::new(&self.status).monospace().small());
@@ -1293,20 +1619,31 @@ impl eframe::App for Ledger {
                         self.dispatch(command);
                     }
                 }
-                ui.label(
-                    RichText::new("Tab pane / Space select / Enter folder")
-                        .small()
-                        .weak(),
-                );
+                if ui.available_width() > 220.0 {
+                    ui.label(
+                        RichText::new("Tab pane / Space select / Enter folder")
+                            .small()
+                            .weak(),
+                    );
+                }
             });
         });
         egui::Panel::left("context-rail")
             .resizable(true)
             .default_size(175.0)
             .size_range(145.0..=300.0)
+            .frame(
+                egui::Frame::new()
+                    .fill(ui.visuals().extreme_bg_color)
+                    .inner_margin(egui::Margin::symmetric(12, 16)),
+            )
             .show(ui, |ui| {
-                ui.add_space(10.0);
-                ui.label(RichText::new("CONTEXT PANEL").monospace().small().weak());
+                ui.label(
+                    RichText::new("WORKSPACE / LEDGER")
+                        .monospace()
+                        .size(10.0)
+                        .weak(),
+                );
                 ui.horizontal(|ui| {
                     ui.selectable_value(&mut self.rail, Rail::Favorites, "Places");
                     ui.selectable_value(&mut self.rail, Rail::Activity, "Activity");
@@ -1314,6 +1651,14 @@ impl eframe::App for Ledger {
                 ui.separator();
                 match self.rail {
                     Rail::Favorites => {
+                        ui.add_space(8.0);
+                        ui.label(
+                            RichText::new("PINNED LOCATIONS")
+                                .monospace()
+                                .size(10.0)
+                                .weak(),
+                        );
+                        ui.add_space(6.0);
                         let mut target = None;
                         for (index, path) in self.preferences.favorites.iter().enumerate() {
                             let name = path
@@ -1323,6 +1668,10 @@ impl eframe::App for Ledger {
                             if ui
                                 .add(
                                     egui::Button::new(format!("/ {name}"))
+                                        .right_text("")
+                                        .min_size(Vec2::new(ui.available_width(), 30.0))
+                                        .truncate()
+                                        .frame(false)
                                         .selected(self.rail_index == Some(index)),
                                 )
                                 .on_hover_text(path.display().to_string())
@@ -1336,12 +1685,12 @@ impl eframe::App for Ledger {
                             self.navigate(self.active, target);
                         }
 
-                        ui.add_space(15.0);
+                        ui.add_space(25.0);
                         if ui.button("+ Pin active folder").clicked() {
                             self.dispatch(Command::Pin);
                         }
                         ui.label(
-                            RichText::new("This rail is contextual, not limited to favorites.")
+                            RichText::new("Places for navigation.\nActivity for exact outcomes.")
                                 .small()
                                 .weak(),
                         );
@@ -1382,6 +1731,11 @@ impl eframe::App for Ledger {
                 }
             });
         let remaining = ui.available_width();
+        if self.workspace_width > 0.0 && (remaining - self.workspace_width).abs() > 1.0 {
+            self.left_width *= remaining / self.workspace_width;
+            self.resize_requested = true;
+        }
+        self.workspace_width = remaining;
         if self.balance_requested {
             self.left_width = remaining / 2.0;
         }
@@ -1395,15 +1749,18 @@ impl eframe::App for Ledger {
         }
         let left = egui::Panel::left("left-files")
             .resizable(true)
+            .frame(egui::Frame::new().fill(ui.visuals().panel_fill))
             .default_size(self.left_width)
             .size_range(230.0..=(remaining - 230.0).max(230.0))
             .show(ui, |ui| {
                 self.pane_ui(ui, 0);
             });
         self.left_width = left.response.rect.width();
-        egui::CentralPanel::default().show(ui, |ui| {
-            self.pane_ui(ui, 1);
-        });
+        egui::CentralPanel::default()
+            .frame(egui::Frame::new().fill(ui.visuals().panel_fill))
+            .show(ui, |ui| {
+                self.pane_ui(ui, 1);
+            });
         self.dialogs(&ctx);
     }
 }
@@ -1522,5 +1879,40 @@ mod tests {
         pane.rebuild();
         assert_eq!(pane.focus_position(), 1);
         assert_eq!(pane.targets(), vec![PathBuf::from("Zulu")]);
+    }
+
+    #[test]
+    fn visible_keyboard_navigation_does_not_scroll() {
+        for position in 0..10 {
+            assert_eq!(reveal_row(0.0, position, ROW_HEIGHT * 10.0), 0.0);
+        }
+        assert_eq!(
+            reveal_row(ROW_HEIGHT * 5.0, 8, ROW_HEIGHT * 10.0),
+            ROW_HEIGHT * 5.0
+        );
+    }
+
+    #[test]
+    fn keyboard_navigation_reveals_only_the_hidden_row() {
+        assert_eq!(reveal_row(0.0, 10, ROW_HEIGHT * 10.0), ROW_HEIGHT);
+        assert_eq!(
+            reveal_row(ROW_HEIGHT * 5.0, 4, ROW_HEIGHT * 10.0),
+            ROW_HEIGHT * 4.0
+        );
+        assert_eq!(reveal_row(0.0, 239, ROW_HEIGHT * 10.0), ROW_HEIGHT * 230.0);
+        assert_eq!(reveal_row(ROW_HEIGHT * 230.0, 0, ROW_HEIGHT * 10.0), 0.0);
+    }
+
+    #[test]
+    fn file_columns_fit_narrow_panes_without_overlapping() {
+        for width in [230.0, 350.0, 600.0] {
+            let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(width, ROW_HEIGHT));
+            let columns = RowColumns::new(rect);
+            assert_eq!(columns.name.left(), 56.0);
+            assert!(columns.name.width() >= 0.0);
+            assert!(columns.name.right() < columns.size.left());
+            assert!(columns.size.right() < columns.age.left());
+            assert_eq!(columns.age.right(), width - 10.0);
+        }
     }
 }

@@ -203,6 +203,38 @@ Physical CZ/US keyboards, pixel/DPI/driver coverage, agreed performance threshol
 actual VS Code workspace read-back and supported Copilot session launch remain
 unverified. AI/MCP/voice providers are not connected.
 
+## Ledger polish follow-up
+
+The original rendered alternative 02 remains the visual reference. The native
+layout now separates checkbox/icon/name/size/age into fixed columns: filenames
+are left-aligned and truncated, metadata right-aligned, and the header uses the
+same column coordinates as the virtualized rows. Both panes start balanced.
+Fixed 29-point striped rows distinguish selection tint from keyboard focus
+without changing the filename text or its geometry. Segoe UI/Consolas are read
+once from Windows fonts, with visible Activity warnings and bundled fallback.
+
+The earlier implementation centered filename buttons, mixed size/age into a
+variable-width label, and forcibly repositioned scrolling to three rows before
+the focused item on every arrow press. That made visible content slide even when
+focus remained inside the viewport. Navigation now minimally reveals only an
+offscreen row, without scroll-to animation, and reserves a stable scrollbar
+gutter. Filtering requests a reveal when focus changes. Palette navigation/Enter
+is consumed before the text editor can swallow the key or surrender focus, and
+its command list scrolls inside a bounded modal rather than exceeding the window.
+Native input testing also exposed egui's raw-input focus traversal continuing
+after consumed Tab/arrows. File navigation now cancels that separate traversal
+and gives accessibility focus to the current file, so switching panes cannot
+accidentally move input into a path editor. Text-editor traversal is unchanged.
+
+`tests\native-visual.ps1` complements (not replaces) the accessibility smoke with
+foreground-guarded Windows keyboard/mouse input, app-client-only PNG captures and
+stationary-row geometry assertions on 242 real synthetic entries. Captures must
+be inspected visually; successful UIA invocation alone is not pixel evidence.
+The script inventories and removes its own exact files/directories. No new
+production dependencies, browser runtime, service mocks or safety changes were
+introduced. Full APP-01, FILE-01, physical-keyboard/DPI/driver and performance gates,
+and the AI/MCP/voice integration statuses remain outstanding.
+
 ## Evidence manifest
 
 Scope: public primary technical documentation, implementation/release and license
