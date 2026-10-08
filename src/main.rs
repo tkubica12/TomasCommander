@@ -53,15 +53,24 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .join("preferences.txt")
         }
     };
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_inner_size([1240.0, 800.0])
+        .with_min_inner_size(app::MIN_WINDOW_SIZE);
+    #[cfg(windows)]
+    {
+        viewport = viewport.with_icon(egui::IconData {
+            rgba: tomas_commander::APP_ICON_RGBA.to_vec(),
+            width: 128,
+            height: 128,
+        });
+    }
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1240.0, 800.0])
-            .with_min_inner_size([880.0, 560.0]),
+        viewport,
         renderer: eframe::Renderer::Glow,
         ..Default::default()
     };
     eframe::run_native(
-        "TomasCommander - Ledger",
+        "Tomas Commander",
         options,
         Box::new(move |creation| {
             Ok(Box::new(app::Ledger::new(

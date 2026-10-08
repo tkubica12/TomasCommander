@@ -41,15 +41,20 @@ function Button([string]$Name) {
 function Invoke-Button([string]$Name) {
     $element = Button $Name
     if ($null -eq $element) { throw "Actual native button not found: $Name" }
-    $pattern = $element.GetCurrentPattern([Windows.Automation.InvokePattern]::Pattern)
-    $pattern.Invoke()
+    $pattern = $null
+    if ($element.TryGetCurrentPattern([Windows.Automation.InvokePattern]::Pattern, [ref]$pattern)) {
+        $pattern.Invoke()
+    } elseif ($element.TryGetCurrentPattern([Windows.Automation.TogglePattern]::Pattern, [ref]$pattern)) {
+        $pattern.Toggle()
+    } else { throw "Actual native button has no supported activation pattern: $Name" }
     Start-Sleep -Milliseconds 200
 }
 
 function Wait-Button([string]$Name) {
     for ($attempt = 0; $attempt -lt 100; $attempt++) {
-        if ($null -ne (Button $Name)) { return }
+        $process.Refresh()
         if ($process.HasExited) { throw "Native process exited with $($process.ExitCode)" }
+        if ($process.MainWindowHandle -ne [IntPtr]::Zero -and $null -ne (Button $Name)) { return }
         Start-Sleep -Milliseconds 100
     }
     throw "Native button did not appear: $Name"
@@ -74,6 +79,9 @@ try {
     $destination = Join-Path $root 'Destination with spaces'
     [IO.Directory]::CreateDirectory($destination) | Out-Null
     $owned.Add($destination)
+    $empty = Join-Path $root 'Empty'
+    [IO.Directory]::CreateDirectory($empty) | Out-Null
+    $owned.Add($empty)
     $source = Join-Path $root 'source.txt'
     [IO.File]::WriteAllText($source, 'real native UI fixture')
     $owned.Add($source)
@@ -93,11 +101,21 @@ try {
     Assert-Check ($process.MainWindowHandle -ne [IntPtr]::Zero) 'Real standalone Windows window'
     $window = [Windows.Automation.AutomationElement]::FromHandle($process.MainWindowHandle)
     Wait-Button 'Light mode'
+    Wait-Button '[.] source.txt'
     $startup = $clock.Elapsed.TotalMilliseconds
-    Assert-Check ($null -ne (Button 'Copy  Ctrl Shift C')) 'AccessKit exposes actual file commands'
+    Assert-Check ($null -ne (Button 'Copy')) 'AccessKit exposes actual file commands'
     Assert-Check (@((Elements) | Where-Object {
         $_.Current.Name -eq 'FIXTURE BOUNDARY ENFORCED'
     }).Count -gt 0) 'Native fixture-boundary indicator'
+    Set-Edit 0 $empty
+    $go = @((Elements) | Where-Object { $_.Current.Name -eq 'Go' })
+    $go[0].GetCurrentPattern([Windows.Automation.InvokePattern]::Pattern).Invoke()
+    Wait-Button '[/] .. / Parent folder'
+    Assert-Check (@((Elements) | Where-Object { $_.Current.Name -eq '0 visible / 0 selected' }).Count -gt 0) 'Empty folder exposes parent navigation without counting it as an item'
+    Set-Edit 0 $root
+    $go = @((Elements) | Where-Object { $_.Current.Name -eq 'Go' })
+    $go[0].GetCurrentPattern([Windows.Automation.InvokePattern]::Pattern).Invoke()
+    Wait-Button '[/] .. / Parent unavailable'
     Start-Sleep -Seconds 2
     $process.Refresh()
     $cpuBefore = $process.TotalProcessorTime.TotalMilliseconds
@@ -127,32 +145,48 @@ try {
     Set-Edit 1 'source.txt'
     Wait-Button '[.] source.txt'
     Assert-Check ($null -ne (Button '[.] source.txt')) 'Real file listing and name filtering'
-    Invoke-Button 'Copy  Ctrl Shift C'
-    Wait-Button 'Approve Copy / Ctrl Enter'
+    Assert-Check ($null -ne (Button '[/] .. / Parent unavailable')) 'Filtered fixture root retains the unavailable navigation row'
+    (Button 'Select source.txt').GetCurrentPattern([Windows.Automation.TogglePattern]::Pattern).Toggle()
+    Start-Sleep -Milliseconds 200
+    Invoke-Button 'Copy'
+    Wait-Button 'Confirm Copy'
     Assert-Check (-not [IO.File]::Exists($copied)) 'Copy has no effects before native approval'
-    Invoke-Button 'Approve Copy / Ctrl Enter'
+    Invoke-Button 'Confirm Copy'
     for ($attempt = 0; $attempt -lt 100 -and -not [IO.File]::Exists($copied); $attempt++) {
         Start-Sleep -Milliseconds 100
     }
     Assert-Check ([IO.File]::ReadAllText($copied) -eq [IO.File]::ReadAllText($source)) 'Native UI copy preserves actual bytes and source'
-    Wait-Button 'Copy  Ctrl Shift C'
+    Wait-Button 'Copy'
     Start-Sleep -Milliseconds 400
-    Invoke-Button 'Commands  Ctrl Shift P'
+    Invoke-Button 'Commands'
     Wait-Button 'Command palette / Ctrl Shift P'
     Assert-Check ($null -ne (Button 'Copy to opposite pane    Ctrl Shift C')) 'Real deterministic command palette'
     Invoke-Button 'Close / Escape'
-    Invoke-Button 'Move  Ctrl Shift M'
+    Invoke-Button 'Move'
     Wait-Button 'Acknowledge / Escape'
     Assert-Check ([IO.File]::ReadAllText($source) -eq 'real native UI fixture') 'Move conflict refuses overwriting copied destination'
     Invoke-Button 'Acknowledge / Escape'
+    $pins = @((Elements) | Where-Object { $_.Current.Name -eq '+ pin' })
+    $pins[1].GetCurrentPattern([Windows.Automation.InvokePattern]::Pattern).Invoke()
     Invoke-Button 'Dark mode'
     $process.CloseMainWindow() | Out-Null
     if (-not $process.WaitForExit(10000)) { throw 'Native window did not close normally' }
     Assert-Check ($process.ExitCode -eq 0) 'Native application exits normally'
     Assert-Check ([IO.File]::ReadAllText($settings).Contains('dark=true')) 'Immediate close flushes the latest appearance preference to the real settings file'
+    Assert-Check ([IO.File]::ReadAllText($settings).Contains('Destination with spaces')) 'Actual favorite persisted before close'
+    $process = Start-Process -FilePath (Resolve-Path -LiteralPath $Executable).Path `
+        -ArgumentList @('--fixture-root', "`"$root`"", '--settings', "`"$settings`"") -PassThru
+    Wait-Button '/ Destination with spaces '
+    Invoke-Button '/ Destination with spaces '
+    Start-Sleep -Milliseconds 500
+    $edits = @((Elements) | Where-Object { $_.Current.ControlType -eq [Windows.Automation.ControlType]::Edit })
+    $value = $edits[0].GetCurrentPattern([Windows.Automation.ValuePattern]::Pattern).Current.Value
+    Assert-Check ($value.EndsWith('Destination with spaces')) 'Reloaded favorite navigates the actual pane after app restart'
+    $process.CloseMainWindow() | Out-Null
+    if (-not $process.WaitForExit(10000)) { throw 'Restarted native window did not close normally' }
 }
 finally {
-    if ($null -ne $window -and $null -ne $process -and -not $process.HasExited) {
+    if ($null -ne $window -and $null -ne $process -and -not $process.HasExited -and $process.MainWindowHandle -ne [IntPtr]::Zero) {
         $nodes=@((Elements) | Select-Object -First 150 | ForEach-Object {
             $valuePattern=$null
             $value=$null

@@ -1,8 +1,41 @@
 use crate::files::FileResult;
 use std::{path::Path, process::Command};
 
+#[cfg(windows)]
+pub fn file_identity(file: &std::fs::File) -> FileResult<(u32, u64)> {
+    use std::os::windows::io::AsRawHandle;
+    use windows::Win32::{
+        Foundation::HANDLE,
+        Storage::FileSystem::{BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle},
+    };
+    let mut information = BY_HANDLE_FILE_INFORMATION::default();
+    unsafe { GetFileInformationByHandle(HANDLE(file.as_raw_handle()), &mut information) }
+        .map_err(|e| format!("Read Windows file identity: {e}"))?;
+    Ok((
+        information.dwVolumeSerialNumber,
+        (u64::from(information.nFileIndexHigh) << 32) | u64::from(information.nFileIndexLow),
+    ))
+}
+
+#[cfg(windows)]
+pub fn path_identity(path: &Path) -> FileResult<(u32, u64)> {
+    use std::os::windows::fs::OpenOptionsExt;
+    let file = std::fs::OpenOptions::new()
+        .access_mode(0)
+        .share_mode(7)
+        .custom_flags(0x0220_0000)
+        .open(path)
+        .map_err(|e| {
+            format!(
+                "Open identity handle {}: {e}",
+                crate::files::display_path(path)
+            )
+        })?;
+    file_identity(&file)
+}
+
 pub fn show_error(message: &str) {
-    eprintln!("TomasCommander: {message}");
+    eprintln!("Tomas Commander: {message}");
     #[cfg(windows)]
     {
         use windows::{
@@ -14,7 +47,7 @@ pub fn show_error(message: &str) {
             MessageBoxW(
                 None,
                 PCWSTR(value.as_ptr()),
-                w!("TomasCommander startup error"),
+                w!("Tomas Commander startup error"),
                 MB_OK | MB_ICONERROR,
             );
         };
@@ -70,7 +103,7 @@ pub fn open_file(path: &Path) -> FileResult<()> {
     if status <= 32 {
         return Err(format!(
             "Windows could not open {} using its associated application (Shell error {status}).",
-            path.display()
+            crate::files::display_path(path)
         ));
     }
     Ok(())
@@ -83,14 +116,117 @@ pub fn open_file(_path: &Path) -> FileResult<()> {
 
 #[cfg(windows)]
 pub fn move_no_replace(source: &Path, target: &Path) -> FileResult<()> {
-    use windows::{Win32::Storage::FileSystem::MoveFileW, core::PCWSTR};
-    let source_wide = wide(source)?;
-    let target_wide = wide(target)?;
-    unsafe { MoveFileW(PCWSTR(source_wide.as_ptr()), PCWSTR(target_wide.as_ptr())) }.map_err(|e| {
+    let parent = target.parent().ok_or("Move target has no parent folder.")?;
+    move_verified(
+        source,
+        target,
+        &crate::files::fingerprint(source)?,
+        path_identity(parent)?,
+    )
+}
+
+#[cfg(windows)]
+pub fn move_verified(
+    source: &Path,
+    target: &Path,
+    expected_source: &crate::files::Fingerprint,
+    expected_parent: (u32, u64),
+) -> FileResult<()> {
+    use std::os::windows::{ffi::OsStrExt, fs::OpenOptionsExt, io::AsRawHandle};
+    use windows::Win32::{
+        Foundation::HANDLE,
+        Storage::FileSystem::{FILE_RENAME_INFO, FileRenameInfo, SetFileInformationByHandle},
+    };
+    let parent = target.parent().ok_or("Move target has no parent folder.")?;
+    let mut guards = Vec::new();
+    let ancestors: std::collections::BTreeSet<_> = source
+        .parent()
+        .ok_or("Move source has no parent folder.")?
+        .ancestors()
+        .chain(parent.ancestors())
+        .collect();
+    for ancestor in ancestors {
+        let handle = std::fs::OpenOptions::new()
+            .access_mode(0)
+            .share_mode(3)
+            .custom_flags(0x0220_0000)
+            .open(ancestor)
+            .map_err(|e| {
+                format!(
+                    "Lock move ancestor {}: {e}",
+                    crate::files::display_path(ancestor)
+                )
+            })?;
+        if crate::files::reparse(
+            &handle
+                .metadata()
+                .map_err(|e| format!("Inspect move ancestor: {e}"))?,
+        ) {
+            return Err("Move ancestor changed to a link; no move performed.".into());
+        }
+        guards.push(handle);
+    }
+    let destination = std::fs::OpenOptions::new()
+        .access_mode(0)
+        .share_mode(3)
+        .custom_flags(0x0220_0000)
+        .open(parent)
+        .map_err(|e| format!("Open move destination handle: {e}"))?;
+    let source_handle = std::fs::OpenOptions::new()
+        .access_mode(0x0001_0080)
+        .share_mode(1)
+        .custom_flags(0x0220_0000)
+        .open(source)
+        .map_err(|e| format!("Open approved move handle: {e}"))?;
+    let metadata = source_handle
+        .metadata()
+        .map_err(|e| format!("Inspect approved move handle: {e}"))?;
+    if file_identity(&source_handle)? != expected_source.file_id
+        || file_identity(&destination)? != expected_parent
+        || crate::files::reparse(&metadata)
+    {
+        return Err("Move identity changed while opening handles; no move performed.".into());
+    }
+    if metadata.is_dir() != expected_source.directory
+        || metadata.len() != expected_source.size
+        || metadata
+            .modified()
+            .map_err(|e| format!("Read approved move modification time: {e}"))?
+            != expected_source.modified
+        || metadata
+            .created()
+            .map_err(|e| format!("Read approved move creation time: {e}"))?
+            != expected_source.created
+    {
+        return Err("Move source changed while opening its handle; no move performed.".into());
+    }
+    let name: Vec<u16> = shell_path(target)?.as_os_str().encode_wide().collect();
+    if name.contains(&0) {
+        return Err("Move filename contains a null character.".into());
+    }
+    let name_bytes = name
+        .len()
+        .checked_mul(2)
+        .ok_or("Move filename is too long.")?;
+    let bytes = std::mem::size_of::<FILE_RENAME_INFO>()
+        .checked_add(name_bytes)
+        .ok_or("Move buffer is too large.")?;
+    let length = u32::try_from(bytes).map_err(|_| "Move buffer exceeds Windows limits.")?;
+    // A vector of the native structure provides its required alignment and flexible-array storage.
+    let mut buffer =
+        vec![FILE_RENAME_INFO::default(); bytes.div_ceil(std::mem::size_of::<FILE_RENAME_INFO>())];
+    let information = buffer.as_mut_ptr();
+    unsafe {
+        (*information).Anonymous.ReplaceIfExists = false;
+        (*information).RootDirectory = HANDLE::default();
+        (*information).FileNameLength = u32::try_from(name_bytes).map_err(|_| "Move filename exceeds Windows limits.")?;
+        std::ptr::copy_nonoverlapping(name.as_ptr(), std::ptr::addr_of_mut!((*information).FileName).cast::<u16>(), name.len());
+        SetFileInformationByHandle(HANDLE(source_handle.as_raw_handle()), FileRenameInfo, information.cast(), length)
+    }.map_err(|e| {
         format!(
-            "Move {} -> {}: {e}. Cross-volume directory moves are not supported yet.",
-            source.display(),
-            target.display()
+            "Move approved handle {} -> {} without replacement: {e}. Cross-volume moves are not supported.",
+            crate::files::display_path(source),
+            crate::files::display_path(target)
         )
     })
 }
@@ -129,8 +265,13 @@ pub fn recycle(path: &Path) -> FileResult<()> {
         let operation: IFileOperation =
             CoCreateInstance(&FileOperation, None, CLSCTX_INPROC_SERVER)
                 .map_err(|e| format!("Create Windows recycle operation: {e}"))?;
-        let item: IShellItem = SHCreateItemFromParsingName(PCWSTR(value.as_ptr()), None)
-            .map_err(|e| format!("Resolve recycle target {}: {e}", path.display()))?;
+        let item: IShellItem =
+            SHCreateItemFromParsingName(PCWSTR(value.as_ptr()), None).map_err(|e| {
+                format!(
+                    "Resolve recycle target {}: {e}",
+                    crate::files::display_path(path)
+                )
+            })?;
         operation
             .SetOperationFlags(
                 FOF_ALLOWUNDO
@@ -148,7 +289,7 @@ pub fn recycle(path: &Path) -> FileResult<()> {
             .map_err(|e| format!("Queue recycle: {e}"))?;
         operation
             .PerformOperations()
-            .map_err(|e| format!("Recycle {}: {e}", path.display()))?;
+            .map_err(|e| format!("Recycle {}: {e}", crate::files::display_path(path)))?;
         if operation
             .GetAnyOperationsAborted()
             .map_err(|e| format!("Read recycling outcome: {e}"))?
@@ -328,6 +469,118 @@ pub fn open_vscode(path: &Path) -> FileResult<()> {
         .arg("--new-window")
         .arg(path)
         .spawn()
-        .map_err(|e| format!("Launch VS Code for {}: {e}", path.display()))?;
+        .map_err(|e| {
+            format!(
+                "Launch VS Code for {}: {e}",
+                crate::files::display_path(path)
+            )
+        })?;
     Ok(())
+}
+
+pub fn find_copilot(
+    paths: impl IntoIterator<Item = std::path::PathBuf>,
+) -> FileResult<std::path::PathBuf> {
+    paths.into_iter().filter(|path| path.is_absolute())
+                .map(|path| path.join("copilot.exe")).find(|path| path.is_file())
+                .ok_or_else(|| "GitHub Copilot CLI (copilot.exe) was not found on PATH. Install the native CLI and restart Tomas Commander.".into())
+}
+
+#[cfg(windows)]
+pub fn open_copilot(path: &Path, app: bool) -> FileResult<()> {
+    use std::{
+        os::windows::process::CommandExt,
+        process::Stdio,
+        time::{Duration, Instant},
+    };
+    let path_variable =
+        std::env::var_os("PATH").ok_or("PATH is unavailable; cannot locate Copilot CLI.")?;
+    let executable = find_copilot(std::env::split_paths(&path_variable))?;
+    if !app {
+        use windows::{
+            Win32::UI::{Shell::ShellExecuteW, WindowsAndMessaging::SW_SHOWNORMAL},
+            core::{PCWSTR, w},
+        };
+        let executable = wide(&shell_path(&executable)?)?;
+        let directory = wide(&shell_path(path)?)?;
+        let result = unsafe {
+            ShellExecuteW(
+                None,
+                w!("open"),
+                PCWSTR(executable.as_ptr()),
+                w!("--yolo"),
+                PCWSTR(directory.as_ptr()),
+                SW_SHOWNORMAL,
+            )
+        };
+        if result.0 as isize <= 32 {
+            return Err(format!(
+                "Windows could not open the Copilot CLI terminal (Shell error {}).",
+                result.0 as isize
+            ));
+        }
+        return Ok(());
+    }
+    let mut command = Command::new(executable);
+    command.current_dir(path).stdin(Stdio::null());
+    let windows = std::env::var_os("WINDIR")
+        .ok_or("WINDIR is unavailable; cannot check Copilot app registration.")?;
+    let registered = Command::new(
+        std::path::PathBuf::from(windows)
+            .join("System32")
+            .join("reg.exe"),
+    )
+    .args(["query", "HKCR\\ghapp", "/v", "URL Protocol"])
+    .creation_flags(0x0800_0000)
+    .stdout(Stdio::null())
+    .stderr(Stdio::null())
+    .status()
+    .map_err(|e| format!("Check GitHub Copilot app registration: {e}"))?;
+    if !registered.success() {
+        return Err("GitHub Copilot app is not registered on this machine. Install or repair the app before using this command; no browser/download fallback was opened.".into());
+    }
+    let mut child = command
+        .arg("app")
+        .creation_flags(0x0800_0000)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("Launch Copilot app: {e}"))?;
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|e| format!("Read Copilot app launch outcome: {e}"))?
+        {
+            if status.success() {
+                return Ok(());
+            }
+            use std::io::Read;
+            let mut detail = String::new();
+            if let Some(stderr) = child.stderr.take() {
+                stderr.take(8192).read_to_string(&mut detail).map_err(|e| {
+                    format!("Copilot app launch failed ({status}); reading the error failed: {e}")
+                })?;
+            }
+            return Err(format!(
+                "Copilot app launch failed ({status}): {}. Check that your CLI supports 'copilot app' and the app is installed.",
+                detail.trim()
+            ));
+        }
+        if Instant::now() >= deadline {
+            child.kill().map_err(|e| {
+                format!("Copilot app launch timed out; stopping launcher failed: {e}")
+            })?;
+            child
+                .wait()
+                .map_err(|e| format!("Copilot app launch timed out; read-back failed: {e}"))?;
+            return Err("Copilot app launch timed out. Inspect the app before retrying.".into());
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[cfg(not(windows))]
+pub fn open_copilot(_path: &Path, _app: bool) -> FileResult<()> {
+    Err("Copilot terminal/app launch currently requires Windows.".into())
 }

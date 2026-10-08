@@ -8,7 +8,7 @@ Creating a card does not start its implementation or grant tool permissions.
 |---|---|---|---|
 | UI-01 | [Five UI alternatives](ui-exploration.md) | Ledger direction accepted; no more design batches; physical-layout check still pending | None |
 | APP-01 | [Windows shell and app integrations](desktop-integration.md) | Real Rust native slice built; physical-layout/launch/measurement acceptance incomplete | VS Code workspace read-back; supported Copilot mechanism; performance limits |
-| FILE-01 | [Two-pane file management](file-management.md) | Real copy/move/recycle and fixture checks passed; complete card not PASS | Recursive search; full task/safety matrix; performance limits |
+| FILE-01 | [Two-pane file management](file-management.md) | Bound operation/safety checks and warm service ceilings PASS; complete acceptance BLOCKED | Physical/native input verification; startup/resource/input limits |
 | AI-01 | [Foundry connection and bounded runtime](ai-runtime.md) | Draft | Approved identity, endpoint, data boundaries, and limits |
 | SEARCH-01 | [AI-assisted file search](ai-file-search.md) | Draft | FILE-01 discovery; AI-01 |
 | CMD-01 | [Deterministic and AI command palette](command-palette.md) | Real deterministic palette; AI portion BLOCKED | Physical-layout/focus matrix; AI-01; performance limits |
@@ -22,9 +22,17 @@ Only UI-01 is a mock design exercise.
 
 Native implementation bindings and partial evidence are recorded in APP-01,
 FILE-01 and CMD-01 below, without weakening their mandatory checks. The latest
-native validation passed 16 default tests, the opt-in real recycle/restore test,
-strict Clippy, release build and 21 actual-window checks. These results do not
-complete any product card: integrations, physical keyboards, full matrices and
+source validation passed 46 default tests, strict Clippy, formatting and an
+isolated release build. Final-source opt-in real recycle/restore and the SHA256
+operation/recovery matrix pass. Expanded native observations cover parent,
+search, sorting, pending/partial metadata, selection and persisted Places/Recent
+flows; the repaired-build native copy and actual search cancellation/restart
+also pass. The owner accepted normal desktop-use safety and scoped warm service
+ceilings, without hostile-race guarantees or full performance acceptance.
+Precise unverified dispatch/physical checks remain. The current
+reconciliation is `FILE-01-final-acceptance-status.json` in FILE-01's own
+evidence directory; older native records keep their earlier build identity.
+These results do not complete any product card: integrations, physical keyboards, full matrices and
 numeric performance acceptance remain outstanding.
 
 ## Real-product acceptance rule

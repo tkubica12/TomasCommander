@@ -11,6 +11,7 @@ pub struct Preferences {
     pub dark: bool,
     pub accent: usize,
     pub favorites: Vec<PathBuf>,
+    pub recent_documents: Vec<PathBuf>,
 }
 
 impl Default for Preferences {
@@ -19,21 +20,42 @@ impl Default for Preferences {
             dark: true,
             accent: 0,
             favorites: Vec::new(),
+            recent_documents: Vec::new(),
         }
     }
 }
 
 impl Preferences {
+    pub const MAX_RECENT: usize = 20;
+
+    pub fn record_document_open(&mut self, path: PathBuf) -> bool {
+        if !document_path(&path) {
+            return false;
+        }
+        self.recent_documents.retain(|recent| recent != &path);
+        self.recent_documents.insert(0, path);
+        self.recent_documents.truncate(Self::MAX_RECENT);
+        true
+    }
+
     pub fn load(path: &Path) -> FileResult<Self> {
         let text = match fs::read_to_string(path) {
             Ok(text) => text,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 return Ok(Self::default());
             }
-            Err(error) => return Err(format!("Read preferences {}: {error}", path.display())),
+            Err(error) => {
+                return Err(format!(
+                    "Read preferences {}: {error}",
+                    crate::files::display_path(path)
+                ));
+            }
         };
         let mut lines = text.lines();
-        if lines.next() != Some("TomasCommander preferences v1") {
+        if !matches!(
+            lines.next(),
+            Some("TomasCommander preferences v1" | "TomasCommander preferences v2")
+        ) {
             return Err(
                 "Unrecognized preferences format; saving is disabled to preserve the file.".into(),
             );
@@ -55,6 +77,15 @@ impl Preferences {
                 }
             } else if let Some(value) = line.strip_prefix("favorite=") {
                 preferences.favorites.push(PathBuf::from(value));
+            } else if let Some(value) = line.strip_prefix("recent=") {
+                let path = PathBuf::from(value);
+                if !document_path(&path) || preferences.recent_documents.len() >= Self::MAX_RECENT {
+                    return Err("Invalid recent-document preference.".into());
+                }
+                if preferences.recent_documents.contains(&path) {
+                    return Err("Duplicate recent-document preference.".into());
+                }
+                preferences.recent_documents.push(path);
             } else if !line.is_empty() {
                 return Err(format!("Unknown preference field: {line}"));
             }
@@ -63,7 +94,7 @@ impl Preferences {
     }
 
     pub fn save(&self, path: &Path) -> FileResult<()> {
-        if self.accent > 3 {
+        if self.accent > 3 || self.recent_documents.len() > Self::MAX_RECENT {
             return Err("Accent preference is out of range.".into());
         }
         Self::load(path)?;
@@ -75,17 +106,22 @@ impl Preferences {
             .as_nanos();
         let temporary = parent.join(format!("preferences-{nonce}.tmp"));
         let mut text = format!(
-            "TomasCommander preferences v1\ndark={}\naccent={}\n",
+            "TomasCommander preferences v2\ndark={}\naccent={}\n",
             self.dark, self.accent
         );
-        for favorite in &self.favorites {
-            let path = favorite
-                .to_str()
-                .ok_or("Favorite path cannot be persisted as Unicode text.")?;
-            if path.contains(['\n', '\r']) {
-                return Err("Favorite path contains a line break.".into());
+        for (field, paths) in [
+            ("favorite", &self.favorites),
+            ("recent", &self.recent_documents),
+        ] {
+            for stored in paths {
+                let path = stored
+                    .to_str()
+                    .ok_or("Stored path cannot be persisted as Unicode text.")?;
+                if path.contains(['\n', '\r']) {
+                    return Err("Stored path contains a line break.".into());
+                }
+                text.push_str(&format!("{field}={path}\n"));
             }
-            text.push_str(&format!("favorite={path}\n"));
         }
         let result = (|| -> FileResult<()> {
             let mut file = OpenOptions::new()
@@ -105,6 +141,31 @@ impl Preferences {
                 format!("Preferences failed and temporary-file cleanup failed: {e}")
             })?;
         }
+
         result
     }
+}
+
+fn document_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            matches!(
+                extension.to_ascii_lowercase().as_str(),
+                "ppt"
+                    | "pptx"
+                    | "pptm"
+                    | "doc"
+                    | "docx"
+                    | "docm"
+                    | "odt"
+                    | "rtf"
+                    | "txt"
+                    | "md"
+                    | "markdown"
+                    | "html"
+                    | "htm"
+                    | "pdf"
+            )
+        })
 }

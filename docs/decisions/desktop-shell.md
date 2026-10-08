@@ -120,6 +120,31 @@ after material changes, and actual-state read-back remain mandatory.
 
 ## First real vertical slice
 
+The displayed full name is Tomas Commander; package/executable/settings
+identifiers stay unchanged. The existing `[t_]` logo is also the embedded Windows
+executable and window/taskbar icon (`build.rs`, `assets\app-icon.*`), without an
+image-decoder or resource-build crate.
+
+The two-pane workspace has an 880 x 560 logical-point minimum. Native viewport
+dimensions are checked after Windows tiling, which can override the initial
+minimum-size hint; undersized dimensions recover without resizing valid windows.
+Action columns reserve both button and hint space and wrap as complete pairs.
+
+Places, Recent documents and Activity are explicit rail modes. Recents track
+only successful document-open requests through this app, persisted and bounded,
+not filesystem or Windows-wide access history.
+
+Native Copilot launch adapters use an absolute PATH-resolved `copilot.exe`, not
+filename-derived shell strings. The CLI action passes constant `--yolo` and the
+active working directory to Windows ShellExecute. The App action checks the
+registered `ghapp` handler before running `copilot app`, with a timeout and
+explicit errors; launch-request success is not proof a session was created.
+[CLI command reference](https://docs.github.com/copilot/reference/cli-command-reference)
+and [App deep-link documentation](https://docs.github.com/en/copilot/how-tos/github-copilot-app/open-with-deep-links)
+were inspected and the installed CLI help confirmed both commands.
+Actual external launch/session acceptance remains pending.
+An embedded terminal is a future consideration, not part of FILE-01.
+
 1. Native Ledger window: two panes, contextual rail initially showing favorites,
    command registry, keyboard focus, all appearance combinations.
 2. Real read-only folder discovery, selection, filtering, sorting and persisted

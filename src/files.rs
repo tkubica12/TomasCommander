@@ -9,6 +9,23 @@ use std::{
 
 pub type FileResult<T> = Result<T, String>;
 
+pub fn display_path(path: &Path) -> String {
+    let text = path.display().to_string();
+    #[cfg(windows)]
+    {
+        if let Some(unc) = text.strip_prefix("\\\\?\\UNC\\") {
+            return format!("\\\\{unc}");
+        }
+        if let Some(local) = text.strip_prefix("\\\\?\\")
+            && local.as_bytes().get(1) == Some(&b':')
+            && local.as_bytes().get(2) == Some(&b'\\')
+        {
+            return local.to_owned();
+        }
+    }
+    text
+}
+
 #[derive(Clone, Debug)]
 pub struct Entry {
     pub path: PathBuf,
@@ -18,6 +35,121 @@ pub struct Entry {
     pub size: u64,
     pub modified: Option<SystemTime>,
     pub folded: String,
+    pub aggregate: Option<FileResult<DirectoryStats>>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct DirectoryStats {
+    pub size: u64,
+    pub modified: Option<SystemTime>,
+    pub examined: usize,
+    pub skipped_links: usize,
+    pub warnings: Vec<String>,
+    pub truncated: bool,
+}
+
+impl DirectoryStats {
+    pub fn partial(&self) -> bool {
+        self.truncated || !self.warnings.is_empty()
+    }
+}
+
+pub fn directory_stats(
+    scope: &Scope,
+    path: &Path,
+    stale: impl Fn() -> bool,
+) -> FileResult<DirectoryStats> {
+    let root = scope.resolve(path)?;
+    let identity = fingerprint(&root)?;
+    let mut stats = DirectoryStats::default();
+    let mut stack = vec![root.clone()];
+    while let Some(folder) = stack.pop() {
+        if stale() {
+            return Err("Folder calculation was superseded.".into());
+        }
+        if stats.examined >= 100_000 || stats.warnings.len() >= 100 {
+            stats.truncated = true;
+            break;
+        }
+        let inspected =
+            fs::symlink_metadata(&folder).map_err(|e| io_error("Inspect folder", &folder, e));
+        match inspected {
+            Ok(metadata) if reparse(&metadata) => {
+                stats.skipped_links += 1;
+                continue;
+            }
+            Err(error) => {
+                stats.warnings.push(error);
+                continue;
+            }
+            _ => (),
+        }
+        match scope.resolve(&folder) {
+            Ok(resolved) if resolved == folder => (),
+            Ok(_) => {
+                stats
+                    .warnings
+                    .push(format!("Folder changed: {}", display_path(&folder)));
+                continue;
+            }
+            Err(error) => {
+                stats.warnings.push(error);
+                continue;
+            }
+        }
+        let children = match fs::read_dir(&folder) {
+            Ok(children) => children,
+            Err(error) => {
+                stats.warnings.push(io_error("Read folder", &folder, error));
+                continue;
+            }
+        };
+        for child in children {
+            if stale() {
+                return Err("Folder calculation was superseded.".into());
+            }
+            if stats.examined >= 100_000 || stats.warnings.len() >= 100 {
+                stats.truncated = true;
+                break;
+            }
+            stats.examined += 1;
+            let inspected = (|| -> FileResult<()> {
+                let child = child.map_err(|e| io_error("Read item", &folder, e))?;
+                let path = child.path();
+                let metadata =
+                    fs::symlink_metadata(&path).map_err(|e| io_error("Inspect item", &path, e))?;
+                if reparse(&metadata) {
+                    stats.skipped_links += 1;
+                } else if metadata.is_dir() {
+                    stack.push(path);
+                } else if metadata.is_file() {
+                    stats.size = stats
+                        .size
+                        .checked_add(metadata.len())
+                        .ok_or("Folder size exceeds the supported range.")?;
+                    let modified = metadata
+                        .modified()
+                        .map_err(|e| io_error("Read item time", &path, e))?;
+                    stats.modified = Some(
+                        stats
+                            .modified
+                            .map_or(modified, |latest| latest.max(modified)),
+                    );
+                }
+                Ok(())
+            })();
+            if let Err(error) = inspected {
+                stats.warnings.push(error);
+            }
+        }
+        if stats.truncated {
+            break;
+        }
+    }
+    if fingerprint(&root)? != identity {
+        return Err("Folder changed during calculation; refresh to calculate it again.".into());
+    }
+    Ok(stats)
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -34,7 +166,7 @@ pub struct Scope {
 }
 
 fn io_error(action: &str, path: &Path, error: impl std::fmt::Display) -> String {
-    format!("{action} {}: {error}", path.display())
+    format!("{action} {}: {error}", display_path(path))
 }
 
 pub fn reparse(metadata: &fs::Metadata) -> bool {
@@ -68,7 +200,10 @@ impl Scope {
         if let Some(root) = &self.root
             && !resolved.starts_with(root)
         {
-            return Err(format!("Outside the fixture boundary: {}", path.display()));
+            return Err(format!(
+                "Outside the fixture boundary: {}",
+                display_path(path)
+            ));
         }
         Ok(resolved)
     }
@@ -78,7 +213,7 @@ impl Scope {
         if reparse(&metadata) {
             return Err(format!(
                 "Links/reparse points cannot be modified: {}",
-                path.display()
+                display_path(path)
             ));
         }
         let resolved = self.resolve(path)?;
@@ -91,6 +226,7 @@ impl Scope {
 
 #[derive(Debug)]
 pub struct Listing {
+    pub path: PathBuf,
     pub entries: Vec<Entry>,
     pub warnings: Vec<String>,
 }
@@ -122,6 +258,11 @@ pub fn list_directory_cancellable(
                         directory: metadata.is_dir(),
                         link: reparse(&metadata),
                         size: metadata.len(),
+                        aggregate: if reparse(&metadata) && metadata.is_dir() {
+                            Some(Err("Link folders are not traversed.".into()))
+                        } else {
+                            None
+                        },
                         modified: match metadata.modified() {
                             Ok(time) => Some(time),
                             Err(error) => {
@@ -141,7 +282,11 @@ pub fn list_directory_cancellable(
         }
     }
     sort_entries(&mut entries, Sort::Name);
-    Ok(Listing { entries, warnings })
+    Ok(Listing {
+        path,
+        entries,
+        warnings,
+    })
 }
 
 pub fn sort_entries(entries: &mut [Entry], sort: Sort) {
@@ -151,6 +296,47 @@ pub fn sort_entries(entries: &mut [Entry], sort: Sort) {
             Sort::Size => b.size.cmp(&a.size).then(a.folded.cmp(&b.folded)),
             Sort::Modified => b.modified.cmp(&a.modified).then(a.folded.cmp(&b.folded)),
         })
+    });
+}
+
+pub fn sort_entries_ordered(entries: &mut [Entry], sort: Sort, descending: bool) {
+    let value = |entry: &Entry| {
+        if entry.directory {
+            entry
+                .aggregate
+                .as_ref()
+                .and_then(|result| result.as_ref().ok())
+                .map(|stats| (stats.size, stats.modified))
+        } else {
+            Some((entry.size, entry.modified))
+        }
+    };
+    entries.sort_by(|a, b| {
+        let order = match sort {
+            Sort::Name => {
+                let names = a.folded.cmp(&b.folded).then(a.path.cmp(&b.path));
+                return b.directory.cmp(&a.directory).then(if descending {
+                    names.reverse()
+                } else {
+                    names
+                });
+            }
+            Sort::Size | Sort::Modified => match (value(a), value(b)) {
+                (None, Some(_)) => return std::cmp::Ordering::Greater,
+                (Some(_), None) => return std::cmp::Ordering::Less,
+                (Some(a), Some(b)) => {
+                    if sort == Sort::Size {
+                        a.0.cmp(&b.0)
+                    } else {
+                        a.1.cmp(&b.1)
+                    }
+                }
+                (None, None) => std::cmp::Ordering::Equal,
+            },
+        };
+        (if descending { order.reverse() } else { order })
+            .then(a.folded.cmp(&b.folded))
+            .then(a.path.cmp(&b.path))
     });
 }
 
@@ -166,24 +352,27 @@ impl Operation {
         match self {
             Self::Copy => "Copy",
             Self::Move => "Move",
-            Self::Recycle => "Recycle",
+            Self::Recycle => "Delete",
         }
     }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct Fingerprint {
-    directory: bool,
-    size: u64,
-    modified: SystemTime,
+pub struct Fingerprint {
+    pub(crate) directory: bool,
+    pub(crate) size: u64,
+    pub(crate) modified: SystemTime,
+    pub(crate) created: SystemTime,
+    #[cfg(windows)]
+    pub(crate) file_id: (u32, u64),
 }
 
-fn fingerprint(path: &Path) -> FileResult<Fingerprint> {
+pub fn fingerprint(path: &Path) -> FileResult<Fingerprint> {
     let meta = fs::symlink_metadata(path).map_err(|e| io_error("Inspect", path, e))?;
     if reparse(&meta) || !(meta.is_file() || meta.is_dir()) {
         return Err(format!(
             "Unsupported link or special item: {}",
-            path.display()
+            display_path(path)
         ));
     }
     Ok(Fingerprint {
@@ -192,6 +381,11 @@ fn fingerprint(path: &Path) -> FileResult<Fingerprint> {
         modified: meta
             .modified()
             .map_err(|e| io_error("Read modification time", path, e))?,
+        created: meta
+            .created()
+            .map_err(|e| io_error("Read creation time", path, e))?,
+        #[cfg(windows)]
+        file_id: crate::platform::path_identity(path)?,
     })
 }
 
@@ -204,11 +398,65 @@ struct PlannedNode {
 
 #[derive(Clone, Debug)]
 pub struct Plan {
-    pub id: u64,
-    pub operation: Operation,
-    pub sources: Vec<PathBuf>,
-    pub destination: Option<PathBuf>,
+    id: u64,
+    operation: Operation,
+    sources: Vec<PathBuf>,
+    destination: Option<PathBuf>,
     nodes: Vec<PlannedNode>,
+    destination_identity: Option<Fingerprint>,
+    execution_key: String,
+}
+
+impl Plan {
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+
+    pub fn operation(&self) -> Operation {
+        self.operation
+    }
+
+    pub fn sources(&self) -> &[PathBuf] {
+        &self.sources
+    }
+
+    pub fn destination(&self) -> Option<&Path> {
+        self.destination.as_deref()
+    }
+
+    pub(crate) fn execution_key(&self) -> &str {
+        &self.execution_key
+    }
+
+    pub(crate) fn journal_snapshot(&self) -> String {
+        let mut snapshot = format!("operation={:?}\nid={}\n", self.operation, self.id);
+        if let Some(destination) = &self.destination {
+            snapshot.push_str(&format!(
+                "destination={}\ndestination_identity={:?}\n",
+                crate::journal::encode_path(destination),
+                self.destination_identity
+            ));
+        }
+        for node in &self.nodes {
+            snapshot.push_str(&format!(
+                "source={}\nidentity={:?}\n",
+                crate::journal::encode_path(&node.source),
+                node.identity
+            ));
+            if let Some(target) = &node.target {
+                snapshot.push_str(&format!("target={}\n", crate::journal::encode_path(target)));
+            }
+        }
+        snapshot
+    }
+
+    pub(crate) fn affected_paths(&self) -> Vec<PathBuf> {
+        self.sources
+            .iter()
+            .cloned()
+            .chain(self.nodes.iter().filter_map(|node| node.target.clone()))
+            .collect()
+    }
 }
 
 pub fn plan(
@@ -291,7 +539,7 @@ pub fn plan_cancellable(
             {
                 return Err(format!(
                     "Conflict; no overwrite allowed: {}",
-                    target.display()
+                    display_path(target)
                 ));
             }
         }
@@ -327,12 +575,24 @@ pub fn plan_cancellable(
             .cmp(&b.source.components().count())
             .then(a.source.cmp(&b.source))
     });
+    let destination_identity = destination.as_deref().map(fingerprint).transpose()?;
+    static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let timestamp = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_err(|e| format!("Create operation identity: {e}"))?
+        .as_nanos();
     Ok(Plan {
         id,
         operation,
         sources,
         destination,
         nodes,
+        destination_identity,
+        execution_key: format!(
+            "{timestamp}-{}-{}",
+            std::process::id(),
+            SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ),
     })
 }
 
@@ -343,22 +603,27 @@ pub struct Outcome {
     pub created: Vec<PathBuf>,
     pub error: Option<String>,
     pub cancelled: bool,
+    pub incomplete: Vec<PathBuf>,
 }
 
-fn validate_plan(scope: &Scope, plan: &Plan) -> FileResult<()> {
+fn validate_plan(scope: &Scope, plan: &Plan, cancelled: &AtomicBool) -> FileResult<()> {
     if let Some(destination) = &plan.destination {
         let resolved = scope.resolve(destination)?;
-        if resolved != *destination {
+        if resolved != *destination || Some(fingerprint(destination)?) != plan.destination_identity
+        {
             return Err("Destination folder changed; create a new plan.".into());
         }
     }
     for node in &plan.nodes {
+        if cancelled.load(Ordering::Relaxed) {
+            return Err("Validation cancelled; no further changes made.".into());
+        }
         if scope.mutation_source(&node.source)? != node.source
             || fingerprint(&node.source)? != node.identity
         {
             return Err(format!(
                 "Source changed; create a new plan: {}",
-                node.source.display()
+                display_path(&node.source)
             ));
         }
         if let Some(target) = &node.target
@@ -368,17 +633,18 @@ fn validate_plan(scope: &Scope, plan: &Plan) -> FileResult<()> {
         {
             return Err(format!(
                 "Destination changed; no overwrite allowed: {}",
-                target.display()
+                display_path(target)
             ));
         }
     }
     // Re-enumeration detects added/removed children, not only changed top-level metadata.
-    let current = self::plan(
+    let current = self::plan_cancellable(
         scope,
         plan.id,
         plan.operation,
         &plan.sources,
         plan.destination.as_deref(),
+        cancelled,
     )?;
     if current.nodes.len() != plan.nodes.len()
         || current
@@ -399,6 +665,11 @@ pub fn execute(scope: &Scope, plan: &Plan, approved: bool, cancelled: &AtomicBoo
         created: Vec::new(),
         error: None,
         cancelled: false,
+        incomplete: if plan.operation == Operation::Copy {
+            plan.nodes.iter().map(|node| node.source.clone()).collect()
+        } else {
+            plan.sources.clone()
+        },
     };
     if !approved {
         outcome.error = Some("Explicit plan approval is required; no changes made.".into());
@@ -409,7 +680,13 @@ pub fn execute(scope: &Scope, plan: &Plan, approved: bool, cancelled: &AtomicBoo
             outcome.cancelled = true;
             return Ok(());
         }
-        validate_plan(scope, plan)?;
+        #[cfg(windows)]
+        let mut copy_guards = if plan.operation == Operation::Copy {
+            Some(lock_copy_paths(plan)?)
+        } else {
+            None
+        };
+        validate_plan(scope, plan, cancelled)?;
         match plan.operation {
             Operation::Copy => {
                 for node in &plan.nodes {
@@ -418,6 +695,23 @@ pub fn execute(scope: &Scope, plan: &Plan, approved: bool, cancelled: &AtomicBoo
                         break;
                     }
                     scope.mutation_source(&node.source)?;
+                    #[cfg(windows)]
+                    if let Some(destination) = &plan.destination
+                        && crate::platform::path_identity(destination)?
+                            != plan
+                                .destination_identity
+                                .as_ref()
+                                .ok_or("Destination identity missing.")?
+                                .file_id
+                    {
+                        return Err("Destination identity changed; copy stopped.".into());
+                    }
+                    if fingerprint(&node.source)? != node.identity {
+                        return Err(format!(
+                            "Source changed; copy stopped: {}",
+                            display_path(&node.source)
+                        ));
+                    }
                     let target = node
                         .target
                         .as_ref()
@@ -429,6 +723,29 @@ pub fn execute(scope: &Scope, plan: &Plan, approved: bool, cancelled: &AtomicBoo
                     if node.identity.directory {
                         fs::create_dir(target).map_err(|e| io_error("Create folder", target, e))?;
                         outcome.created.push(target.clone());
+                        #[cfg(windows)]
+                        {
+                            use std::os::windows::fs::OpenOptionsExt;
+                            let handle = OpenOptions::new()
+                                .access_mode(0)
+                                .share_mode(3)
+                                .custom_flags(0x0220_0000)
+                                .open(target)
+                                .map_err(|e| io_error("Lock created folder", target, e))?;
+                            if reparse(
+                                &handle
+                                    .metadata()
+                                    .map_err(|e| io_error("Inspect created folder", target, e))?,
+                            ) {
+                                return Err(
+                                    "Created copy folder changed to a link; copy stopped.".into()
+                                );
+                            }
+                            copy_guards
+                                .as_mut()
+                                .ok_or("Copy guards missing.")?
+                                .push(handle);
+                        }
                     } else {
                         let mut options = OpenOptions::new();
                         options.read(true);
@@ -443,12 +760,21 @@ pub fn execute(scope: &Scope, plan: &Plan, approved: bool, cancelled: &AtomicBoo
                         let meta = source
                             .metadata()
                             .map_err(|e| io_error("Inspect open source", &node.source, e))?;
+                        #[cfg(windows)]
+                        if crate::platform::file_identity(&source)? != node.identity.file_id {
+                            return Err(
+                                "Source identity changed while opening it; copy stopped.".into()
+                            );
+                        }
                         if reparse(&meta)
                             || meta.len() != node.identity.size
                             || meta
                                 .modified()
                                 .map_err(|e| io_error("Read source time", &node.source, e))?
                                 != node.identity.modified
+                            || meta.created().map_err(|e| {
+                                io_error("Read source creation time", &node.source, e)
+                            })? != node.identity.created
                         {
                             return Err("Source changed while opening it; copy stopped.".into());
                         }
@@ -477,7 +803,7 @@ pub fn execute(scope: &Scope, plan: &Plan, approved: bool, cancelled: &AtomicBoo
                                 .map_err(|e| io_error("Write destination", target, e))?;
                         }
                         output
-                            .flush()
+                            .sync_all()
                             .map_err(|e| io_error("Flush destination", target, e))?;
                         if outcome.cancelled {
                             break;
@@ -503,11 +829,63 @@ pub fn execute(scope: &Scope, plan: &Plan, approved: bool, cancelled: &AtomicBoo
                         break;
                     }
                     scope.mutation_source(source)?;
+                    for node in plan
+                        .nodes
+                        .iter()
+                        .filter(|node| node.source.starts_with(source))
+                    {
+                        if cancelled.load(Ordering::Relaxed) {
+                            return Err(
+                                "Move validation cancelled; no further changes made.".into()
+                            );
+                        }
+                        if fingerprint(&node.source)? != node.identity {
+                            return Err(format!(
+                                "Source changed; move stopped: {}",
+                                display_path(&node.source)
+                            ));
+                        }
+                    }
+                    #[cfg(windows)]
+                    if let Some(destination) = &plan.destination
+                        && crate::platform::path_identity(destination)?
+                            != plan
+                                .destination_identity
+                                .as_ref()
+                                .ok_or("Destination identity missing.")?
+                                .file_id
+                    {
+                        return Err("Destination identity changed; move stopped.".into());
+                    }
                     let target = plan
                         .destination
                         .as_ref()
                         .ok_or("Move destination is missing.")?
                         .join(source.file_name().ok_or("Source filename is missing.")?);
+                    if cancelled.load(Ordering::Relaxed) {
+                        outcome.cancelled = true;
+                        break;
+                    }
+                    #[cfg(windows)]
+                    {
+                        let identity = &plan
+                            .nodes
+                            .iter()
+                            .find(|node| node.source == *source)
+                            .ok_or("Approved move source identity missing.")?
+                            .identity;
+                        let destination = plan
+                            .destination_identity
+                            .as_ref()
+                            .ok_or("Approved move destination identity missing.")?;
+                        crate::platform::move_verified(
+                            source,
+                            &target,
+                            identity,
+                            destination.file_id,
+                        )?;
+                    }
+                    #[cfg(not(windows))]
                     crate::platform::move_no_replace(source, &target)?;
                     outcome.created.push(target);
                     outcome.completed.push(source.clone());
@@ -520,6 +898,27 @@ pub fn execute(scope: &Scope, plan: &Plan, approved: bool, cancelled: &AtomicBoo
                         break;
                     }
                     scope.mutation_source(source)?;
+                    for node in plan
+                        .nodes
+                        .iter()
+                        .filter(|node| node.source.starts_with(source))
+                    {
+                        if cancelled.load(Ordering::Relaxed) {
+                            return Err(
+                                "Recycle validation cancelled; no further changes made.".into()
+                            );
+                        }
+                        if fingerprint(&node.source)? != node.identity {
+                            return Err(format!(
+                                "Source changed; recycling stopped: {}",
+                                display_path(&node.source)
+                            ));
+                        }
+                    }
+                    if cancelled.load(Ordering::Relaxed) {
+                        outcome.cancelled = true;
+                        break;
+                    }
                     crate::platform::recycle(source)?;
                     if source
                         .try_exists()
@@ -527,7 +926,7 @@ pub fn execute(scope: &Scope, plan: &Plan, approved: bool, cancelled: &AtomicBoo
                     {
                         return Err(format!(
                             "Windows did not remove the source: {}",
-                            source.display()
+                            display_path(source)
                         ));
                     }
                     outcome.completed.push(source.clone());
@@ -538,8 +937,44 @@ pub fn execute(scope: &Scope, plan: &Plan, approved: bool, cancelled: &AtomicBoo
     })();
     if let Err(error) = result {
         outcome.error = Some(error);
+        outcome.cancelled = cancelled.load(Ordering::Relaxed);
     }
+    let completed: BTreeSet<_> = outcome.completed.iter().collect();
     outcome
+        .incomplete
+        .retain(|source| !completed.contains(source));
+    outcome
+}
+
+#[cfg(windows)]
+fn lock_copy_paths(plan: &Plan) -> FileResult<Vec<File>> {
+    use std::os::windows::fs::OpenOptionsExt;
+    let mut paths = BTreeSet::new();
+    for node in &plan.nodes {
+        paths.extend(node.source.ancestors().map(Path::to_owned));
+    }
+    if let Some(destination) = &plan.destination {
+        paths.extend(destination.ancestors().map(Path::to_owned));
+    }
+    let mut handles = Vec::with_capacity(paths.len());
+    for path in paths {
+        let metadata =
+            fs::symlink_metadata(&path).map_err(|e| io_error("Inspect copy guard", &path, e))?;
+        if reparse(&metadata) {
+            return Err(format!(
+                "Copy path changed to a link: {}",
+                display_path(&path)
+            ));
+        }
+        let handle = OpenOptions::new()
+            .access_mode(0)
+            .share_mode(3)
+            .custom_flags(0x0220_0000)
+            .open(&path)
+            .map_err(|e| io_error("Lock copy path against replacement", &path, e))?;
+        handles.push(handle);
+    }
+    Ok(handles)
 }
 
 pub fn read_bytes(path: &Path) -> FileResult<Vec<u8>> {

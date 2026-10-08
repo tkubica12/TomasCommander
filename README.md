@@ -1,4 +1,4 @@
-# TomasCommander
+# Tomas Commander
 
 A keyboard-first, standalone Windows file manager built in Rust with a native
 Ledger-style UI. No browser, WebView, or JavaScript runtime.
@@ -13,8 +13,10 @@ cargo build --release --locked
 .\target\release\tomas-commander.exe --root "D:\TomasCommander"
 ```
 
-Includes two-pane navigation, selection, filtering, sorting, favorites, a command
-palette, VS Code launching, light/dark themes and four accent colors.
+Includes two-pane navigation, selection, filtering, recursive filename search,
+bidirectional column sorting, asynchronous folder sizes/dates, persisted
+favorites/recent documents, a command palette, VS Code/Copilot launchers,
+light/dark themes and four accent colors.
 Preferences live in `%LOCALAPPDATA%\TomasCommander\preferences.txt`.
 
 ## Keys
@@ -26,20 +28,39 @@ Preferences live in `%LOCALAPPDATA%\TomasCommander\preferences.txt`.
 | Space / Shift+arrows / Ctrl+A | Toggle / range / select all |
 | Enter / Backspace | Open / parent folder |
 | Ctrl+F / Ctrl+R | Filter / refresh |
+| Ctrl+Shift+F | Search active folder and descendants |
+| Ctrl+Shift+B | Focus pinned folders; arrows / Enter choose, Escape / Tab return |
+| Ctrl+Shift+H | Focus Recent documents |
 | Ctrl+Shift+C / Ctrl+Shift+M | Copy / move |
-| Delete | Recycle |
+| Ctrl+Shift+D | Delete to the Recycle Bin, with approval |
+| Ctrl+Shift+S | Cycle Name / Size / Last modified, ascending / descending |
 | Escape / Ctrl+Enter | Cancel / approve in confirmation |
 
 Other commands are available in the palette. No F-keys or Z/Y bindings required.
+The pinned `..` row always remains above the files, including empty/filtered
+folders. It is navigation only, never a selection or operation target.
+Search uses real relative filenames, skips links/junctions, and supports
+Enter to search, arrows/Enter to show a result, and cancellation.
+Click a column header to sort; click it again to reverse direction.
+Right-click toggles file selection. Recent documents records only document-like
+files opened through this app, not Windows-wide activity.
+
+Run GitHub Copilot CLI requests `copilot --yolo` in the active folder using the
+Windows console/default-terminal host. It permits the launched CLI to act without
+permission prompts. Run GitHub Copilot App requests `copilot app` in that folder;
+the native CLI and registered `ghapp` handler are required. Actual external
+terminal/session creation still needs end-to-end verification.
 
 ## Safety and status
 
 Every mutation requires exact-target approval. Existing destinations are never
 overwritten. Cancellation can leave partial copies; Activity shows actual paths.
+Durable operation records prevent replay after restart; interrupted overlapping
+operations require actual-state read-back, never automatic retry.
 Copy does not preserve full ACLs, alternate streams or timestamps. Cross-volume
-directory moves are unsupported. See the [operation policy](docs/decisions/file-operations.md).
+moves are unsupported. See the [operation policy](docs/decisions/file-operations.md).
 
-AI/Foundry, MCP answers, voice, Copilot sessions, recursive search and remappable
+AI/Foundry integration, MCP answers, voice and remappable
 shortcuts are not implemented. Physical CZ/US, multi-DPI and full performance
 acceptance remain pending.
 

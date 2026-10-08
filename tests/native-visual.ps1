@@ -182,7 +182,7 @@ try {
     Keys '{HOME}'
     for ($i = 0; $i -lt 3; $i++) { Keys '+{DOWN}' }
     Capture 'range-selection'
-    if ($AssertStable -and (Checked-Count) -ne 4) { throw 'Shift+Down did not select the four-item range' }
+    if ($AssertStable -and (Checked-Count) -ne 3) { throw 'Shift+Down did not select the three real items, excluding the parent row' }
     Keys '{ESC}'
     Keys ' '
     Capture 'space-selection'
