@@ -1,3 +1,4 @@
+pub mod ai;
 pub mod files;
 pub mod journal;
 pub mod platform;

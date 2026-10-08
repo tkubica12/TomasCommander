@@ -276,9 +276,15 @@ enum Command {
     Activity,
     Theme,
     Accent,
+    Foundry,
 }
 
-const COMMANDS: [(Command, &str, &str); 17] = [
+const COMMANDS: [(Command, &str, &str); 18] = [
+    (
+        Command::Foundry,
+        "Foundry connection and bounded text prompt",
+        "",
+    ),
     (Command::Copy, "Copy to opposite pane", "Ctrl Shift C"),
     (Command::Move, "Move to opposite pane", "Ctrl Shift M"),
     (Command::Recycle, "Delete selected items", "Ctrl Shift D"),
@@ -307,6 +313,7 @@ const COMMANDS: [(Command, &str, &str); 17] = [
 ];
 
 pub struct Ledger {
+    ai: crate::ai_ui::AiPanel,
     panes: [Pane; 2],
     active: usize,
     scope: Scope,
@@ -522,6 +529,7 @@ impl Ledger {
             }
         });
         let mut app = Self {
+            ai: crate::ai_ui::AiPanel::new(),
             panes: [Pane::new(initial.clone()), Pane::new(initial.clone())],
             active: 0,
             scope,
@@ -749,6 +757,7 @@ impl Ledger {
     fn dispatch(&mut self, command: Command) {
         self.palette = false;
         match command {
+            Command::Foundry => self.ai.open = true,
             Command::Copy | Command::Move | Command::Recycle => {
                 if self.operation_busy || self.plan.is_some() {
                     self.fail("Finish or cancel the current operation first.");
@@ -884,6 +893,9 @@ impl Ledger {
     }
 
     fn shortcuts(&mut self, ctx: &egui::Context) {
+        if self.ai.open {
+            return;
+        }
         let editing = ctx.memory(|memory| {
             (0..2).any(|pane| {
                 memory.has_focus(Id::new(("path", pane)))
@@ -1943,7 +1955,7 @@ impl Ledger {
                     chosen = Some(*command);
                 }
                 ui.separator();
-                ui.label("Real local commands only. Foundry/MCP and voice are not connected.");
+                ui.label("Real local commands and bounded Foundry text. MCP and voice are not connected.");
                 dismiss = ui.button("Close / Escape").clicked();
             });
             dismiss |= modal.should_close();
@@ -2026,6 +2038,7 @@ impl Ledger {
 
 impl eframe::App for Ledger {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.ai.poll();
         self.poll(ctx);
         self.shortcuts(ctx);
     }
@@ -2042,12 +2055,17 @@ impl eframe::App for Ledger {
             || self.error.is_some()
             || self.search_dialog.is_some()
             || self.close_after_save
+            || self.ai.open
         {
             ui.disable();
         }
         if self.operation_busy && ctx.input(|input| input.viewport().close_requested()) {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             self.fail("An operation is still running. Cancel work or wait for its exact outcome before closing.");
+        } else if self.ai.busy() && ctx.input(|input| input.viewport().close_requested()) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.ai.cancel();
+            self.ai.open = true;
         } else if ctx.input(|input| input.viewport().close_requested())
             && ((self.save_pending && self.preferences_writable) || self.saves_in_flight > 0)
         {
@@ -2079,6 +2097,9 @@ impl eframe::App for Ledger {
                         ui.heading("Tomas Commander");
                     });
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("Foundry").clicked() {
+                            self.dispatch(Command::Foundry);
+                        }
                         if action_button(ui, "Commands", "Ctrl Shift P", true).clicked() {
                             self.palette = true;
                             self.palette_focus = true;
@@ -2347,11 +2368,12 @@ impl eframe::App for Ledger {
                 self.pane_ui(ui, 1);
             });
         self.dialogs(&ctx);
+        self.ai.show(&ctx);
     }
 }
 
 // egui 0.36 text editors expose ValuePattern but do not process SetValue.
-fn accessible_text_value(ctx: &egui::Context, id: Id, text: &mut String) -> bool {
+pub(crate) fn accessible_text_value(ctx: &egui::Context, id: Id, text: &mut String) -> bool {
     let mut changed = false;
     ctx.input_mut(|input| {
         input.events.retain(|event| {

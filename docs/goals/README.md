@@ -9,7 +9,7 @@ Creating a card does not start its implementation or grant tool permissions.
 | UI-01 | [Five UI alternatives](ui-exploration.md) | Ledger direction accepted; no more design batches; physical-layout check still pending | None |
 | APP-01 | [Windows shell and app integrations](desktop-integration.md) | Real Rust native slice built; physical-layout/launch/measurement acceptance incomplete | VS Code workspace read-back; supported Copilot mechanism; performance limits |
 | FILE-01 | [Two-pane file management](file-management.md) | Bound operation/safety checks and warm service ceilings PASS; complete acceptance BLOCKED | Physical/native input verification; startup/resource/input limits |
-| AI-01 | [Foundry connection and bounded runtime](ai-runtime.md) | Draft | Approved identity, endpoint, data boundaries, and limits |
+| AI-01 | [Foundry connection and bounded runtime](ai-runtime.md) | Scoped bounded text/runtime pilot verified; C01-C04 PASS | Broader app/hardware acceptance remains separate |
 | SEARCH-01 | [AI-assisted file search](ai-file-search.md) | Draft | FILE-01 discovery; AI-01 |
 | CMD-01 | [Deterministic and AI command palette](command-palette.md) | Real deterministic palette; AI portion BLOCKED | Physical-layout/focus matrix; AI-01; performance limits |
 | ANSWER-01 | [Web and workplace answers](connected-answers.md) | Draft | AI-01; authorized MCP connections |

@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod ai_ui;
 mod app;
 
 use eframe::egui;
@@ -7,9 +8,55 @@ use std::{path::PathBuf, time::Instant};
 use tomas_commander::files::Scope;
 
 fn main() {
+    if std::env::args().nth(1).as_deref() == Some("--ai-worker") {
+        if tomas_commander::ai::worker().is_err() {
+            std::process::exit(1);
+        }
+        return;
+    }
+    if matches!(
+        std::env::args().nth(1).as_deref(),
+        Some("--ai-check" | "--ai-smoke" | "--ai-check-session")
+    ) {
+        if let Err(error) = ai_cli() {
+            eprintln!("{error}");
+            std::process::exit(1);
+        }
+        return;
+    }
     if let Err(error) = run() {
         tomas_commander::platform::show_error(&error.to_string());
         std::process::exit(1);
+    }
+
+    fn ai_cli() -> Result<(), String> {
+        use tomas_commander::ai::{self, Completion, Job};
+        let config_path = ai::config_path()?;
+        let config = ai::Config::load(&config_path)?;
+        let prompt = (std::env::args().nth(1).as_deref() == Some("--ai-smoke"))
+            .then(|| "Reply with exactly: Synthetic Foundry connection OK.".to_owned());
+        let benchmark = std::env::args().nth(1).as_deref() == Some("--ai-check-session");
+        let mut session = ai::Session::default();
+        for trial in 0..if benchmark { 4 } else { 1 } {
+            let completion = session.run(
+                Job {
+                    config: config.clone(),
+                    prompt: prompt.clone(),
+                    config_path: config_path.clone(),
+                    recheck: trial == 0,
+                },
+                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            )?;
+            if let Completion::Error(error) = completion {
+                return Err(error);
+            }
+            println!(
+                "{}",
+                serde_json::to_string(&completion).map_err(|_| "Could not encode smoke result.")?
+            );
+        }
+        session.clear()?;
+        Ok(())
     }
 }
 

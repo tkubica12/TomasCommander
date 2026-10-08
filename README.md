@@ -60,9 +60,17 @@ operations require actual-state read-back, never automatic retry.
 Copy does not preserve full ACLs, alternate streams or timestamps. Cross-volume
 moves are unsupported. See the [operation policy](docs/decisions/file-operations.md).
 
-AI/Foundry integration, MCP answers, voice and remappable
-shortcuts are not implemented. Physical CZ/US, multi-DPI and full performance
-acceptance remain pending.
+Foundry supports an explicit prompt-only native pilot: open **Foundry**, configure
+the nonsecret Azure resource/identity settings, then check the existing Azure CLI
+sign-in and send once. No file data, tools, automatic retries or model fallback.
+Verified identity/token reuse is memory-only and capped at 60 seconds; Check
+forces fresh verification, and Disconnect clears the session.
+Settings are in `%LOCALAPPDATA%\TomasCommander\ai-connection.json`; the five-attempt
+pilot budget is durable. Cancel/deadline outcomes may still be billed.
+See [AI runtime policy](docs/decisions/ai-runtime.md).
+
+MCP answers, voice, AI file search/planning and remappable shortcuts are not
+implemented. Physical CZ/US, multi-DPI and full performance acceptance remain pending.
 
 ## Development
 
