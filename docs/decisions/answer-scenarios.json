@@ -1,0 +1,62 @@
+{
+  "version": 1,
+  "id": "ANSWER-01-public-rubric-v1",
+  "status": "OWNER_APPROVED_PUBLIC_PILOT_LOCAL_KEY_SETUP_PENDING",
+  "approval": "Owner selected 'Approve this public pilot, Sol route and budget extension' through coordinator on 2026-10-09; exact A01/A02 submissions once, public official passages only, cumulative model 9 to 11, no retries or workplace reads",
+  "scope": "Public official documentation only; no actual workplace records",
+  "questions": [
+    {
+      "id": "A01",
+      "question": "What transport and authentication does Web IQ MCP document?",
+      "required_source": "https://webiq.microsoft.ai/documentation/mcp/",
+      "additional_source": "https://webiq.microsoft.ai/documentation/authentication/",
+      "expected": [
+        "The documented MCP endpoint is https://api.microsoft.ai/v3/mcp.",
+        "Authentication supports an account-bound API key or an Entra access token.",
+        "The documented Entra flow is app-only client credentials, not the app's existing Foundry user token."
+      ]
+    },
+    {
+      "id": "A02",
+      "question": "Does Work IQ MCP include write tools, and which single read tool is in this app?",
+      "required_source": "https://learn.microsoft.com/en-us/microsoft-365/copilot/extensibility/work-iq/mcp/tool-reference",
+      "expected": [
+        "The service documents mutation tools; service availability is not app permission.",
+        "This app has only an unapproved typed fetch/mail-preview adapter proposal, not an authenticated WorkIQ connection.",
+        "No workplace write tool is enabled and no actual workplace record was retrieved."
+      ]
+    }
+  ],
+  "rubric": {
+    "question_relevance": "A reviewer must check whether quoted passages actually address each expected fact; substring presence alone is not relevance.",
+    "factual_support": "Every displayed decision-bearing factual claim must be an exact inspected passage excerpt with the matching source ID; unsupported paraphrases are rejected.",
+    "coverage": "Missing or conflicting evidence must be explicit. A link or title without a passage supports no factual claim.",
+    "summaries": "Source summaries are exact first-sentence excerpts, with full bounded passages inspectable.",
+    "acceptance": "Owner must accept the answer UX; synthetic injection cannot replace actual MCP plus provider receipts."
+  },
+  "live_proposal": {
+    "approval_required": false,
+    "credential_setup_required": true,
+    "questions": 2,
+    "mcp_posts_per_question_max": 8,
+    "mcp_posts_total_max": 16,
+    "retrieval_tool_calls_per_question_max": 2,
+    "passages_max": 3,
+    "passage_utf8_bytes_max": 1200,
+    "source_overall_seconds_max": 30,
+    "inference_requests_total_max": 2,
+    "inference_cumulative_baseline": 9,
+    "inference_cumulative_ceiling": 11,
+    "model_proposal": "Existing configured gpt-6-sol deployment; approved exact A01/A02 only, configuration-bound durable grant, no general stronger-route enablement",
+    "output_tokens_per_request_max": 512,
+    "retry": false,
+    "fallback": false,
+    "workplace_reads": 0
+  },
+  "implementation_scope": {
+    "current_public_client": "initialize, notifications/initialized, tools/list, one web call: normally four POSTs",
+    "unsupported": "No browse expansion, source-derived query reformulation, general model inference, OAuth setup or authenticated workplace route",
+    "credential_authority": "Owner selected existing WebIQ key through secure local configuration; user must enter/save it locally, never in chat",
+    "no_authority_inferred": "The separate public pilot approval grants the exact A01/A02 reads/inference; credential-route selection alone never permits spending, key creation, new registration or roles"
+  }
+}

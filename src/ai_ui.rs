@@ -28,12 +28,42 @@ pub struct AiPanel {
     previous_focus: Option<Id>,
     was_open: bool,
     submitted: Option<Instant>,
+    task: ai::Task,
+    search_result: Option<ai::Result<(tomas_commander::search::Intent, ai::Reply)>>,
+    command_result: Option<ai::Result<(tomas_commander::commands::Intent, ai::Reply)>>,
+    #[cfg(feature = "native-answer-tests")]
+    pub answer_test_mode: bool,
+    #[cfg(feature = "native-search-tests")]
+    pub test_scenario: Option<SearchTestScenario>,
 }
 
 struct SessionJob {
     job: Job,
     cancel: Arc<AtomicBool>,
     result: SyncSender<ai::Result<Completion>>,
+}
+
+#[cfg(feature = "native-search-tests")]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum SearchTestScenario {
+    Ambiguous,
+    NoMatch,
+    Unavailable,
+    Failed,
+    PendingCancel,
+    LocalCancel,
+}
+
+#[cfg(feature = "native-search-tests")]
+impl SearchTestScenario {
+    pub const ALL: [(Self, &'static str); 6] = [
+        (Self::Ambiguous, "Ambiguous"),
+        (Self::NoMatch, "No match"),
+        (Self::Unavailable, "Unavailable"),
+        (Self::Failed, "Failed"),
+        (Self::PendingCancel, "Pending cancel"),
+        (Self::LocalCancel, "Local cancel"),
+    ];
 }
 
 impl AiPanel {
@@ -66,6 +96,13 @@ impl AiPanel {
             previous_focus: None,
             was_open: false,
             submitted: None,
+            task: ai::Task::Text,
+            search_result: None,
+            command_result: None,
+            #[cfg(feature = "native-answer-tests")]
+            answer_test_mode: false,
+            #[cfg(feature = "native-search-tests")]
+            test_scenario: None,
         }
     }
 
@@ -77,7 +114,7 @@ impl AiPanel {
         self.cancel.store(true, Ordering::Release);
     }
 
-    fn disconnect(&mut self) {
+    pub fn disconnect(&mut self) {
         self.cancel();
         self.session = None;
         self.consent = false;
@@ -86,7 +123,136 @@ impl AiPanel {
                 .into();
     }
 
+    pub fn start_search(&mut self, ctx: &egui::Context, prompt: &str) -> bool {
+        if self.busy() {
+            self.status = "Foundry is busy. Cancel or wait before interpreting a search.".into();
+            return false;
+        }
+        self.search_result = None;
+        self.task = ai::Task::SearchIntent;
+        self.prompt = prompt.to_owned();
+        self.consent = true;
+        #[cfg(feature = "native-search-tests")]
+        if let Some(scenario) = self.test_scenario {
+            self.start_test_search(ctx, scenario);
+            return true;
+        }
+        self.start(ctx, true);
+        self.busy()
+    }
+
+    pub fn take_search_result(
+        &mut self,
+    ) -> Option<ai::Result<(tomas_commander::search::Intent, ai::Reply)>> {
+        self.search_result.take()
+    }
+
+    pub fn status(&self) -> &str {
+        &self.status
+    }
+
+    pub fn start_command(&mut self, ctx: &egui::Context, prompt: &str) -> bool {
+        if self.busy() {
+            self.status = "Foundry is busy. Cancel or wait before interpreting a command.".into();
+            return false;
+        }
+        self.command_result = None;
+        self.task = ai::Task::CommandIntent;
+        self.prompt = prompt.to_owned();
+        self.consent = true;
+        self.start(ctx, true);
+        self.busy()
+    }
+
+    pub fn take_command_result(
+        &mut self,
+    ) -> Option<ai::Result<(tomas_commander::commands::Intent, ai::Reply)>> {
+        self.command_result.take()
+    }
+
+    #[cfg(feature = "native-search-tests")]
+    fn start_test_search(&mut self, ctx: &egui::Context, scenario: SearchTestScenario) {
+        self.cancel = Arc::new(AtomicBool::new(false));
+        let cancel = self.cancel.clone();
+        let context = ctx.clone();
+        let (sender, receiver) = mpsc::sync_channel(1);
+        self.pending = Some(receiver);
+        self.submitted = Some(Instant::now());
+        self.answer = None;
+        self.status = "TEST ONLY: injected interpretation, zero provider calls.".into();
+        std::thread::spawn(move || {
+            let delay = if scenario == SearchTestScenario::PendingCancel {
+                15000
+            } else {
+                100
+            };
+            let started = Instant::now();
+            while started.elapsed() < Duration::from_millis(delay) {
+                if cancel.load(Ordering::Acquire) {
+                    let _ = sender.send(Err("TEST ONLY: injected pending interpretation cancelled; zero provider calls.".into()));
+                    context.request_repaint();
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let result = match scenario {
+                SearchTestScenario::Unavailable => Err(
+                    "TEST ONLY: injected unavailable provider (HTTP 404); no request or retry."
+                        .into(),
+                ),
+                SearchTestScenario::Failed => Err(
+                    "TEST ONLY: injected malformed search interpretation JSON; no scan or retry."
+                        .into(),
+                ),
+                _ => {
+                    let text = match scenario {
+                        SearchTestScenario::Ambiguous => {
+                            r#"{"status":"ambiguous","terms":[],"folders":[],"file_types":[]}"#
+                        }
+                        SearchTestScenario::NoMatch => {
+                            r#"{"status":"ready","terms":[["notpresentinsyntheticcorpus"]],"folders":[],"file_types":[]}"#
+                        }
+                        _ => r#"{"status":"ready","terms":[],"folders":[],"file_types":["image"]}"#,
+                    };
+                    tomas_commander::search::Intent::parse(text).map(|intent| {
+                        Completion::SearchIntent {
+                            intent,
+                            reply: ai::Reply {
+                                text: text.into(),
+                                request_id: "TEST_ONLY_no_request".into(),
+                                response_id: "TEST_ONLY_no_response".into(),
+                                input_tokens: 0,
+                                output_tokens: 0,
+                                elapsed_ms: 0,
+                                authentication_ms: 0,
+                                authentication_cached: false,
+                                authentication_stages: ai::AuthTimings::default(),
+                                provider_ms: 0,
+                                local_us: 0,
+                                attempts: 0,
+                            },
+                        }
+                    })
+                }
+            };
+            let _ = sender.send(result);
+            context.request_repaint();
+        });
+    }
+
     fn start(&mut self, ctx: &egui::Context, inference: bool) {
+        #[cfg(feature = "native-answer-tests")]
+        if self.answer_test_mode {
+            self.status =
+                "TEST ONLY: all Foundry entry is disabled in the answer UI harness.".into();
+            return;
+        }
+        #[cfg(feature = "native-search-tests")]
+        if self.test_scenario.is_some() {
+            self.status =
+                "TEST ONLY: provider entry disabled; use the injected AI search scenario.".into();
+            return;
+        }
         if self.pending.is_some() {
             return;
         }
@@ -110,11 +276,7 @@ impl AiPanel {
                     "Confirm the explicit prompt-only data boundary before sending.".into();
                 return;
             }
-            if let Err(error) = ai::request(
-                &self.config,
-                ai::Input::ExplicitPrompt(&self.prompt),
-                ai::Route::Primary,
-            ) {
+            if let Err(error) = ai::validate_prompt(&self.config, &self.prompt, self.task) {
                 self.status = error;
                 return;
             }
@@ -129,6 +291,7 @@ impl AiPanel {
             prompt,
             config_path: path.clone(),
             recheck: !inference,
+            task: if inference { self.task } else { ai::Task::Text },
         };
         let context = ctx.clone();
         let (tx, rx) = mpsc::sync_channel(1);
@@ -237,7 +400,45 @@ impl AiPanel {
                     );
                     self.answer = Some(answer);
                 }
+                Ok(Completion::SearchIntent { intent, mut reply }) => {
+                    if let Some(elapsed) = elapsed {
+                        reply.elapsed_ms = elapsed;
+                    }
+                    self.status = format!(
+                        "Search interpreted / {} ms / {} input + {} output tokens / pilot attempt {}/{}",
+                        reply.elapsed_ms,
+                        reply.input_tokens,
+                        reply.output_tokens,
+                        reply.attempts,
+                        self.config.limits.requests
+                    );
+                    #[cfg(feature = "native-search-tests")]
+                    if self.test_scenario.is_some() {
+                        self.status =
+                            "TEST ONLY: injected interpretation completed; zero provider calls."
+                                .into();
+                    }
+                    self.search_result = Some(Ok((intent, reply)));
+                    self.consent = false;
+                }
+                Ok(Completion::CommandIntent { intent, mut reply }) => {
+                    if let Some(elapsed) = elapsed {
+                        reply.elapsed_ms = elapsed;
+                    }
+                    self.status = format!(
+                        "Command interpreted / {} ms / {} input + {} output tokens / cumulative attempt {} (explicit grant)",
+                        reply.elapsed_ms, reply.input_tokens, reply.output_tokens, reply.attempts,
+                    );
+                    self.command_result = Some(Ok((intent, reply)));
+                    self.consent = false;
+                }
                 Ok(Completion::Error(error)) | Err(error) => {
+                    if self.task == ai::Task::SearchIntent {
+                        self.search_result = Some(Err(error.clone()));
+                    }
+                    if self.task == ai::Task::CommandIntent {
+                        self.command_result = Some(Err(error.clone()));
+                    }
                     self.disconnect();
                     self.status = error;
                 }
@@ -375,6 +576,7 @@ impl AiPanel {
             self.start(ctx, false);
         }
         if send {
+            self.task = ai::Task::Text;
             self.start(ctx, true);
         }
     }
@@ -401,6 +603,109 @@ impl Drop for AiPanel {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "native-search-tests")]
+    #[test]
+    fn native_failure_entry_blocks_provider_and_delivers_distinct_cancellable_states() {
+        let context = egui::Context::default();
+        for scenario in [
+            SearchTestScenario::Ambiguous,
+            SearchTestScenario::NoMatch,
+            SearchTestScenario::Unavailable,
+            SearchTestScenario::Failed,
+            SearchTestScenario::PendingCancel,
+        ] {
+            let mut panel = AiPanel::new();
+            panel.test_scenario = Some(scenario);
+            panel.start(&context, true);
+            assert!(!panel.busy() && panel.session.is_none());
+            assert!(panel.status.contains("provider entry disabled"));
+            assert!(panel.start_search(&context, "Synthetic failure test"));
+            if scenario == SearchTestScenario::PendingCancel {
+                panel.cancel();
+            }
+            let started = Instant::now();
+            while panel.busy() && started.elapsed() < Duration::from_secs(2) {
+                std::thread::sleep(Duration::from_millis(10));
+                panel.poll();
+            }
+            assert!(!panel.busy() && panel.session.is_none());
+            let result = panel
+                .take_search_result()
+                .expect("Injected outcome must arrive once");
+            match scenario {
+                SearchTestScenario::Ambiguous => assert_eq!(
+                    result.unwrap().0.status,
+                    tomas_commander::search::IntentStatus::Ambiguous
+                ),
+                SearchTestScenario::NoMatch => {
+                    assert_eq!(result.unwrap().0.terms[0][0], "notpresentinsyntheticcorpus")
+                }
+                SearchTestScenario::Unavailable => {
+                    assert!(result.unwrap_err().contains("unavailable"))
+                }
+                SearchTestScenario::Failed => assert!(result.unwrap_err().contains("malformed")),
+                SearchTestScenario::PendingCancel => {
+                    assert!(result.unwrap_err().contains("cancelled"))
+                }
+                SearchTestScenario::LocalCancel => unreachable!(),
+            }
+            assert!(panel.take_search_result().is_none());
+        }
+    }
+
+    #[test]
+    fn command_failure_arrives_once_and_never_starts_search_or_retry() {
+        let mut panel = AiPanel::new();
+        panel.task = ai::Task::CommandIntent;
+        let (sender, receiver) = mpsc::sync_channel(1);
+        panel.pending = Some(receiver);
+        let ctx = egui::Context::default();
+        assert!(!panel.start_command(&ctx, "Must not resubmit"));
+        assert!(panel.busy());
+        sender
+            .send(Err(
+                "Synthetic exhausted budget; no request or effect.".into()
+            ))
+            .unwrap();
+        panel.poll();
+        assert!(
+            panel
+                .take_command_result()
+                .unwrap()
+                .unwrap_err()
+                .contains("exhausted budget")
+        );
+        assert!(panel.take_command_result().is_none());
+        assert!(panel.take_search_result().is_none());
+        assert!(panel.session.is_none());
+        assert!(!panel.busy());
+    }
+
+    #[test]
+    fn search_result_and_failure_are_delivered_once_and_cancel_disconnects() {
+        let mut panel = AiPanel::new();
+        panel.task = ai::Task::SearchIntent;
+        let (sender, receiver) = mpsc::sync_channel(1);
+        panel.pending = Some(receiver);
+        sender
+            .send(Err(
+                "Synthetic unavailable provider; no request made.".into()
+            ))
+            .unwrap();
+        panel.poll();
+        assert!(
+            panel
+                .take_search_result()
+                .unwrap()
+                .unwrap_err()
+                .contains("unavailable")
+        );
+        assert!(panel.take_search_result().is_none());
+        assert!(!panel.busy());
+        assert!(panel.session.is_none());
+        panel.disconnect();
+        assert!(panel.cancel.load(Ordering::Acquire));
+    }
     #[test]
     fn pending_resubmission_cancel_result_disconnect_and_focus_are_wired() {
         let mut panel = AiPanel::new();

@@ -1,89 +1,142 @@
 # Tomas Commander
 
-A keyboard-first, standalone Windows file manager built in Rust with a native
-Ledger-style UI. No browser, WebView, or JavaScript runtime.
+My personal, made-to-measure file manager for the modern era: a standalone
+Windows application built in Rust, with a native UI and a goal of being very
+fast, lightweight and keyboard-first.
 
-## Run
+Inspired by Total Commander and Norton Commander, it brings two-pane file work,
+in-app reading and editing, and developer/agent launchers into one clean,
+terminal-inspired workspace. No browser engine, WebView or JavaScript runtime.
+AI commands and more AI-assisted workflows are part of the direction; the
+existing AI integrations are limited experiments, not general-purpose agents.
 
-Requires Windows, Rust 1.95+, and Visual Studio 2022 Build Tools with C++ and the
-Windows SDK.
+**Use entirely at your own risk. This is a personal project with zero support
+and no guarantees. Developed with GitHub Copilot; 0% of the code has been
+reviewed by a human. Back up your files before using it.**
+
+![Tomas Commander in dark mode with a blue accent](assets/screenshot-dark-blue.jpg)
+
+Actual v0.1.0 application screenshot; the displayed folder listing was captured
+before the release cleanup.
+
+## Download and run
+
+Download `tomas-commander.exe` from [GitHub Releases](https://github.com/tkubica12/TomasCommander/releases).
+The first semantic version is **v0.1.0**, an experimental Windows x64 release.
+No installer or Rust toolchain is needed to run the downloaded executable.
+The binary is unsigned; this project does not provide code-signing or support.
 
 ```powershell
-cargo build --release --locked
-.\target\release\tomas-commander.exe --root "D:\TomasCommander"
+.\tomas-commander.exe
+# Optional initial folder:
+.\tomas-commander.exe --root "C:\Projects"
 ```
 
-Includes two-pane navigation, selection, filtering, recursive filename search,
-bidirectional column sorting, asynchronous folder sizes/dates, persisted
-favorites/recent documents, a command palette, VS Code/Copilot launchers,
-light/dark themes and four accent colors.
-Preferences live in `%LOCALAPPDATA%\TomasCommander\preferences.txt`.
+## Included in v0.1.0
 
-## Keys
+- Two file panes, keyboard navigation, multi-selection, filtering, recursive
+  filename search and sortable size/date columns.
+- Copy, same-volume move, Recycle Bin deletion, rename and new folder, with
+  exact-path confirmation and durable operation receipts.
+- Saved locations with editable names and removal, recent documents, compact
+  clickable breadcrumbs and inline filename editing.
+- Native previews for Markdown, semantic HTML, PDF, JPEG/PNG/BMP, UTF-8
+  text/config/source files, formatted JSON and comma-delimited CSV.
+- Source editing with guarded Save; ZIP browsing, creation, insertion and
+  extraction with reviewed operation plans.
+- Command palette and Open with choices for VS Code, GitHub Copilot CLI and
+  GitHub Copilot App, when installed.
+- Light/dark mode, four accent choices, proportional UI zoom and internal
+  drag-and-drop: Move by default, Ctrl for Copy.
 
-| Key | Action |
+## Keyboard essentials
+
+| Shortcut | Action |
 |---|---|
-| Ctrl+Shift+P | Command palette |
 | Tab / arrows | Switch pane / navigate |
-| Space / Shift+arrows / Ctrl+A | Toggle / range / select all |
 | Enter / Backspace | Open / parent folder |
-| Ctrl+F / Ctrl+R | Filter / refresh |
-| Ctrl+Shift+F | Search active folder and descendants |
-| Ctrl+Shift+B | Focus pinned folders; arrows / Enter choose, Escape / Tab return |
-| Ctrl+Shift+H | Focus Recent documents |
-| Ctrl+Shift+C / Ctrl+Shift+M | Copy / move |
-| Ctrl+Shift+D | Delete to the Recycle Bin, with approval |
-| Ctrl+Shift+S | Cycle Name / Size / Last modified, ascending / descending |
-| Escape / Ctrl+Enter | Cancel / approve in confirmation |
+| Ctrl+Left / Ctrl+Right | Parent / return after parent navigation |
+| Ctrl+Up / Ctrl+Down | Jump ten rows |
+| Space / Shift+arrows / Ctrl+A | Toggle / range / select all |
+| Ctrl+Enter | Toggle preview; a different file replaces it |
+| Shift+Enter | Open with menu |
+| Ctrl+Shift+P | Command palette |
+| Alt+Up | Saved places, including Add current folder |
+| Ctrl+F / Ctrl+Shift+F | Filter / recursive filename search |
+| Ctrl+Shift+C / Ctrl+Shift+M / Ctrl+Shift+D | Copy / move / Recycle Bin |
+| Ctrl+N / Ctrl+Shift+N | New folder / rename |
+| Ctrl+plus / Ctrl+minus / Ctrl+wheel | Global UI zoom |
+| Ctrl+0 | Reset zoom |
+| ? / status-bar Help | Shortcut help |
 
-Other commands are available in the palette. No F-keys or Z/Y bindings required.
-The pinned `..` row always remains above the files, including empty/filtered
-folders. It is navigation only, never a selection or operation target.
-Search uses real relative filenames, skips links/junctions, and supports
-Enter to search, arrows/Enter to show a result, and cancellation.
-Click a column header to sort; click it again to reverse direction.
-Right-click toggles file selection. Recent documents records only document-like
-files opened through this app, not Windows-wide activity.
+No function keys or Z/Y bindings are required. Mouse access remains available.
+Single-click a filename to edit it in place; Enter reviews the rename and
+Escape cancels. Double-click opens normally; Ctrl-double-click previews and
+Shift-double-click opens the chooser.
 
-Run GitHub Copilot CLI requests `copilot --yolo` in the active folder using the
-Windows console/default-terminal host. It permits the launched CLI to act without
-permission prompts. Run GitHub Copilot App requests `copilot app` in that folder;
-the native CLI and registered `ghapp` handler are required. Actual external
-terminal/session creation still needs end-to-end verification.
+Preferences, saved-location names and appearance persist in
+`%LOCALAPPDATA%\TomasCommander\preferences.txt`.
 
-## Safety and status
+## Important limits
 
-Every mutation requires exact-target approval. Existing destinations are never
-overwritten. Cancellation can leave partial copies; Activity shows actual paths.
-Durable operation records prevent replay after restart; interrupted overlapping
-operations require actual-state read-back, never automatic retry.
-Copy does not preserve full ACLs, alternate streams or timestamps. Cross-volume
-moves are unsupported. See the [operation policy](docs/decisions/file-operations.md).
+Confirmations are safeguards, not a guarantee against data loss. Ordinary file
+operations do not overwrite or merge existing destinations. Cancellation can
+leave partial outputs; inspect **Operations** before retrying. Copy does not
+preserve all Windows metadata, ACLs or alternate streams. Cross-volume moves
+are not supported.
 
-Foundry supports an explicit prompt-only native pilot: open **Foundry**, configure
-the nonsecret Azure resource/identity settings, then check the existing Azure CLI
-sign-in and send once. No file data, tools, automatic retries or model fallback.
-Verified identity/token reuse is memory-only and capped at 60 seconds; Check
-forces fresh verification, and Disconnect clears the session.
-Settings are in `%LOCALAPPDATA%\TomasCommander\ai-connection.json`; the five-attempt
-pilot budget is durable. Cancel/deadline outcomes may still be billed.
-See [AI runtime policy](docs/decisions/ai-runtime.md).
+HTML previews are semantic, not full CSS/browser rendering; scripts and external
+assets are not loaded. ZIP support is limited to Store/Deflate and excludes
+encrypted, split and ZIP64 archives. Voice, remappable shortcuts and external
+Explorer drag-and-drop are not implemented. Broad hardware, performance,
+accessibility and physical CZ/US keyboard acceptance are not complete.
 
-MCP answers, voice, AI file search/planning and remappable shortcuts are not
-implemented. Physical CZ/US, multi-DPI and full performance acceptance remain pending.
+Copilot CLI is launched with `--yolo`, allowing that external agent to act
+without its usual permission prompts. Only use it in a folder you trust.
 
-## Development
+Foundry prompt-only interpretation/search/file-command pilots require your own
+explicit configuration, consent and existing Azure CLI sign-in. They have
+durable attempt limits and no automatic retries. Connected WebIQ answers have
+an experimental app-side implementation but no completed live acceptance;
+WorkIQ is not a working integration. AI data/budget boundaries are described
+in [AI runtime](docs/decisions/ai-runtime.md) and
+[connected answers](docs/decisions/connected-answers.md).
+
+## Build from source
+
+Windows, Rust 1.95+ and Visual Studio 2022 Build Tools with C++/Windows SDK
+are required.
+
+```powershell
+.\scripts\build.ps1
+.\release\tomas-commander.exe --root "C:\Projects"
+```
+
+`release\tomas-commander.exe` is the single current local executable. `release`
+and Cargo's `target` cache are gitignored; published versions live in GitHub
+Releases. Close the local app before rebuilding. A failed build/publication
+preserves the previous executable.
 
 ```powershell
 cargo test --locked
-cargo clippy --locked --all-targets -- -D warnings
+cargo test --locked --all-features
+cargo clippy --locked --all-targets --all-features -- -D warnings
 cargo fmt --all -- --check
+.\tests\build-workflow.ps1
 ```
 
-Real-window checks: `tests\native-smoke.ps1` and `tests\native-visual.ps1`.
-They use owned synthetic fixtures; the visual run temporarily controls its test
-window, so leave the desktop idle. See the scripts for parameters.
+Diagnostic features are nonshipping. Build them only with
+`.\scripts\build.ps1 -Mode Diagnostic -Features native-desktop-tests`, then
+close the diagnostic process and run
+`.\scripts\build.ps1 -Mode CleanDiagnostic`.
 
-[PRD](PRD.md) · [Goal Cards](docs/goals/README.md) ·
-[Architecture and validation](docs/decisions/desktop-shell.md).
-`prototypes\ui` is historical browser design exploration, not the product.
+The existing local WinHTTP timeout regression is intermittent under a broad
+parallel test run; an isolated rerun can pass. This is a known validation limit,
+not evidence that the full suite is consistently green.
+
+[Usage and format limits](docs/usage.md) ·
+[Architecture](docs/decisions/desktop-shell.md) ·
+[File-operation policy](docs/decisions/file-operations.md) ·
+[Roadmap](docs/roadmap.md) · [Release notes](CHANGELOG.md)
+
+Licensed under [MIT](LICENSE).

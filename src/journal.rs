@@ -16,6 +16,108 @@ pub struct Journal {
 }
 
 impl Journal {
+    #[cfg(feature = "native-desktop-tests")]
+    pub fn desktop_rejection_probe(
+        scope: &Scope,
+        root: PathBuf,
+        source: &Path,
+        destination: &Path,
+    ) -> FileResult<String> {
+        if root
+            .try_exists()
+            .map_err(|error| format!("Inspect rejection journal: {error}"))?
+        {
+            return Err(
+                "Rejection probe journal already exists; inspect it, do not retry or overwrite."
+                    .into(),
+            );
+        }
+        let journal = Self::new(root);
+        journal.initialize()?;
+        let plan = files::plan(
+            scope,
+            1,
+            files::Operation::Copy,
+            &[source.to_owned()],
+            Some(destination),
+        )?;
+        let original = files::fingerprint(source)?;
+        let cancel = AtomicBool::new(false);
+        let mut report = String::from(
+            "TEST ONLY / synthetic snapshots and claimed receipt / real rejection paths / zero fixture effects\n",
+        );
+        for (label, candidate, approved, expected) in [
+            (
+                "Unapproved exact plan",
+                plan.clone(),
+                false,
+                "Explicit plan approval",
+            ),
+            (
+                "Injected stale source snapshot",
+                plan.desktop_test_stale_snapshot(false)?,
+                true,
+                "Source changed",
+            ),
+            (
+                "Injected stale destination snapshot",
+                plan.desktop_test_stale_snapshot(true)?,
+                true,
+                "Destination folder changed",
+            ),
+            (
+                "Injected existing target binding",
+                plan.desktop_test_existing_target()?,
+                true,
+                "Destination changed; no overwrite",
+            ),
+        ] {
+            let outcome = files::execute(scope, &candidate, approved, &cancel);
+            let error = outcome
+                .error
+                .as_deref()
+                .ok_or_else(|| format!("{label}: expected refusal, got no error."))?;
+            if !error.contains(expected)
+                || !outcome.created.is_empty()
+                || !outcome.completed.is_empty()
+            {
+                return Err(format!("{label}: rejection invariant failed: {outcome:?}"));
+            }
+            report.push_str(&format!("{label}: {error}\n"));
+        }
+        // Seed only diagnostic journal metadata, never a successful operation.
+        let mut receipt = journal.claim(&plan)?;
+        receipt.write_all(b"\nerror=\"TEST ONLY synthetic claimed receipt; no operation executed\"\nfinished\n")
+            .and_then(|()| receipt.sync_all())
+            .map_err(|error| format!("Persist diagnostic replay receipt: {error}"))?;
+        drop(receipt);
+        let replay = journal.execute(scope, &plan, true, &cancel);
+        let error = replay
+            .error
+            .as_deref()
+            .ok_or("Duplicate replay probe did not refuse.")?;
+        if !error.contains("Claim operation once")
+            || !replay.created.is_empty()
+            || !replay.completed.is_empty()
+        {
+            return Err(format!(
+                "Duplicate replay rejection invariant failed: {replay:?}"
+            ));
+        }
+        report.push_str(&format!(
+            "Injected already-claimed receipt / replay: {error}\n"
+        ));
+        if files::fingerprint(source)? != original
+            || destination
+                .join(source.file_name().ok_or("Probe source has no filename.")?)
+                .try_exists()
+                .map_err(|error| format!("Read back rejection target: {error}"))?
+        {
+            return Err("Rejection probe source/target read-back failed.".into());
+        }
+        Ok(report)
+    }
+
     pub fn new(root: PathBuf) -> Self {
         Self { root }
     }
@@ -108,6 +210,19 @@ impl Journal {
     }
 
     fn claim(&self, plan: &Plan) -> FileResult<File> {
+        self.claim_snapshot(
+            plan.execution_key(),
+            &plan.journal_snapshot(),
+            &plan.affected_paths(),
+        )
+    }
+
+    pub(crate) fn claim_snapshot(
+        &self,
+        key: &str,
+        snapshot: &str,
+        affected: &[PathBuf],
+    ) -> FileResult<File> {
         self.initialize()?;
         // Serialize claim/check across instances; an abandoned lock handle is released by Windows.
         let lock_path = self.root.join("journal.lock");
@@ -121,7 +236,6 @@ impl Journal {
         let _lock = options
             .open(&lock_path)
             .map_err(|e| format!("Lock operation journal; no changes made: {e}"))?;
-        let affected = plan.affected_paths();
         for (path, text) in self.records()? {
             if !text.ends_with("finished\n") {
                 let recorded = recorded_paths(&text)?;
@@ -139,9 +253,7 @@ impl Journal {
                 }
             }
         }
-        let path = self
-            .root
-            .join(format!("{}.operation", plan.execution_key()));
+        let path = self.root.join(format!("{key}.operation"));
         let mut record = OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -152,7 +264,7 @@ impl Journal {
                     files::display_path(&path)
                 )
             })?;
-        let snapshot = format!("{HEADER}{}", plan.journal_snapshot());
+        let snapshot = format!("{HEADER}{snapshot}");
         if snapshot.len() as u64 > MAX_RECORD_BYTES {
             return Err(
                 "Approved plan exceeds the durable journal limit; no mutation performed.".into(),
@@ -175,7 +287,7 @@ impl Journal {
         if !approved {
             return files::execute(scope, plan, false, cancelled);
         }
-        let mut record = match self.claim(plan) {
+        let record = match self.claim(plan) {
             Ok(record) => record,
             Err(error) => {
                 return Outcome {
@@ -188,7 +300,10 @@ impl Journal {
                 };
             }
         };
-        let mut outcome = files::execute(scope, plan, true, cancelled);
+        Self::finish(record, files::execute(scope, plan, true, cancelled))
+    }
+
+    pub(crate) fn finish(mut record: File, mut outcome: Outcome) -> Outcome {
         let mut result = format!("\ncancelled={}\n", outcome.cancelled);
         for path in &outcome.completed {
             result.push_str(&format!("completed={}\n", encode_path(path)));

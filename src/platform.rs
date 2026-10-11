@@ -115,6 +115,35 @@ pub fn open_file(_path: &Path) -> FileResult<()> {
 }
 
 #[cfg(windows)]
+pub fn open_web_url(url: &crate::answers::SafeUrl) -> FileResult<()> {
+    use windows::{
+        Win32::UI::{Shell::ShellExecuteW, WindowsAndMessaging::SW_SHOWNORMAL},
+        core::{PCWSTR, w},
+    };
+    let checked = crate::answers::SafeUrl::inspected(url.as_str())?;
+    let value: Vec<u16> = checked.as_str().encode_utf16().chain(Some(0)).collect();
+    let result = unsafe {
+        ShellExecuteW(
+            None,
+            w!("open"),
+            PCWSTR(value.as_ptr()),
+            None,
+            None,
+            SW_SHOWNORMAL,
+        )
+    };
+    if result.0 as isize <= 32 {
+        return Err("Windows could not open the selected inspected web source.".into());
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+pub fn open_web_url(_url: &crate::answers::SafeUrl) -> FileResult<()> {
+    Err("Opening source links requires the Windows desktop.".into())
+}
+
+#[cfg(windows)]
 pub fn move_no_replace(source: &Path, target: &Path) -> FileResult<()> {
     let parent = target.parent().ok_or("Move target has no parent folder.")?;
     move_verified(
@@ -461,21 +490,32 @@ pub fn open_vscode(path: &Path) -> FileResult<()> {
             candidates.push(std::path::PathBuf::from(root).join(suffix));
         }
     }
-    let executable = candidates
-        .into_iter()
-        .find(|path| path.is_file())
-        .ok_or("VS Code executable not found in standard locations. No shell fallback was used.")?;
-    Command::new(executable)
-        .arg("--new-window")
-        .arg(path)
-        .spawn()
-        .map_err(|e| {
-            format!(
-                "Launch VS Code for {}: {e}",
-                crate::files::display_path(path)
-            )
-        })?;
+    let executable = find_vscode(candidates)?;
+    vscode_command(&executable, path).spawn().map_err(|e| {
+        format!(
+            "Launch VS Code for {}: {e}",
+            crate::files::display_path(path)
+        )
+    })?;
     Ok(())
+}
+
+pub fn find_vscode(
+    candidates: impl IntoIterator<Item = std::path::PathBuf>,
+) -> FileResult<std::path::PathBuf> {
+    candidates
+        .into_iter()
+        .filter(|path| path.is_absolute())
+        .find(|path| path.is_file())
+        .ok_or_else(|| {
+            "VS Code executable not found in standard locations. Install VS Code using its user or system installer, then restart Tomas Commander. No shell fallback was used.".into()
+        })
+}
+
+fn vscode_command(executable: &Path, folder: &Path) -> Command {
+    let mut command = Command::new(executable);
+    command.arg("--new-window").arg(folder);
+    command
 }
 
 pub fn find_copilot(
@@ -583,4 +623,20 @@ pub fn open_copilot(path: &Path, app: bool) -> FileResult<()> {
 #[cfg(not(windows))]
 pub fn open_copilot(_path: &Path, _app: bool) -> FileResult<()> {
     Err("Copilot terminal/app launch currently requires Windows.".into())
+}
+
+#[cfg(test)]
+mod launch_tests {
+    use super::*;
+
+    #[test]
+    fn vscode_folder_is_one_lossless_argument_not_shell_syntax() {
+        let folder = Path::new(r"C:\owned fixtures\Příliš žluťoučký & %PATH%");
+        let command = vscode_command(Path::new(r"C:\VS Code\Code.exe"), folder);
+        assert_eq!(command.get_program(), r"C:\VS Code\Code.exe");
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            [std::ffi::OsStr::new("--new-window"), folder.as_os_str()]
+        );
+    }
 }

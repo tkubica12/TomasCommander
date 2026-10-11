@@ -4,7 +4,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-if (-not $Executable) { $Executable = Join-Path $PSScriptRoot '..\target\release\tomas-commander.exe' }
+if (-not $Executable) { $Executable = Join-Path $PSScriptRoot '..\release\tomas-commander.exe' }
 Add-Type -AssemblyName UIAutomationClient
 Add-Type -AssemblyName UIAutomationTypes
 $root = Join-Path $EvidenceDirectory ("native-smoke-" + [Guid]::NewGuid().ToString('N'))

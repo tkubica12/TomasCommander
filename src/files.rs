@@ -408,6 +408,30 @@ pub struct Plan {
 }
 
 impl Plan {
+    #[cfg(feature = "native-desktop-tests")]
+    pub(crate) fn desktop_test_stale_snapshot(&self, destination: bool) -> FileResult<Self> {
+        let mut plan = self.clone();
+        let identity = if destination {
+            plan.destination_identity.as_mut()
+        } else {
+            plan.nodes.first_mut().map(|node| &mut node.identity)
+        }
+        .ok_or("Desktop rejection probe requires a source and destination snapshot.")?;
+        identity.size = identity.size.wrapping_add(1);
+        Ok(plan)
+    }
+
+    #[cfg(feature = "native-desktop-tests")]
+    pub(crate) fn desktop_test_existing_target(&self) -> FileResult<Self> {
+        let mut plan = self.clone();
+        let node = plan
+            .nodes
+            .first_mut()
+            .ok_or("Desktop target rejection probe requires a planned node.")?;
+        node.target = Some(node.source.clone());
+        Ok(plan)
+    }
+
     pub fn id(&self) -> u64 {
         self.id
     }
@@ -947,8 +971,12 @@ pub fn execute(scope: &Scope, plan: &Plan, approved: bool, cancelled: &AtomicBoo
 }
 
 #[cfg(windows)]
+pub(crate) fn lock_mutation_parents(parent: &Path) -> FileResult<Vec<File>> {
+    lock_paths(parent.ancestors().map(Path::to_owned).collect())
+}
+
+#[cfg(windows)]
 fn lock_copy_paths(plan: &Plan) -> FileResult<Vec<File>> {
-    use std::os::windows::fs::OpenOptionsExt;
     let mut paths = BTreeSet::new();
     for node in &plan.nodes {
         paths.extend(node.source.ancestors().map(Path::to_owned));
@@ -956,6 +984,12 @@ fn lock_copy_paths(plan: &Plan) -> FileResult<Vec<File>> {
     if let Some(destination) = &plan.destination {
         paths.extend(destination.ancestors().map(Path::to_owned));
     }
+    lock_paths(paths)
+}
+
+#[cfg(windows)]
+fn lock_paths(paths: BTreeSet<PathBuf>) -> FileResult<Vec<File>> {
+    use std::os::windows::fs::OpenOptionsExt;
     let mut handles = Vec::with_capacity(paths.len());
     for path in paths {
         let metadata =

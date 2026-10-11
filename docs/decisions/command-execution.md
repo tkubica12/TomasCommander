@@ -1,25 +1,28 @@
-# Native command execution
+# Commands and intent
 
-Date: 2026-10-07. Deterministic slice only; AI planning is not connected.
+The palette dispatches typed allowlisted application commands. Text does not
+become arbitrary shell code. Deterministic file commands use the same planners,
+guards, workers and journal as keyboard/mouse actions.
 
-The typed registry in `src\app.rs` exposes local commands through the native
-Ctrl+Shift+P palette and actual buttons. Matching is a case-insensitive substring
-of command titles. Arrows choose, Enter dispatches, Escape closes. There is no
-natural-language inference, shell execution, or canned model response.
+The experimental Natural-language file command mode sends one confirmed
+Czech/English prompt to the configured primary model. Candidate resolution is
+local within the two pane roots; paths/candidates/contents are not transmitted.
+Ambiguity asks for a choice. Unsupported/malformed outputs fail explicitly.
 
-Supported actions: copy, move, recycle, refresh, favorites, pin folder, sort,
-filter, balance panes, open VS Code, activity, theme, and accent. Theme/accent
-commands make appearance controls accessible without using the mouse.
-The palette's file commands use the same typed executor and modal approval as
-the buttons; see [file operation policy](file-operations.md).
+Supported pilot intents find, copy, move or recycle one file. They never grant
+overwrite, merge, permanent deletion or effect approval. A successful intent
+builds the existing immutable exact-path review; Cancel has no file effect.
+Execution still needs explicit confirmation and revalidated snapshots.
 
-Text fields retain editing shortcuts. The egui 0.36 text-edit accessibility
-bridge explicitly implements AccessKit SetValue requests for path, filter, and
-palette fields, including cursor reset and filter revision. Native UI Automation
-verifies exact editor-value read-back, not just successful invocation.
+`command-scenarios.json` retains the frozen pilot scenarios. The configuration-
+bound grant adds four exact CommandIntent attempts to the original five-attempt
+history, with a cumulative ceiling of nine; it does not reset history or enable
+general automation. No automatic retries/fallbacks.
 
-AI intents and multi-step plans remain BLOCKED on actual Foundry endpoint,
-deployment, authentication, data boundary and cost/operation limits. The Penta
-presentation/Kosik natural-language scenario is not yet delivered.
-Copilot App sessions, WorkIQ/WebIQ/MCP and voice are likewise not deterministic
-substitutes. Their Goal Card checks remain unpassed.
+Developer launchers are separate explicit commands. VS Code receives the folder
+as a lossless argument. Copilot App requests `copilot app` for that folder.
+Copilot CLI requests `copilot --yolo` through the Windows terminal host, which
+allows the external agent to act without its normal permission prompts.
+Installed tools and handlers are required; failures are surfaced.
+
+See [operation policy](file-operations.md) and [AI runtime](ai-runtime.md).

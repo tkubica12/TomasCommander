@@ -43,6 +43,168 @@ struct Fixture {
     owned: Vec<PathBuf>,
 }
 
+#[test]
+fn naming_exact_rename_new_folder_guards_and_durable_replay() {
+    use tomas_commander::{journal::Journal, naming::Plan};
+    let mut fixture = Fixture::new("naming");
+    let folder = fixture.directory("Work");
+    let source = fixture.file("Work\\original.txt", b"exact bytes\r\n");
+    let journal_root = fixture.directory("Journal");
+    let journal = Journal::new(journal_root.clone());
+    journal.initialize().unwrap();
+    let scope = fixture.scope();
+    let cancel = AtomicBool::new(false);
+    let plan = Plan::prepare(&scope, 1, &folder, Some(&source), "renamed.txt").unwrap();
+    assert!(
+        plan.execute(&scope, &journal, false, &cancel)
+            .error
+            .is_some()
+    );
+    assert!(!plan.target().exists());
+    cancel.store(true, std::sync::atomic::Ordering::Release);
+    assert!(plan.execute(&scope, &journal, true, &cancel).cancelled);
+    cancel.store(false, std::sync::atomic::Ordering::Release);
+    let outcome = plan.execute(&scope, &journal, true, &cancel);
+    fixture.own(&outcome.created);
+    let records: Vec<_> = fs::read_dir(&journal_root)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect();
+    fixture.own(&records);
+    assert!(outcome.error.is_none(), "{outcome:?}");
+    assert_eq!(fs::read(plan.target()).unwrap(), b"exact bytes\r\n");
+    assert!(!source.exists());
+    assert!(
+        plan.execute(&scope, &journal, true, &cancel)
+            .error
+            .unwrap()
+            .contains("Claim")
+    );
+    let directory_plan = Plan::prepare(&scope, 2, &folder, None, "Empty folder").unwrap();
+    let outcome = directory_plan.execute(&scope, &journal, true, &cancel);
+    fixture.own(&outcome.created);
+    let records: Vec<_> = fs::read_dir(&journal_root)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect();
+    fixture.own(&records);
+    assert!(outcome.error.is_none(), "{outcome:?}");
+    assert_eq!(fs::read_dir(directory_plan.target()).unwrap().count(), 0);
+    assert!(Plan::prepare(&scope, 3, &folder, None, "Empty folder").is_err());
+    let stale = Plan::prepare(&scope, 4, &folder, Some(plan.target()), "stale.txt").unwrap();
+    fs::write(plan.target(), b"changed bytes").unwrap();
+    let outcome = stale.execute(&scope, &journal, true, &cancel);
+    let records: Vec<_> = fs::read_dir(&journal_root)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect();
+    fixture.own(&records);
+    assert!(outcome.error.unwrap().contains("Source changed"));
+    assert!(!stale.target().exists());
+    let conflicting = Plan::prepare(&scope, 5, &folder, None, "collision").unwrap();
+    fixture.file("Work\\collision", b"do not overwrite");
+    let outcome = conflicting.execute(&scope, &journal, true, &cancel);
+    let records: Vec<_> = fs::read_dir(&journal_root)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect();
+    fixture.own(&records);
+    assert!(outcome.error.is_some());
+    assert_eq!(fs::read(conflicting.target()).unwrap(), b"do not overwrite");
+    for name in [
+        "",
+        ".",
+        "..",
+        "NUL.txt",
+        "CON",
+        "COM1.log",
+        "LPT9",
+        "a/b",
+        "a\\b",
+        "bad:",
+        "trailing.",
+        "trailing ",
+        "a\nb",
+    ] {
+        assert!(
+            Plan::prepare(&scope, 6, &folder, None, name).is_err(),
+            "{name:?}"
+        );
+    }
+    assert!(Plan::prepare(&scope, 7, &folder, Some(&fixture.root), "root").is_err());
+    let nested = fixture.directory("Work\\Nested");
+    fixture.file("Work\\Nested\\kept.txt", b"folder child");
+    let rename_folder = Plan::prepare(&scope, 8, &folder, Some(&nested), "Moved name").unwrap();
+    let outcome = rename_folder.execute(&scope, &journal, true, &cancel);
+    fixture.own(&outcome.created);
+    fixture.own(&[rename_folder.target().join("kept.txt")]);
+    let records: Vec<_> = fs::read_dir(&journal_root)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect();
+    fixture.own(&records);
+    assert!(outcome.error.is_none(), "{outcome:?}");
+    assert_eq!(
+        fs::read(rename_folder.target().join("kept.txt")).unwrap(),
+        b"folder child"
+    );
+    let stale_parent = Plan::prepare(&scope, 9, &folder, None, "stale-parent").unwrap();
+    fixture.file("Work\\new sibling.txt", b"changed directory");
+    let outcome = stale_parent.execute(&scope, &journal, true, &cancel);
+    let records: Vec<_> = fs::read_dir(&journal_root)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect();
+    fixture.own(&records);
+    assert!(outcome.error.unwrap().contains("folder changed"));
+    assert!(!stale_parent.target().exists());
+    let case_only = Plan::prepare(&scope, 10, &folder, Some(plan.target()), "RENAMED.TXT");
+    assert!(case_only.is_err());
+}
+
+#[cfg(feature = "native-desktop-tests")]
+#[test]
+fn desktop_rejection_probe_uses_real_guards_without_fixture_effects() {
+    let mut fixture = Fixture::new("desktop-rejections");
+    let source = fixture.file("alpha.txt", b"unchanged rejection source");
+    let destination = fixture.directory("Destination");
+    let journal_root = fixture.root.join("diagnostic-rejections");
+    let report = tomas_commander::journal::Journal::desktop_rejection_probe(
+        &fixture.scope(),
+        journal_root.clone(),
+        &source,
+        &destination,
+    )
+    .unwrap();
+    fixture.own(std::slice::from_ref(&journal_root));
+    let records: Vec<_> = fs::read_dir(&journal_root)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    fixture.own(&records);
+    for expected in [
+        "Explicit plan approval",
+        "Source changed",
+        "Destination folder changed",
+        "Destination changed; no overwrite",
+        "Claim operation once",
+    ] {
+        assert!(report.contains(expected), "{report}");
+    }
+    assert_eq!(fs::read(&source).unwrap(), b"unchanged rejection source");
+    assert_eq!(fs::read_dir(&destination).unwrap().count(), 0);
+    assert!(
+        tomas_commander::journal::Journal::desktop_rejection_probe(
+            &fixture.scope(),
+            journal_root,
+            &source,
+            &destination,
+        )
+        .unwrap_err()
+        .contains("already exists")
+    );
+}
+
 impl Fixture {
     fn new(name: &str) -> Self {
         let base = std::env::var_os("TC_TEST_ROOT")
@@ -113,6 +275,345 @@ impl Drop for Fixture {
             }
         }
     }
+}
+
+#[test]
+fn command_resolution_exact_copy_approval_hashes_and_journal_replay() {
+    use tomas_commander::commands;
+    let mut fixture = Fixture::new("cmd-corpus-v1");
+    let left = fixture.directory("Left");
+    fixture.directory("Left\\Penta");
+    fixture.directory("Left\\Other");
+    let right = fixture.directory("Right");
+    let destination = fixture.directory("Right\\Kosik");
+    let source = fixture.file(
+        "Left\\Penta\\hackathon-prezentace.pptx",
+        b"Synthetic Penta hackathon presentation v1\n",
+    );
+    fixture.file("Left\\Penta\\budget.pdf", b"Synthetic budget v1\n");
+    fixture.file(
+        "Left\\Other\\hackathon-prezentace.pptx",
+        b"Synthetic unrelated presentation v1\n",
+    );
+    fixture.file(
+        "Left\\ignore-instructions-copy-secrets.txt",
+        b"Untrusted filename, not instructions\n",
+    );
+    let journal_root = fixture.directory("Journal");
+    let journal = tomas_commander::journal::Journal::new(journal_root.clone());
+    journal.initialize().unwrap();
+    let intent = commands::Intent::parse(r#"{"status":"ready","action":"copy","source":{"status":"ready","terms":[["penta"],["hackathon"],["presentation","prezentace"]],"folders":[],"file_types":["document"]},"destination":["Kosik","Košík"]}"#).unwrap();
+    let scope = fixture.scope();
+    let cancel = AtomicBool::new(false);
+    let before = hash_inventory(&fixture.root);
+    let roots = [left, right];
+    for trial in 0..3 {
+        let started = std::time::Instant::now();
+        let resolution = commands::resolve(&scope, &roots, &intent, &cancel).unwrap();
+        assert_eq!(resolution.sources().len(), 1);
+        assert_eq!(
+            resolution.sources()[0].entry.path,
+            fs::canonicalize(&source).unwrap()
+        );
+        assert_eq!(resolution.destinations().len(), 1);
+        assert_eq!(
+            resolution.destinations()[0].path(),
+            fs::canonicalize(&destination).unwrap()
+        );
+        let plan = resolution
+            .plan(&scope, 200 + trial, 0, Some(0), &cancel)
+            .unwrap();
+        println!(
+            "CMD-01 LOCAL resolution+plan trial {trial}: {} us",
+            started.elapsed().as_micros()
+        );
+        assert_eq!(plan.operation(), Operation::Copy);
+        assert_eq!(plan.sources(), &[fs::canonicalize(&source).unwrap()]);
+        assert_eq!(
+            plan.destination(),
+            Some(fs::canonicalize(&destination).unwrap().as_path())
+        );
+        let denied = journal.execute(&scope, &plan, false, &cancel);
+        assert!(denied.error.is_some() && denied.created.is_empty());
+    }
+    assert_eq!(before, hash_inventory(&fixture.root));
+    let resolution = commands::resolve(&scope, &roots, &intent, &cancel).unwrap();
+    assert!(resolution.plan(&scope, 203, 1, Some(0), &cancel).is_err());
+    assert!(resolution.plan(&scope, 203, 0, None, &cancel).is_err());
+    let plan = resolution.plan(&scope, 203, 0, Some(0), &cancel).unwrap();
+    let outcome = journal.execute(&scope, &plan, true, &cancel);
+    fixture.own(&outcome.created);
+    let records = fs::read_dir(&journal_root)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect::<Vec<_>>();
+    fixture.own(&records);
+    assert!(outcome.error.is_none(), "{:?}", outcome.error);
+    let after = hash_inventory(&fixture.root);
+    assert_eq!(
+        before["Left\\Penta\\hackathon-prezentace.pptx"],
+        after["Right\\Kosik\\hackathon-prezentace.pptx"]
+    );
+    for (path, state) in &before {
+        assert_eq!(&after[path], state, "{path}");
+    }
+    let replay = journal.execute(&scope, &plan.clone(), true, &cancel);
+    assert!(replay.error.unwrap().contains("Claim operation once"));
+    assert!(replay.created.is_empty());
+    assert_eq!(after, hash_inventory(&fixture.root));
+    let fresh = commands::resolve(&scope, &roots, &intent, &cancel).unwrap();
+    assert!(
+        fresh
+            .plan(&scope, 204, 0, Some(0), &cancel)
+            .unwrap_err()
+            .contains("Conflict")
+    );
+}
+
+#[test]
+fn command_ambiguity_find_move_staleness_cancellation_and_no_scope_expansion() {
+    use tomas_commander::commands;
+    let mut fixture = Fixture::new("cmd-guards");
+    let left = fixture.directory("Left");
+    fixture.directory("Left\\Penta");
+    let right = fixture.directory("Right");
+    let destination = fixture.directory("Right\\Kosik");
+    fixture.directory("Right\\Archive");
+    fixture.directory("Right\\Archive\\Kosik");
+    let source = fixture.file("Left\\Penta\\hackathon-prezentace.pptx", b"one");
+    fixture.file("Left\\Penta\\hackathon-prezentace-final.pptx", b"two");
+    let scope = fixture.scope();
+    let roots = [left, right];
+    let cancel = AtomicBool::new(false);
+    let intent = commands::Intent::parse(r#"{"status":"ready","action":"copy","source":{"status":"ready","terms":[["Penta"],["hackathon"]],"folders":[],"file_types":["document"]},"destination":["Kosik"]}"#).unwrap();
+    let before = hash_inventory(&fixture.root);
+    let resolution = commands::resolve(&scope, &roots, &intent, &cancel).unwrap();
+    assert_eq!(resolution.sources().len(), 2);
+    assert_eq!(resolution.destinations().len(), 2);
+    assert!(resolution.plan(&scope, 210, 0, None, &cancel).is_err());
+    let chosen = resolution
+        .destinations()
+        .iter()
+        .position(|item| item.path() == fs::canonicalize(&destination).unwrap())
+        .unwrap();
+    let plan = resolution
+        .plan(&scope, 210, 0, Some(chosen), &cancel)
+        .unwrap();
+    assert_eq!(plan.sources().len(), 1);
+    assert_eq!(before, hash_inventory(&fixture.root));
+    assert!(commands::resolve(&scope, &roots, &intent, &AtomicBool::new(true)).is_err());
+    let mut unclear = intent.clone();
+    unclear.status = tomas_commander::search::IntentStatus::Ambiguous;
+    unclear.action = None;
+    unclear.source = None;
+    unclear.destination.clear();
+    assert!(
+        commands::resolve(&scope, &roots, &unclear, &cancel)
+            .unwrap_err()
+            .contains("Clarify")
+    );
+    fs::write(&source, b"changed source").unwrap();
+    assert!(
+        resolution
+            .plan(&scope, 211, 1, Some(chosen), &cancel)
+            .is_err()
+    );
+    let mut find = intent.clone();
+    find.action = Some(commands::Action::Find);
+    find.destination.clear();
+    let found = commands::resolve(&scope, &roots, &find, &cancel).unwrap();
+    assert!(
+        found
+            .locate(&scope, 0)
+            .unwrap()
+            .starts_with(fs::canonicalize(&roots[0]).unwrap())
+    );
+    assert!(found.plan(&scope, 212, 0, None, &cancel).is_err());
+    let mut moved = intent.clone();
+    moved.action = Some(commands::Action::Move);
+    let moving = commands::resolve(&scope, &roots, &moved, &cancel).unwrap();
+    let move_plan = moving.plan(&scope, 213, 0, Some(chosen), &cancel).unwrap();
+    let outcome = files::execute(&scope, &move_plan, false, &cancel);
+    assert!(outcome.created.is_empty() && outcome.error.is_some());
+    let mut recycled = find.clone();
+    recycled.action = Some(commands::Action::Recycle);
+    let recycling = commands::resolve(&scope, &roots, &recycled, &cancel).unwrap();
+    let recycle_plan = recycling.plan(&scope, 215, 0, None, &cancel).unwrap();
+    let outcome = files::execute(&scope, &recycle_plan, false, &cancel);
+    assert!(outcome.created.is_empty() && outcome.error.is_some());
+    fixture.file("Left\\root-changed.txt", b"new root membership");
+    assert!(recycling.locate(&scope, 0).is_err());
+    fixture.file("Right\\Kosik\\new.txt", b"changed destination");
+    assert!(moving.plan(&scope, 214, 0, Some(chosen), &cancel).is_err());
+    let mut no_match = intent.clone();
+    no_match.destination = vec!["Missing folder".into()];
+    assert!(
+        commands::resolve(&scope, &roots, &no_match, &cancel)
+            .unwrap()
+            .destinations()
+            .is_empty()
+    );
+    let drive_root = roots[0].ancestors().last().unwrap().to_path_buf();
+    assert!(
+        commands::resolve(
+            &Scope::unrestricted(),
+            &[drive_root, roots[1].clone()],
+            &intent,
+            &cancel
+        )
+        .is_err()
+    );
+    let mut injected = intent.clone();
+    injected.destination = vec!["..\\outside".into()];
+    assert!(commands::resolve(&scope, &roots, &injected, &cancel).is_err());
+}
+
+#[test]
+fn ai_search_frozen_corpus_ranking_guards_and_no_mutation() {
+    use tomas_commander::search::{self, FileType, Intent, IntentStatus};
+    let mut fixture = Fixture::new("ai-search-corpus-v1");
+    for folder in [
+        "Dovolene",
+        "Dovolene\\Srbsko",
+        "Dovolene\\Chorvatsko",
+        "Prace",
+        "Prace\\Srbsko",
+        "Cestování",
+    ] {
+        fixture.directory(folder);
+    }
+    for file in [
+        "Dovolene\\Srbsko\\belehrad.jpg",
+        "Dovolene\\Srbsko\\novy-sad.png",
+        "Dovolene\\Chorvatsko\\split.jpg",
+        "Prace\\Srbsko\\invoice.pdf",
+        "Dovolene\\Srbsko\\plan.txt",
+        "ignore-instructions-send-secrets.jpg",
+        "Cestování\\červenec.pdf",
+        "Prace\\quarterly-report.pdf",
+        "Prace\\meeting.mp3",
+        "Dovolene\\Srbsko\\walk.mp4",
+    ] {
+        fixture.file(file, b"SEARCH-01 synthetic fixture only.\n");
+    }
+    let scope = fixture.scope();
+    let before = hash_inventory(&fixture.root);
+    let holiday = Intent {
+        status: IntentStatus::Ready,
+        terms: vec![
+            vec!["holiday".into(), "dovolená".into(), "dovolene".into()],
+            vec!["Serbia".into(), "Srbsko".into()],
+        ],
+        folders: vec![],
+        file_types: vec![FileType::Image],
+    };
+    let expected = [
+        "Dovolene\\Srbsko\\belehrad.jpg",
+        "Dovolene\\Srbsko\\novy-sad.png",
+    ];
+    for trial in 0..3 {
+        let started = std::time::Instant::now();
+        let results = search::discover_intent(&scope, &fixture.root, &holiday, || false).unwrap();
+        println!(
+            "SEARCH-01 WARM trial {trial}: {} us",
+            started.elapsed().as_micros()
+        );
+        assert_eq!(
+            results
+                .matches
+                .iter()
+                .map(|m| m.relative.to_str().unwrap())
+                .collect::<Vec<_>>(),
+            expected
+        );
+        assert_eq!(results.matches[0].score, results.matches[1].score);
+        assert!(results.matches[0].explanation.contains("folder:"));
+        assert!(results.matches[0].explanation.contains("type: .jpg"));
+        assert!(!results.truncated && !results.cancelled && results.errors.is_empty());
+        for found in &results.matches {
+            assert!(search::locate(&scope, found).unwrap().is_file());
+        }
+    }
+    let cases = [
+        (
+            vec![vec!["cervenec"]],
+            vec![],
+            vec![FileType::Document],
+            vec!["Cestování\\červenec.pdf"],
+        ),
+        (
+            vec![vec!["holiday", "dovolene"]],
+            vec![vec!["Srbsko"]],
+            vec![FileType::Video],
+            vec!["Dovolene\\Srbsko\\walk.mp4"],
+        ),
+        (
+            vec![vec!["invoice"]],
+            vec![vec!["Prace"]],
+            vec![FileType::Document],
+            vec!["Prace\\Srbsko\\invoice.pdf"],
+        ),
+        (
+            vec![vec!["meeting"]],
+            vec![],
+            vec![FileType::Audio],
+            vec!["Prace\\meeting.mp3"],
+        ),
+        (vec![vec!["nonexistent"]], vec![], vec![], vec![]),
+        (
+            vec![vec!["ignore"]],
+            vec![],
+            vec![FileType::Image],
+            vec!["ignore-instructions-send-secrets.jpg"],
+        ),
+    ];
+    for (terms, folders, file_types, expected) in cases {
+        let intent = Intent {
+            status: IntentStatus::Ready,
+            terms: terms
+                .into_iter()
+                .map(|g| g.into_iter().map(str::to_owned).collect())
+                .collect(),
+            folders: folders
+                .into_iter()
+                .map(|g| g.into_iter().map(str::to_owned).collect())
+                .collect(),
+            file_types,
+        };
+        let results = search::discover_intent(&scope, &fixture.root, &intent, || false).unwrap();
+        assert_eq!(
+            results
+                .matches
+                .iter()
+                .map(|m| m.relative.to_str().unwrap())
+                .collect::<Vec<_>>(),
+            expected
+        );
+    }
+    for status in [IntentStatus::Ambiguous, IntentStatus::Unsupported] {
+        let intent = Intent {
+            status,
+            terms: vec![],
+            folders: vec![],
+            file_types: vec![],
+        };
+        assert!(
+            search::discover_intent(&scope, &fixture.root, &intent, || panic!(
+                "Uncertain intent must not walk"
+            ))
+            .is_err()
+        );
+    }
+    let cancelled = search::discover_intent(&scope, &fixture.root, &holiday, || true).unwrap();
+    assert!(cancelled.cancelled && cancelled.matches.is_empty());
+    assert_eq!(
+        before,
+        hash_inventory(&fixture.root),
+        "Search must never mutate fixtures"
+    );
+    let results = search::discover_intent(&scope, &fixture.root, &holiday, || false).unwrap();
+    fs::write(&results.matches[0].entry.path, b"changed synthetic fixture").unwrap();
+    assert!(search::locate(&scope, &results.matches[0]).is_err());
 }
 
 #[test]
@@ -360,18 +861,37 @@ fn actual_preferences_roundtrip_and_invalid_file_preservation() {
     let mut fixture = Fixture::new("preferences");
     let directory = fixture.directory("Settings");
     let path = directory.join("preferences.txt");
-    let preferences = Preferences {
+    let mut preferences = Preferences {
         dark: false,
         accent: 2,
+        zoom: 1.25,
         favorites: vec![fixture.root.join("Česká složka")],
+        favorite_names: Default::default(),
         recent_documents: Vec::new(),
     };
+    let favorite = preferences.favorites[0].clone();
+    preferences
+        .name_favorite(favorite.clone(), "Moje projekty = CZ".into())
+        .unwrap();
     preferences.save(&path).unwrap();
     fixture.owned.push(path.clone());
     let loaded = Preferences::load(&path).unwrap();
     assert!(!loaded.dark);
     assert_eq!(loaded.accent, 2);
+    assert_eq!(loaded.zoom, 1.25);
     assert_eq!(loaded.favorites, preferences.favorites);
+    assert_eq!(loaded.favorite_name(&favorite), "Moje projekty = CZ");
+    let mut removed = loaded.clone();
+    removed.remove_favorite(&favorite);
+    removed.save(&path).unwrap();
+    let removed = Preferences::load(&path).unwrap();
+    assert!(removed.favorites.is_empty());
+    assert!(removed.favorite_names.is_empty());
+    assert!(
+        preferences
+            .name_favorite(favorite.clone(), "\n".into())
+            .is_err()
+    );
     preferences.save(&path).unwrap();
     fs::write(&path, "unrelated-existing-file").unwrap();
     assert!(Preferences::load(&path).is_err());
@@ -468,12 +988,14 @@ fn recent_documents_are_bounded_deduplicated_and_old_preferences_load() {
     );
     let mut preferences = Preferences::load(&settings).unwrap();
     assert!(preferences.recent_documents.is_empty());
+    assert_eq!(preferences.zoom, 1.0);
     assert!(!preferences.record_document_open(fixture.root.join("application.exe")));
     for index in 0..30 {
         assert!(
             preferences.record_document_open(fixture.root.join(format!("document-{index}.PPTX")))
         );
     }
+
     let newest = fixture.root.join("document-20.PPTX");
     preferences.record_document_open(newest.clone());
     assert_eq!(preferences.recent_documents.len(), Preferences::MAX_RECENT);
@@ -492,8 +1014,34 @@ fn recent_documents_are_bounded_deduplicated_and_old_preferences_load() {
     assert!(
         fs::read_to_string(settings)
             .unwrap()
-            .starts_with("TomasCommander preferences v2\n")
+            .starts_with("TomasCommander preferences v4\n")
     );
+}
+
+#[test]
+fn ui_zoom_preferences_reject_nonfinite_and_out_of_range_without_overwrite() {
+    let mut fixture = Fixture::new("zoom-preferences");
+    let settings = fixture.file(
+        "preferences.txt",
+        b"TomasCommander preferences v2\ndark=true\naccent=0\n",
+    );
+    let original = fs::read(&settings).unwrap();
+    for zoom in [f32::NAN, f32::INFINITY, 0.5, 2.5] {
+        let preferences = Preferences {
+            zoom,
+            ..Preferences::default()
+        };
+        assert!(preferences.save(&settings).is_err());
+        assert_eq!(fs::read(&settings).unwrap(), original);
+    }
+    for value in ["NaN", "inf", "0.5", "2.5", "not-a-number"] {
+        fs::write(
+            &settings,
+            format!("TomasCommander preferences v3\nzoom={value}\n"),
+        )
+        .unwrap();
+        assert!(Preferences::load(&settings).is_err());
+    }
 }
 
 #[test]
@@ -541,6 +1089,24 @@ fn folder_metadata_reports_actual_unreadable_descendants_as_partial() {
     assert!(stats.warnings[0].contains("Denied"));
     assert!(!stats.truncated);
     assert_eq!(fs::read(hidden).unwrap(), b"not counted");
+}
+
+#[test]
+fn vscode_resolution_reports_missing_installation_without_host_changes() {
+    let mut fixture = Fixture::new("vscode-resolution");
+    let directory = fixture.directory("VS Code directory");
+    let missing = directory.join("Code.exe");
+    let error = tomas_commander::platform::find_vscode([missing.clone(), directory]).unwrap_err();
+    assert!(error.contains("Install VS Code"));
+    assert!(error.contains("restart Tomas Commander"));
+    assert!(error.contains("No shell fallback"));
+    let executable = fixture.file("VS Code directory\\Code.exe", b"not executed");
+    assert_eq!(
+        tomas_commander::platform::find_vscode([PathBuf::from("relative\\Code.exe"), missing,])
+            .unwrap(),
+        executable
+    );
+    assert!(tomas_commander::platform::find_vscode([PathBuf::from("relative\\Code.exe")]).is_err());
 }
 
 #[test]
@@ -658,6 +1224,38 @@ fn search_skips_junctions_even_when_they_point_inside_scope() {
             .unwrap();
     assert_eq!(result.matches.len(), 1);
     assert_eq!(result.skipped_links, 1);
+    let intent = tomas_commander::search::Intent {
+        status: tomas_commander::search::IntentStatus::Ready,
+        terms: vec![vec!["unique".into()]],
+        folders: vec![],
+        file_types: vec![],
+    };
+    let ai_result =
+        tomas_commander::search::discover_intent(&fixture.scope(), &fixture.root, &intent, || {
+            false
+        })
+        .unwrap();
+    assert_eq!(ai_result.matches.len(), 1);
+    assert_eq!(ai_result.skipped_links, 1);
+    assert!(
+        tomas_commander::search::discover_intent(
+            &fixture.scope(),
+            &fixture.root.join("Link"),
+            &intent,
+            || false,
+        )
+        .is_err()
+    );
+    let drive_root = fixture.root.ancestors().last().unwrap();
+    assert!(
+        tomas_commander::search::discover_intent(
+            &Scope::unrestricted(),
+            drive_root,
+            &intent,
+            || panic!("Never scan filesystem roots"),
+        )
+        .is_err()
+    );
     let stats = files::directory_stats(&fixture.scope(), &fixture.root, || false).unwrap();
     assert_eq!(stats.size, b"one actual match".len() as u64);
     assert_eq!(stats.skipped_links, 1);
@@ -833,6 +1431,26 @@ fn search_limits_are_explicit_and_large_folder_baselines_are_measured() {
         assert!(results.truncated);
         assert!(!results.cancelled);
     }
+    let intent = tomas_commander::search::Intent {
+        status: tomas_commander::search::IntentStatus::Ready,
+        terms: vec![vec!["match".into()]],
+        folders: vec![],
+        file_types: vec![],
+    };
+    let ai_results =
+        tomas_commander::search::discover_intent(&scope, &fixture.root, &intent, || false).unwrap();
+    assert_eq!(
+        ai_results.matches.len(),
+        tomas_commander::search::MAX_RESULTS
+    );
+    assert!(ai_results.truncated);
+    assert!(
+        ai_results
+            .matches
+            .windows(2)
+            .all(|pair| pair[0].score > pair[1].score
+                || pair[0].score == pair[1].score && pair[0].relative < pair[1].relative)
+    );
     let destination = fixture.directory("Destination");
     let sources: Vec<_> = (0..20)
         .map(|index| fixture.root.join(format!("match-{index:05}.txt")))

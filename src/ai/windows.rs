@@ -315,6 +315,7 @@ struct CachedAuth {
     verified: Instant,
     token: Token,
     version: String,
+    stronger: bool,
 }
 
 fn unix_seconds() -> Result<u64> {
@@ -334,6 +335,7 @@ impl AuthCache {
             !job.recheck
                 && entry.config == job.config
                 && entry.path == job.config_path
+                && entry.stronger == (job.task == Task::PublicAnswer)
                 && entry.verified.elapsed() < SESSION_FRESHNESS
                 && entry.token.expires > now.saturating_add(job.config.limits.timeout_seconds + 60)
         })
@@ -355,62 +357,26 @@ impl AuthCache {
             verified: Instant::now(),
             token,
             version,
+            stronger: job.task == Task::PublicAnswer,
         });
         Ok(false)
     }
 }
 
-struct Lease(PathBuf);
-impl Lease {
-    fn release(self) -> Result<()> {
-        fs::remove_file(self.0)
-            .map_err(|_| "AI spending lease cleanup failed; further requests are blocked.".into())
-    }
+type Lease = CounterLease;
+
+#[cfg(test)]
+fn reserve(path: &Path, maximum: u32) -> Result<(u32, Lease)> {
+    reserve_scoped(path, |_| Ok(maximum))
 }
 
-fn reserve(path: &Path, maximum: u32) -> Result<(u32, Lease)> {
-    let budget = path.with_file_name("ai-budget.json");
-    let lock = path.with_file_name("ai-budget.lock");
-    fs::create_dir_all(path.parent().ok_or("AI state path has no parent.")?)
-        .map_err(|_| "Could not create AI state directory.")?;
-    let lease_file = OpenOptions::new().create_new(true).write(true).open(&lock)
-        .map_err(|_| "AI spending lease is busy or interrupted. Inspect ai-budget.lock; no request was sent.")?;
-    drop(lease_file);
-    let lease = Lease(lock);
-    let result = (|| {
-        let count = if budget.exists() {
-            let bytes = read_bounded(&budget, 256)?;
-            let value: Value = serde_json::from_slice(&bytes)
-                .map_err(|_| "AI budget record is malformed; request blocked.")?;
-            u32::try_from(
-                value["attempts"]
-                    .as_u64()
-                    .ok_or("AI budget counter is missing.")?,
-            )
-            .map_err(|_| "AI budget counter is out of range.")?
-        } else {
-            0
-        };
-        if count >= maximum {
-            return Err("Durable pilot request budget exhausted. Additional spending needs explicit owner approval; no automatic reset.".into());
-        }
-        let count = count + 1;
-        persist(
-            &budget,
-            &serde_json::to_vec(&json!({"attempts":count}))
-                .map_err(|_| "Budget encoding failed.")?,
-        )?;
-        Ok(count)
-    })();
-    match result {
-        Ok(count) => Ok((count, lease)),
-        Err(error) => {
-            lease
-                .release()
-                .map_err(|cleanup| format!("{error} {cleanup}"))?;
-            Err(error)
-        }
-    }
+fn reserve_scoped(path: &Path, ceiling: impl FnOnce(u32) -> Result<u32>) -> Result<(u32, Lease)> {
+    reserve_counter(
+        path.parent().ok_or("AI state path has no parent.")?,
+        "ai-budget.json",
+        "ai-budget.lock",
+        ceiling,
+    )
 }
 
 struct Internet(*mut c_void);
@@ -569,28 +535,204 @@ fn post(c: &Config, token: &Secret, body: &[u8]) -> Result<(Vec<u8>, String)> {
     }
 }
 
+pub(crate) fn post_web_mcp(
+    key: &str,
+    body: &[u8],
+    session_id: Option<&str>,
+    initialized: bool,
+) -> Result<crate::answers::WireResponse> {
+    if body.len() > 8192 {
+        return Err("MCP request body exceeds byte ceiling.".into());
+    }
+    unsafe {
+        let session = Internet::new(WinHttpOpen(
+            w!("TomasCommander/ANSWER-01"),
+            WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
+            PCWSTR::null(),
+            PCWSTR::null(),
+            0,
+        ))?;
+        let tls = WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_2 | WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_3;
+        WinHttpSetOption(
+            Some(session.0),
+            WINHTTP_OPTION_SECURE_PROTOCOLS,
+            Some(&tls.to_ne_bytes()),
+        )
+        .map_err(|_| "MCP TLS policy binding failed.")?;
+        WinHttpSetTimeouts(session.0, 5000, 5000, 5000, 5000)
+            .map_err(|_| "MCP stage timeout binding failed.")?;
+        // Fixed documented provider origin; no caller/source URL can receive this credential.
+        let connection = Internet::new(WinHttpConnect(session.0, w!("api.microsoft.ai"), 443, 0))?;
+        let request = Internet::new(WinHttpOpenRequest(
+            connection.0,
+            w!("POST"),
+            w!("/v3/mcp"),
+            PCWSTR::null(),
+            PCWSTR::null(),
+            std::ptr::null(),
+            WINHTTP_FLAG_SECURE,
+        ))?;
+        protect_request(&request, 5000)?;
+        let mut header = SecretHeader(
+            "Content-Type: application/json\r\nAccept: application/json, text/event-stream\r\nx-apikey: "
+                .encode_utf16().collect(),
+        );
+        header.0.extend(key.encode_utf16());
+        header.0.extend("\r\n".encode_utf16());
+        if initialized {
+            header
+                .0
+                .extend("MCP-Protocol-Version: 2025-06-18\r\n".encode_utf16());
+        }
+        if let Some(id) = session_id {
+            if id.is_empty() || id.len() > 256 || !id.bytes().all(|byte| byte.is_ascii_graphic()) {
+                return Err("MCP session header rejected.".into());
+            }
+            header.0.extend("Mcp-Session-Id: ".encode_utf16());
+            header.0.extend(id.encode_utf16());
+            header.0.extend("\r\n".encode_utf16());
+        }
+        WinHttpSendRequest(
+            request.0,
+            Some(&header.0),
+            Some(body.as_ptr().cast()),
+            body.len() as u32,
+            body.len() as u32,
+            0,
+        )
+        .map_err(|_| "MCP send failed; uncertain read outcome, lease retained.")?;
+        WinHttpReceiveResponse(request.0, std::ptr::null_mut())
+            .map_err(|_| "MCP response failed/timed out; lease retained.")?;
+        let mut status = 0u32;
+        let mut length = 4;
+        WinHttpQueryHeaders(
+            request.0,
+            WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+            PCWSTR::null(),
+            Some((&mut status as *mut u32).cast()),
+            &mut length,
+            std::ptr::null_mut(),
+        )
+        .map_err(|_| "MCP HTTP status unavailable; lease retained.")?;
+        if !matches!(status, 200 | 202) {
+            return Ok(crate::answers::WireResponse {
+                status,
+                content_type: String::new(),
+                session: None,
+                body: vec![],
+            });
+        }
+        fn query_header(
+            request: &Internet,
+            name: PCWSTR,
+            optional: bool,
+        ) -> Result<Option<String>> {
+            let mut value = [0u16; 512];
+            let mut length = std::mem::size_of_val(&value) as u32;
+            let result = unsafe {
+                WinHttpQueryHeaders(
+                    request.0,
+                    WINHTTP_QUERY_CUSTOM,
+                    name,
+                    Some(value.as_mut_ptr().cast()),
+                    &mut length,
+                    std::ptr::null_mut(),
+                )
+            };
+            if let Err(error) = result {
+                if optional && error.code().0 as u32 == 0x8007_2f76 {
+                    return Ok(None); // ERROR_WINHTTP_HEADER_NOT_FOUND
+                }
+                return Err("MCP response header unavailable or oversized.".into());
+            }
+            let end = value
+                .iter()
+                .position(|unit| *unit == 0)
+                .ok_or("MCP header not terminated.")?;
+            Ok(Some(
+                String::from_utf16(&value[..end]).map_err(|_| "Malformed MCP header.")?,
+            ))
+        }
+        let content_type =
+            query_header(&request, w!("Content-Type"), status == 202)?.unwrap_or_default();
+        let id = query_header(&request, w!("Mcp-Session-Id"), true)?;
+        let mut bytes = Vec::new();
+        loop {
+            let mut chunk = [0u8; 4096];
+            let mut count = 0;
+            WinHttpReadData(
+                request.0,
+                chunk.as_mut_ptr().cast(),
+                chunk.len() as u32,
+                &mut count,
+            )
+            .map_err(|_| "MCP bounded response read failed; lease retained.")?;
+            if count == 0 {
+                break;
+            }
+            if bytes.len() + count as usize > MAX_RESPONSE_BYTES {
+                return Err("MCP response exceeds byte ceiling; no retry.".into());
+            }
+            bytes.extend_from_slice(&chunk[..count as usize]);
+        }
+        Ok(crate::answers::WireResponse {
+            status,
+            content_type,
+            session: id,
+            body: bytes,
+        })
+    }
+}
+
 pub(super) fn execute(job: Job, cache: &mut AuthCache) -> Result<Completion> {
+    let mut routed = job.config.clone();
+    if job.task == Task::PublicAnswer {
+        let context = crate::answers::PublicContext::parse(
+            job.prompt.as_deref().ok_or("Missing public context.")?,
+        )?;
+        context.validate_receipt(&job.config_path)?;
+        validate_answer_authority(&job.config, &job.config_path, &context.question)?;
+        routed.deployment = job.config.stronger_deployment.clone();
+        routed.model = job.config.stronger_model.clone();
+        routed.stronger_deployment.clear();
+        routed.stronger_model.clear();
+    }
     let local_started = Instant::now();
     let body = job
         .prompt
         .as_ref()
-        .map(|prompt| request(&job.config, Input::ExplicitPrompt(prompt), Route::Primary))
+        .map(|prompt| {
+            request_for_task(
+                &job.config,
+                Input::ExplicitPrompt(prompt),
+                Route::Primary,
+                job.task,
+            )
+        })
         .transpose()?;
     let prepared_us = local_started.elapsed().as_micros() as u64;
     let auth_started = Instant::now();
     job.config.validate()?;
     let mut stages = AuthTimings::default();
     let cached = cache.prepare(&job, || {
-        let (verified, version) = verify(&job.config)?;
+        let (verified, version) = verify(&routed)?;
         stages = verified;
         let started = Instant::now();
-        let token = token(&job.config)?;
+        let token = token(&routed)?;
         stages.token_ms = started.elapsed().as_millis() as u64;
         Ok((token, version))
     })?;
     let authentication_ms = auth_started.elapsed().as_millis() as u64;
     if let Some(body) = body {
-        let (attempts, lease) = reserve(&job.config_path, job.config.limits.requests)?;
+        let (attempts, lease) = reserve_scoped(&job.config_path, |count| {
+            request_ceiling(
+                &job.config_path,
+                &job.config,
+                job.task,
+                job.prompt.as_deref().ok_or("Missing explicit prompt.")?,
+                count,
+            )
+        })?;
         let provider_started = Instant::now();
         let token = &cache
             .0
@@ -607,7 +749,12 @@ pub(super) fn execute(job: Job, cache: &mut AuthCache) -> Result<Completion> {
             .as_ref()
             .ok_or("Verified deployment version unavailable.")?
             .version;
-        let parsed = parse_reply(&bytes, job.config.limits, &id, &job.config.model, version);
+        let limits = if job.task == Task::PublicAnswer {
+            crate::answers::public_limits(&job.config)
+        } else {
+            job.config.limits
+        };
+        let parsed = parse_reply(&bytes, limits, &id, &routed.model, version);
         let local_us = prepared_us + local_started.elapsed().as_micros() as u64;
         lease.release()?;
         let mut reply = parsed?;
@@ -617,7 +764,17 @@ pub(super) fn execute(job: Job, cache: &mut AuthCache) -> Result<Completion> {
         reply.authentication_stages = stages;
         reply.provider_ms = provider_ms;
         reply.local_us = local_us;
-        Ok(Completion::Answer(reply))
+        if job.task == Task::SearchIntent {
+            let intent = crate::search::Intent::parse(&reply.text)?;
+            reply.local_us = prepared_us + local_started.elapsed().as_micros() as u64;
+            Ok(Completion::SearchIntent { intent, reply })
+        } else if job.task == Task::CommandIntent {
+            let intent = crate::commands::Intent::parse(&reply.text)?;
+            reply.local_us = prepared_us + local_started.elapsed().as_micros() as u64;
+            Ok(Completion::CommandIntent { intent, reply })
+        } else {
+            Ok(Completion::Answer(reply))
+        }
     } else {
         Ok(Completion::Connected(Connection {
             message: "Configured identity, tenant, subscription, endpoint and deployments verified. Inference permission is confirmed only by Send. Stronger route remains disabled.".into(),
@@ -725,6 +882,7 @@ mod tests {
             config_path: PathBuf::from("synthetic-owned"),
             prompt: None,
             recheck: false,
+            task: Task::Text,
         };
         let load = || {
             Ok((
@@ -742,12 +900,29 @@ mod tests {
                 .prepare(&job, || panic!("warm cache must not acquire credentials"))
                 .unwrap()
         );
+        let mut alternate = Job {
+            config: job.config.clone(),
+            config_path: job.config_path.clone(),
+            prompt: None,
+            recheck: false,
+            task: Task::SearchIntent,
+        };
+        assert!(
+            cache.usable(&alternate, unix_seconds().unwrap()),
+            "existing primary tasks retain proof reuse"
+        );
+        alternate.task = Task::PublicAnswer;
+        assert!(
+            !cache.usable(&alternate, unix_seconds().unwrap()),
+            "Sol cannot reuse primary deployment version proof"
+        );
         for field in 0..11 {
             let mut changed = Job {
                 config: job.config.clone(),
                 config_path: job.config_path.clone(),
                 prompt: None,
                 recheck: false,
+                task: Task::Text,
             };
             match field {
                 0 => changed.config.identity = "different@example.org".into(),
@@ -832,6 +1007,38 @@ mod tests {
             .is_err()
         );
     }
+    #[test]
+    fn scoped_extension_counts_each_attempt_and_never_replays_history() {
+        let root = std::env::temp_dir().join(format!(
+            "tc-cmd-reserve-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&root).unwrap();
+        let path = root.join("ai-connection.json");
+        fs::write(root.join("ai-budget.json"), br#"{"attempts":5}"#).unwrap();
+        for expected in 6..=9 {
+            let (count, lease) = reserve_scoped(&path, |count| {
+                assert_eq!(count, expected - 1);
+                Ok(9)
+            })
+            .unwrap();
+            assert_eq!(count, expected);
+            assert!(reserve_scoped(&path, |_| Ok(9)).is_err());
+            lease.release().unwrap();
+        }
+        assert!(reserve_scoped(&path, |_| Ok(9)).is_err());
+        assert_eq!(
+            fs::read(root.join("ai-budget.json")).unwrap(),
+            br#"{"attempts":9}"#
+        );
+        fs::remove_file(root.join("ai-budget.json")).unwrap();
+        fs::remove_dir(root).unwrap();
+    }
+
     #[test]
     fn budget_is_durable_and_exhaustion_blocks() {
         let root = std::env::temp_dir().join(format!(

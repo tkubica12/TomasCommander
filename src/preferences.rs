@@ -10,7 +10,9 @@ use std::{
 pub struct Preferences {
     pub dark: bool,
     pub accent: usize,
+    pub zoom: f32,
     pub favorites: Vec<PathBuf>,
+    pub favorite_names: std::collections::BTreeMap<PathBuf, String>,
     pub recent_documents: Vec<PathBuf>,
 }
 
@@ -19,14 +21,45 @@ impl Default for Preferences {
         Self {
             dark: true,
             accent: 0,
+            zoom: 1.0,
             favorites: Vec::new(),
+            favorite_names: Default::default(),
             recent_documents: Vec::new(),
         }
     }
 }
 
 impl Preferences {
+    pub fn favorite_name(&self, path: &Path) -> String {
+        self.favorite_names.get(path).cloned().unwrap_or_else(|| {
+            path.file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| crate::files::display_path(path))
+        })
+    }
+
+    pub fn remove_favorite(&mut self, path: &Path) {
+        self.favorites.retain(|stored| stored != path);
+        self.favorite_names.remove(path);
+    }
+
+    pub fn name_favorite(&mut self, path: PathBuf, name: String) -> FileResult<()> {
+        if !self.favorites.contains(&path) || name.trim().is_empty() || name.contains(['\r', '\n'])
+        {
+            return Err(
+                "Saved place needs an existing location and a nonempty single-line name.".into(),
+            );
+        }
+        self.favorite_names.insert(path, name.trim().to_owned());
+        Ok(())
+    }
     pub const MAX_RECENT: usize = 20;
+    pub const MIN_ZOOM: f32 = 0.75;
+    pub const MAX_ZOOM: f32 = 2.0;
+
+    pub fn valid_zoom(zoom: f32) -> bool {
+        zoom.is_finite() && (Self::MIN_ZOOM..=Self::MAX_ZOOM).contains(&zoom)
+    }
 
     pub fn record_document_open(&mut self, path: PathBuf) -> bool {
         if !document_path(&path) {
@@ -54,7 +87,12 @@ impl Preferences {
         let mut lines = text.lines();
         if !matches!(
             lines.next(),
-            Some("TomasCommander preferences v1" | "TomasCommander preferences v2")
+            Some(
+                "TomasCommander preferences v1"
+                    | "TomasCommander preferences v2"
+                    | "TomasCommander preferences v3"
+                    | "TomasCommander preferences v4"
+            )
         ) {
             return Err(
                 "Unrecognized preferences format; saving is disabled to preserve the file.".into(),
@@ -75,8 +113,19 @@ impl Preferences {
                 if preferences.accent > 3 {
                     return Err("Accent preference is out of range.".into());
                 }
+            } else if let Some(value) = line.strip_prefix("zoom=") {
+                preferences.zoom = value
+                    .parse()
+                    .map_err(|e| format!("Invalid zoom preference: {e}"))?;
+                if !Self::valid_zoom(preferences.zoom) {
+                    return Err("Zoom preference must be between 75% and 200%.".into());
+                }
             } else if let Some(value) = line.strip_prefix("favorite=") {
                 preferences.favorites.push(PathBuf::from(value));
+            } else if let Some(value) = line.strip_prefix("favorite_name=") {
+                let (path, name): (PathBuf, String) = serde_json::from_str(value)
+                    .map_err(|error| format!("Invalid saved place name: {error}"))?;
+                preferences.name_favorite(path, name)?;
             } else if let Some(value) = line.strip_prefix("recent=") {
                 let path = PathBuf::from(value);
                 if !document_path(&path) || preferences.recent_documents.len() >= Self::MAX_RECENT {
@@ -97,6 +146,9 @@ impl Preferences {
         if self.accent > 3 || self.recent_documents.len() > Self::MAX_RECENT {
             return Err("Accent preference is out of range.".into());
         }
+        if !Self::valid_zoom(self.zoom) {
+            return Err("Zoom preference must be between 75% and 200%.".into());
+        }
         Self::load(path)?;
         let parent = path.parent().ok_or("Preferences path has no parent.")?;
         fs::create_dir_all(parent).map_err(|e| format!("Create preferences directory: {e}"))?;
@@ -106,8 +158,8 @@ impl Preferences {
             .as_nanos();
         let temporary = parent.join(format!("preferences-{nonce}.tmp"));
         let mut text = format!(
-            "TomasCommander preferences v2\ndark={}\naccent={}\n",
-            self.dark, self.accent
+            "TomasCommander preferences v4\ndark={}\naccent={}\nzoom={}\n",
+            self.dark, self.accent, self.zoom
         );
         for (field, paths) in [
             ("favorite", &self.favorites),
@@ -122,6 +174,19 @@ impl Preferences {
                 }
                 text.push_str(&format!("{field}={path}\n"));
             }
+        }
+        for (path, name) in &self.favorite_names {
+            if !self.favorites.contains(path)
+                || name.trim().is_empty()
+                || name.contains(['\r', '\n'])
+            {
+                return Err("Invalid saved place name.".into());
+            }
+            text.push_str(&format!(
+                "favorite_name={}\n",
+                serde_json::to_string(&(path, name))
+                    .map_err(|error| format!("Encode saved place: {error}"))?
+            ));
         }
         let result = (|| -> FileResult<()> {
             let mut file = OpenOptions::new()
