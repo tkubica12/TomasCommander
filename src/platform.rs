@@ -1,6 +1,27 @@
 use crate::files::FileResult;
 use std::{path::Path, process::Command};
 
+pub fn logical_drives() -> FileResult<Vec<std::path::PathBuf>> {
+    #[cfg(windows)]
+    {
+        let mask = unsafe { windows::Win32::Storage::FileSystem::GetLogicalDrives() };
+        if mask == 0 {
+            return Err(format!(
+                "List Windows drives: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        Ok((0..26)
+            .filter(|bit| mask & (1 << bit) != 0)
+            .map(|bit| std::path::PathBuf::from(format!("{}:\\", char::from(b'A' + bit))))
+            .collect())
+    }
+    #[cfg(not(windows))]
+    {
+        Err("Drive selection is available only on Windows.".into())
+    }
+}
+
 #[cfg(windows)]
 pub fn file_identity(file: &std::fs::File) -> FileResult<(u32, u64)> {
     use std::os::windows::io::AsRawHandle;
@@ -628,6 +649,24 @@ pub fn open_copilot(_path: &Path, _app: bool) -> FileResult<()> {
 #[cfg(test)]
 mod launch_tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn logical_drives_are_exact_sorted_roots_including_the_system_drive() {
+        let drives = logical_drives().unwrap();
+        assert!(!drives.is_empty());
+        assert!(drives.windows(2).all(|pair| pair[0] < pair[1]));
+        for drive in &drives {
+            let text = drive.to_str().unwrap();
+            assert_eq!(text.len(), 3);
+            assert!(text.as_bytes()[0].is_ascii_uppercase());
+            assert_eq!(&text[1..], ":\\");
+            assert!(drive.is_absolute());
+            assert!(drive.parent().is_none());
+        }
+        let system = std::env::var("SystemDrive").unwrap();
+        assert!(drives.contains(&std::path::PathBuf::from(format!("{system}\\"))));
+    }
 
     #[test]
     fn vscode_folder_is_one_lossless_argument_not_shell_syntax() {

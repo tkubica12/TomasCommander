@@ -22,7 +22,7 @@ before the release cleanup.
 ## Download and run
 
 Download `tomas-commander.exe` from [GitHub Releases](https://github.com/tkubica12/TomasCommander/releases).
-The first semantic version is **v0.1.0**, an experimental Windows x64 release.
+The latest version is **v0.2.0**, an experimental Windows x64 release.
 No installer or Rust toolchain is needed to run the downloaded executable.
 The binary is unsigned; this project does not provide code-signing or support.
 
@@ -32,7 +32,7 @@ The binary is unsigned; this project does not provide code-signing or support.
 .\tomas-commander.exe --root "C:\Projects"
 ```
 
-## Included in v0.1.0
+## Features
 
 - Two file panes, keyboard navigation, multi-selection, filtering, recursive
   filename search and sortable size/date columns.
@@ -69,7 +69,20 @@ The binary is unsigned; this project does not provide code-signing or support.
 | Ctrl+0 | Reset zoom |
 | ? / status-bar Help | Shortcut help |
 
+Typing in a file pane goes directly into its filter. Down from the filter
+focuses the first matching file; further arrows navigate the list. Escape clears
+the filter from the field or file list.
+The command palette has multiline input and slash actions such as `/rename`
+and `/preview`, alongside command-name filtering. Enter runs; Shift+Enter
+inserts a newline. `/ai-search your prompt` uses the existing bounded AI search.
+The workspace rail starts collapsed; expand it with `>` or the places/recent
+keyboard shortcuts. See [release notes](CHANGELOG.md) for version history.
+
 No function keys or Z/Y bindings are required. Mouse access remains available.
+At a drive root, opening `..`, Backspace, Ctrl+Left or the header's `..` button
+opens the Windows drive chooser. Use Up/Down and Enter, or click a drive;
+Escape cancels. The chosen drive replaces only the active pane. Unavailable
+or disconnected drives report an ordinary folder-read error.
 Single-click a filename to edit it in place; Enter reviews the rename and
 Escape cancels. Double-click opens normally; Ctrl-double-click previews and
 Shift-double-click opens the chooser.

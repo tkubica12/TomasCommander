@@ -2,8 +2,18 @@
 
 ## File work
 
-The `..` row is navigation only, never an operation target. Filter is local;
-recursive search examines actual filenames without following links/junctions.
+The `..` row is navigation only, never an operation target.
+At a filesystem root it opens a chooser of Windows drive letters, including
+mapped/removable drives reported by Windows. Up/Down and Enter select; Escape
+cancels. Backspace, Ctrl+Left and the header's `..` use the same route.
+Fixture-root boundaries remain closed and never offer an escape to other drives.
+Filter is local; recursive search examines actual filenames without following links/junctions.
+Typing in a file pane appends to its filter and focuses the filter field.
+Down from the filter focuses the first matching file; subsequent arrows navigate
+the list. Escape clears a nonempty filter from either the field or the file list,
+preserving selected files. With no filter, Escape still clears the selection.
+Ctrl+F still focuses the filter explicitly. Text editors, dialogs,
+the places rail and previews retain their own keyboard handling.
 Selected rows operate on their selected group; an unselected row targets itself.
 Rename always targets the focused item.
 
@@ -54,6 +64,23 @@ No overwrite/merge, ZIP-to-ZIP transfer or virtual Recycle Bin operation.
 Only Store/Deflate; ZIP64, encrypted, split and unsafe/ambiguous archives fail.
 
 ## Settings and integrations
+
+The workspace rail starts collapsed on every launch. Use its `>` / `<` controls
+to expand/collapse it; Ctrl+Shift+B or Ctrl+Shift+H expands it for places/recent
+documents. Saved places remain available through Alt+Up while it is collapsed.
+
+Ctrl+Shift+P opens a multiline command palette. Every existing action has a
+slash command, for example `/rename`, `/preview`, `/settings` or `/copilot-cli`.
+Typing words still filters commands by name; `/` filters slash commands.
+Enter runs the highlighted command, Shift+Enter inserts a newline, Escape closes.
+Commands retain their existing dialogs and guarded effects; `/rename new.txt`
+is not an inline rename operation and is rejected.
+
+Use `/ai-search your prompt` or a free-text prompt with no matching commands to
+start the existing AI filename search inside the palette. Selecting `/ai-search`
+without a prompt prepares the input. `/search` opens deterministic local search;
+`/search query` prefills it without sending anything to a provider.
+There is no separate AI-search toolbar button.
 
 Preferences: `%LOCALAPPDATA%\TomasCommander\preferences.txt`. v1-v3 remain
 readable; custom saved-place names use v4. Appearance, zoom, favorites/names and
