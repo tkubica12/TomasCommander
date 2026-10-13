@@ -21,6 +21,12 @@ an arbitrarily large listing remains continuously monitored.
 Active watched changes trigger an asynchronous panel refresh while retaining
 selection, filter and navigation-return history. Queued invalidations are bounded;
 overflow requests a conservative full refresh, not trusted stale hits.
+During same-folder refresh, the UI keeps the last successful size/date snapshot
+for each surviving non-link directory until its new calculation arrives.
+These display snapshots are not cache hits or trusted operation metadata.
+A tooltip identifies retained values as refreshing. New directories still show
+pending placeholders; removed/type-changed entries do not inherit snapshots.
+Fresh results replace both values together; calculation failures remain explicit.
 
 Calculation starts after monitoring is established and checks the same generation
 again before committing a result. A detected concurrent change permits one

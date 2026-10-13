@@ -6,6 +6,18 @@ Completed changes are recorded here until the next release. Publish urgent
 fixes separately; otherwise group related changes into a release. Published
 tags and release assets remain unchanged.
 
+## v0.2.1 - 2026-10-13
+
+Directory metadata display fix for Windows x64.
+
+- Keep last known directory size and modification time visible during background
+  refresh, replacing both together when the new calculation arrives instead of
+  briefly reverting to `...`.
+- Preserve live change monitoring and explicit calculation errors. A tooltip
+  identifies retained values while they refresh.
+
+Unsigned, unsupported and provided at your own risk.
+
 ## v0.2.0 - 2026-10-13
 
 Keyboard navigation and command-palette improvements for Windows x64.

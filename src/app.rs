@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     path::PathBuf,
     sync::{
         Arc,
@@ -169,6 +169,7 @@ struct Pane {
     path: PathBuf,
     path_text: String,
     entries: Vec<Entry>,
+    pending_aggregates: BTreeSet<PathBuf>,
     visible: Vec<usize>,
     filter: String,
     sort: Sort,
@@ -196,6 +197,7 @@ impl Pane {
             path_text: files::display_path(&path),
             path,
             entries: Vec::new(),
+            pending_aggregates: BTreeSet::new(),
             visible: Vec::new(),
             filter: String::new(),
             sort: Sort::Name,
@@ -292,14 +294,67 @@ impl Pane {
             self.parent_returns.clear();
             self.filter.clear();
             self.entries.clear();
+            self.pending_aggregates.clear();
             self.visible.clear();
             self.selected.clear();
             self.focused = child;
             self.scroll_offset = 0.0;
             self.scroll_to_focus = true;
         }
+        if refresh {
+            self.pending_aggregates = self
+                .entries
+                .iter()
+                .filter(|entry| entry.directory && !entry.link)
+                .map(|entry| entry.path.clone())
+                .collect();
+        }
         self.busy = true;
         self.warning = None;
+    }
+
+    fn replace_entries(&mut self, mut entries: Vec<Entry>) {
+        let previous: BTreeMap<_, _> = self
+            .entries
+            .iter()
+            .filter(|entry| entry.directory && !entry.link)
+            .filter_map(|entry| match &entry.aggregate {
+                Some(Ok(stats)) => Some((&entry.path, stats)),
+                _ => None,
+            })
+            .collect();
+        self.pending_aggregates = entries
+            .iter()
+            .filter(|entry| entry.directory && !entry.link && entry.aggregate.is_none())
+            .map(|entry| entry.path.clone())
+            .collect();
+        for entry in &mut entries {
+            if self.pending_aggregates.contains(&entry.path)
+                && let Some(stats) = previous.get(&entry.path)
+            {
+                entry.aggregate = Some(Ok((*stats).clone()));
+            }
+        }
+        files::sort_entries_ordered(&mut entries, self.sort, self.descending);
+        self.entries = entries;
+    }
+
+    fn apply_aggregate(
+        &mut self,
+        path: &std::path::Path,
+        stats: FileResult<files::DirectoryStats>,
+    ) -> bool {
+        self.pending_aggregates.remove(path);
+        if let Some(entry) = self
+            .entries
+            .iter_mut()
+            .find(|entry| entry.path == path && entry.directory && !entry.link)
+        {
+            entry.aggregate = Some(stats);
+            true
+        } else {
+            false
+        }
     }
 
     fn remember_parent_return(&mut self) -> Vec<ReturnLocation> {
@@ -2661,8 +2716,7 @@ impl Ledger {
                     path,
                     result: stats,
                 } => {
-                    if let Some(entry) = pane.entries.iter_mut().find(|entry| entry.path == path) {
-                        entry.aggregate = Some(stats);
+                    if pane.apply_aggregate(&path, stats) {
                         aggregate_changed[result.pane] = true;
                     }
                     continue;
@@ -2670,11 +2724,10 @@ impl Ledger {
             };
             pane.busy = false;
             match listing {
-                Ok(mut listing) => {
+                Ok(listing) => {
                     pane.path = listing.path;
                     pane.path_text = files::display_path(&pane.path);
-                    files::sort_entries_ordered(&mut listing.entries, pane.sort, pane.descending);
-                    pane.entries = listing.entries;
+                    pane.replace_entries(listing.entries);
                     let paths: BTreeSet<_> = pane
                         .entries
                         .iter()
@@ -2694,6 +2747,7 @@ impl Ledger {
                     }
                 }
                 Err(error) => {
+                    pane.pending_aggregates.clear();
                     pane.warning = Some(error.clone());
                     self.fail(error);
                 }
@@ -3247,10 +3301,11 @@ impl Ledger {
                                 .on_hover_text(format!("{}{}", files::display_path(&path),
                                     match &entry.aggregate {
                                         Some(Err(error)) => format!("\n{error}"),
-                                        Some(Ok(stats)) => format!("\n{} items; {} links excluded{}{}; modified times are UTC",
+                                        Some(Ok(stats)) => format!("\n{} items; {} links excluded{}{}{}; modified times are UTC",
                                             stats.examined, stats.skipped_links,
                                             if stats.truncated { "; calculation limit reached" } else { "" },
-                                            if stats.warnings.is_empty() { String::new() } else { format!("\n{}", stats.warnings.join("\n")) }),
+                                            if stats.warnings.is_empty() { String::new() } else { format!("\n{}", stats.warnings.join("\n")) },
+                                            if pane.pending_aggregates.contains(&path) { "\nRefreshing; showing last known size and modification time" } else { "" }),
                                         None if entry.directory && !navigation => "\nCalculating folder size and latest file modification...".into(),
                                         _ => "\nModified times are UTC".into(),
                                     }));
@@ -5052,13 +5107,10 @@ impl eframe::App for Ledger {
         #[cfg(feature = "native-desktop-tests")]
         if let Some(metrics) = &mut self.desktop_metrics {
             let listing_ready = self.panes.iter().all(|pane| !pane.busy) && self.error.is_none();
-            let pending_scan = self.panes.iter().any(|pane| {
-                pane.busy
-                    || pane
-                        .entries
-                        .iter()
-                        .any(|entry| entry.directory && !entry.link && entry.aggregate.is_none())
-            });
+            let pending_scan = self
+                .panes
+                .iter()
+                .any(|pane| pane.busy || !pane.pending_aggregates.is_empty());
             let pending_search = self
                 .search_dialog
                 .as_ref()
@@ -6732,6 +6784,98 @@ mod tests {
             folded: name.to_lowercase(),
             aggregate: None,
         }
+    }
+
+    #[test]
+    fn directory_refresh_keeps_size_and_date_until_replacement_arrives() {
+        let root = PathBuf::from("fixture");
+        let mut pane = Pane::new(root.clone());
+        let mut folder = entry("folder");
+        folder.directory = true;
+        let old_time = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+        folder.aggregate = Some(Ok(files::DirectoryStats {
+            size: 123,
+            modified: Some(old_time),
+            ..Default::default()
+        }));
+        pane.entries = vec![folder.clone()];
+        let mut fresh_listing = folder.clone();
+        fresh_listing.aggregate = None;
+        for _ in 0..3 {
+            pane.begin_navigation(root.clone());
+            pane.replace_entries(vec![fresh_listing.clone()]);
+            let retained = pane.entries[0]
+                .aggregate
+                .as_ref()
+                .unwrap()
+                .as_ref()
+                .unwrap();
+            assert_eq!(retained.size, 123);
+            assert_eq!(retained.modified, Some(old_time));
+            assert!(pane.pending_aggregates.contains(&folder.path));
+        }
+        let new_time = old_time + Duration::from_secs(100);
+        assert!(pane.apply_aggregate(
+            &folder.path,
+            Ok(files::DirectoryStats {
+                size: 456,
+                modified: Some(new_time),
+                ..Default::default()
+            })
+        ));
+        let updated = pane.entries[0]
+            .aggregate
+            .as_ref()
+            .unwrap()
+            .as_ref()
+            .unwrap();
+        assert_eq!(updated.size, 456);
+        assert_eq!(updated.modified, Some(new_time));
+        assert!(pane.pending_aggregates.is_empty());
+        pane.replace_entries(vec![fresh_listing]);
+        assert!(pane.apply_aggregate(&folder.path, Err("Read denied".into())));
+        assert_eq!(
+            pane.entries[0]
+                .aggregate
+                .as_ref()
+                .unwrap()
+                .as_ref()
+                .unwrap_err(),
+            "Read denied"
+        );
+        assert!(pane.pending_aggregates.is_empty());
+    }
+
+    #[test]
+    fn directory_refresh_does_not_retain_removed_or_type_changed_snapshots() {
+        let mut pane = Pane::new(PathBuf::from("fixture"));
+        let mut folder = entry("folder");
+        folder.directory = true;
+        folder.aggregate = Some(Ok(files::DirectoryStats {
+            size: 123,
+            ..Default::default()
+        }));
+        pane.entries = vec![folder.clone()];
+        pane.replace_entries(vec![entry("folder")]);
+        assert!(pane.entries[0].aggregate.is_none());
+        assert!(pane.pending_aggregates.is_empty());
+        pane.entries = vec![folder.clone()];
+        let mut link = folder.clone();
+        link.link = true;
+        link.aggregate = Some(Err("Link folders are not traversed.".into()));
+        pane.replace_entries(vec![link]);
+        assert!(pane.entries[0].aggregate.as_ref().unwrap().is_err());
+        assert!(pane.pending_aggregates.is_empty());
+        pane.entries = vec![folder.clone()];
+        let mut new_folder = entry("new-folder");
+        new_folder.directory = true;
+        pane.replace_entries(vec![new_folder.clone()]);
+        assert!(pane.entries[0].aggregate.is_none());
+        assert_eq!(pane.pending_aggregates, BTreeSet::from([new_folder.path]));
+        assert!(!pane.apply_aggregate(&folder.path, Ok(files::DirectoryStats::default())));
+        pane.begin_navigation(PathBuf::from("other"));
+        assert!(pane.entries.is_empty());
+        assert!(pane.pending_aggregates.is_empty());
     }
 
     #[test]
