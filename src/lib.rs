@@ -5,6 +5,8 @@ pub mod archives;
 pub mod changes;
 pub mod commands;
 pub mod directory_cache;
+pub mod file_agent;
+pub mod file_tools;
 pub mod files;
 mod html;
 pub mod journal;

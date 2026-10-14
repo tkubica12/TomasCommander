@@ -1,4 +1,26 @@
-# Experimental Foundry runtime
+# Foundry runtime
+
+## Read-only file harness
+
+The primary-deployment file harness is distinct from the older frozen pilots
+below. It uses the same verified identity/TLS transport, but explicitly approved
+roots and contents may be sent via read-only tools. It has ten model calls and
+a two-minute segment deadline, explicit continuation, no monetary/lifetime
+spending ceiling, and technical context/output limits. Roots/configuration are
+persisted separately. `ai-file-agent-usage.json` records cumulative attempts;
+`ai-file-agent-calls.jsonl` records request IDs and actual token usage without
+prompts, paths or contents. Old counters/grants are not reset. The existing
+`ai-budget.lock` serializes both routes; an uncertain lease remains blocking.
+No automatic retry, stronger-model fallback, shell or filesystem mutation.
+See [AI file discovery](ai-search.md) for scope, formats and controls.
+
+Ask uses Medium reasoning on the configured primary deployment. Headless file
+requests accept `reasoning_effort` as `none`, `low` or `medium`; omitted values
+default to `medium`. This supports explicit controlled comparisons, not an
+automatic deployment switch. Model/tool timing excludes worker startup and
+identity/resource verification; end-to-end latency must include both.
+
+## Original bounded pilots
 
 AI is a narrowly bounded pilot, not an autonomous general agent. The app uses a
 typed Rust runner and Azure OpenAI v1 Responses over WinHTTP, not an agent SDK.

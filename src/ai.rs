@@ -696,7 +696,11 @@ struct Worker {
 }
 
 impl Worker {
-    fn spawn(mut command: Command) -> Result<Self> {
+    fn spawn(command: Command) -> Result<Self> {
+        Self::spawn_with_limit(command, MAX_RESPONSE_BYTES)
+    }
+
+    fn spawn_with_limit(mut command: Command, maximum: usize) -> Result<Self> {
         #[cfg(windows)]
         let contained = windows::spawn_contained(&mut command)?;
         #[cfg(windows)]
@@ -710,7 +714,7 @@ impl Worker {
         thread::spawn(move || {
             let mut reader = BufReader::new(stdout);
             loop {
-                let result = read_frame(&mut reader, MAX_RESPONSE_BYTES)
+                let result = read_frame(&mut reader, maximum)
                     .and_then(|bytes| bytes.ok_or("AI worker closed its result pipe.".into()));
                 let failed = result.is_err();
                 if output.send(result).is_err() || failed {
@@ -771,7 +775,25 @@ pub(crate) fn contained_exchange(
     timeout: Duration,
     cancel: Arc<AtomicBool>,
 ) -> Result<Vec<u8>> {
-    if encoded.len() > 16_384 || cancel.load(Ordering::Acquire) {
+    contained_exchange_progress(
+        argument,
+        std::mem::take(&mut encoded),
+        timeout,
+        cancel,
+        16_384,
+        |_| Ok(true),
+    )
+}
+
+pub(crate) fn contained_exchange_progress(
+    argument: &str,
+    encoded: Vec<u8>,
+    timeout: Duration,
+    cancel: Arc<AtomicBool>,
+    maximum: usize,
+    terminal: impl FnMut(&[u8]) -> Result<bool>,
+) -> Result<Vec<u8>> {
+    if encoded.len() > maximum || cancel.load(Ordering::Acquire) {
         return Err("Cancelled or oversized connected-source request; nothing sent.".into());
     }
     let mut command =
@@ -781,7 +803,22 @@ pub(crate) fn contained_exchange(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
-    let mut worker = Worker::spawn(command)?;
+    exchange_progress_command(command, encoded, timeout, cancel, maximum, terminal)
+}
+
+fn exchange_progress_command(
+    command: Command,
+    mut encoded: Vec<u8>,
+    timeout: Duration,
+    cancel: Arc<AtomicBool>,
+    maximum: usize,
+    mut terminal: impl FnMut(&[u8]) -> Result<bool>,
+) -> Result<Vec<u8>> {
+    if encoded.len() > maximum || cancel.load(Ordering::Acquire) {
+        return Err("Cancelled or oversized connected-source request; nothing sent.".into());
+    }
+    let started = Instant::now();
+    let mut worker = Worker::spawn_with_limit(command, maximum.max(MAX_RESPONSE_BYTES))?;
     let input = worker.input.clone();
     let sender = worker.sender.clone();
     thread::spawn(move || {
@@ -802,7 +839,6 @@ pub(crate) fn contained_exchange(
             let _ = sender.send(Err(error));
         }
     });
-    let started = Instant::now();
     let result = loop {
         if cancel.load(Ordering::Acquire) {
             break Err(
@@ -813,7 +849,14 @@ pub(crate) fn contained_exchange(
             break Err("Source timeout. Submitted reads have uncertain outcomes; no retry.".into());
         }
         match worker.results.recv_timeout(Duration::from_millis(25)) {
-            Ok(result) if !cancel.load(Ordering::Acquire) => break result,
+            Ok(result) if !cancel.load(Ordering::Acquire) => match result {
+                Ok(bytes) => match terminal(&bytes) {
+                    Ok(true) => break Ok(bytes),
+                    Ok(false) => (),
+                    Err(error) => break Err(error),
+                },
+                Err(error) => break Err(error),
+            },
             Ok(_) => break Err("Cancelled as source result arrived; result discarded.".into()),
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => {
@@ -1677,6 +1720,50 @@ mod tests {
         assert_eq!(fs::read(&path).unwrap(), br#"{"unexpected":"preserve"}"#);
         fs::remove_file(path).unwrap();
         fs::remove_dir(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn progress_transport_times_out_or_cancels_after_retaining_real_progress() {
+        for cancelled in [false, true] {
+            let mut command =
+                Command::new(r"C:\Program Files\Microsoft SDKs\Azure\CLI2\python.exe");
+            command
+                .args([
+                    "-I",
+                    "-c",
+                    "import sys,time; sys.stdin.buffer.readline(); sys.stdout.buffer.write(b'progress\\n'); sys.stdout.buffer.flush(); time.sleep(30)",
+                ])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null());
+            let flag = Arc::new(AtomicBool::new(false));
+            let signal = flag.clone();
+            let mut received = false;
+            let started = Instant::now();
+            let result = exchange_progress_command(
+                command,
+                b"synthetic".to_vec(),
+                Duration::from_secs(1),
+                flag,
+                2 * 1024 * 1024,
+                |bytes| {
+                    assert_eq!(bytes, b"progress");
+                    received = true;
+                    if cancelled {
+                        signal.store(true, Ordering::Release);
+                    }
+                    Ok(false)
+                },
+            );
+            assert!(received);
+            assert!(
+                result
+                    .unwrap_err()
+                    .contains(if cancelled { "Cancelled" } else { "timeout" })
+            );
+            assert!(started.elapsed() < Duration::from_secs(3));
+        }
     }
 
     #[cfg(windows)]

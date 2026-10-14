@@ -158,9 +158,9 @@ try {
     Assert-Check ([IO.File]::ReadAllText($copied) -eq [IO.File]::ReadAllText($source)) 'Native UI copy preserves actual bytes and source'
     Wait-Button 'Copy'
     Start-Sleep -Milliseconds 400
-    Invoke-Button 'Commands'
-    Wait-Button 'Command palette / Ctrl Shift P'
-    Assert-Check ($null -ne (Button 'Copy to opposite pane    Ctrl Shift C')) 'Real deterministic command palette'
+    Invoke-Button 'Ask'
+    Wait-Button 'Close / Escape'
+    Assert-Check ($null -ne (Button '/copy  Copy to opposite pane    Ctrl Shift C')) 'Real deterministic Ask commands'
     Invoke-Button 'Close / Escape'
     Invoke-Button 'Move'
     Wait-Button 'Acknowledge / Escape'

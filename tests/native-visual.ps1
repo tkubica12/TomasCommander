@@ -197,9 +197,9 @@ try {
     if ($AssertStable -and $null -eq (Find "[.] $czechName")) { throw 'Unicode fixture did not appear in the filtered listing' }
     Keys '^a{BACKSPACE}{ESC}'
     Click '[/] 00 Projects'
-    Keys '^+p'
+    Keys '^{SPACE}'
     Capture 'palette'
-    Keys 'toggle'
+    Keys '/theme'
     Keys '{ENTER}'
     if ($null -eq (Find 'Dark mode')) {
         if ($AssertStable) { throw 'Palette Enter did not execute the selected theme command' }
@@ -207,7 +207,7 @@ try {
         Click 'Toggle light and dark theme'
     }
     Capture 'light'
-    Keys '^+p'
+    Keys '^{SPACE}'
     Keys 'cycle'
     Keys '{DOWN}'
     Keys '{DOWN}'

@@ -16,10 +16,19 @@ Ctrl+F still focuses the filter explicitly. Text editors, dialogs,
 the places rail and previews retain their own keyboard handling.
 Selected rows operate on their selected group; an unselected row targets itself.
 Rename always targets the focused item.
+Right-click a file or folder and choose **Copy path** to copy its full Windows
+path, including the filename, as plain text to the clipboard. This targets the
+clicked row, not the selected group; the `..` navigation row has no such action.
 
 Drag a row or selected group to the opposite pane/folder. Move is the default;
 hold Ctrl at release for Copy. Drops prepare a plan, not an immediate effect.
-Escape cancels. External shell dragging and ZIP-to-ZIP transfers are unsupported.
+Escape cancels. Drag real files/folders outside the window to hand them to Windows
+applications such as Teams or Explorer. External dragging offers Copy only:
+the source is never moved/deleted, even with Shift. The target decides whether
+it accepts the files; accepting a drop does not prove an upload completed.
+Once Windows takes over, Escape cancels; release and start a new drag to return
+to internal pane operations. Virtual ZIP members cannot be dragged externally,
+and ZIP-to-ZIP transfers are unsupported.
 
 Saved places are available in the left rail and Alt+Up popup. Edit changes the
 display name; Delete removes only its bookmark. Recent documents records files
@@ -58,7 +67,7 @@ up or exits at its root; a nonempty filter searches relative member names.
 Enter on a member previews bounded CRC-verified contents.
 
 Copy/move can extract selected members or insert files from the other pane.
-Create ZIP is in the palette. Changes review physical/member paths and use staged
+Create ZIP is in Ask. Changes review physical/member paths and use staged
 publication; move removes sources only after destination verification.
 No overwrite/merge, ZIP-to-ZIP transfer or virtual Recycle Bin operation.
 Only Store/Deflate; ZIP64, encrypted, split and unsafe/ambiguous archives fail.
@@ -69,16 +78,29 @@ The workspace rail starts collapsed on every launch. Use its `>` / `<` controls
 to expand/collapse it; Ctrl+Shift+B or Ctrl+Shift+H expands it for places/recent
 documents. Saved places remain available through Alt+Up while it is collapsed.
 
-Ctrl+Shift+P opens a multiline command palette. Every existing action has a
+Ctrl+Space opens Ask, with multiline input for AI and commands. Every existing action has a
 slash command, for example `/rename`, `/preview`, `/settings` or `/copilot-cli`.
 Typing words still filters commands by name; `/` filters slash commands.
-Enter runs the highlighted command, Shift+Enter inserts a newline, Escape closes.
+Enter submits ordinary text to AI; slash input runs the highlighted command.
+Click a command or select it with arrows then Enter to run a filtered command.
+Shift+Enter inserts a newline, Escape closes.
 Commands retain their existing dialogs and guarded effects; `/rename new.txt`
 is not an inline rename operation and is rejected.
 
-Use `/ai-search your prompt` or a free-text prompt with no matching commands to
-start the existing AI filename search inside the palette. Selecting `/ai-search`
-without a prompt prepares the input. `/search` opens deterministic local search;
+Use `/ai-search your prompt` or a free-text prompt to start the read-only file
+harness. Selecting `/ai-search` without a prompt prepares the input. Arrow keys
+navigate real results, Enter shows a result in the pane, Ctrl+Enter previews.
+Escape cancels an active run without discarding known results; Escape again
+closes it. A capped run offers explicit Continue.
+Submission hides Ask immediately after validation. AI keeps running while you
+work in the file panes. The header notification bell shows a running dot, then
+an unread result badge; clicking it reopens the same task without starting another.
+One AI task runs at a time; a second AI submission reopens the active task.
+Slash commands remain available while AI runs. Hide or Ctrl+Space dismisses task
+details without cancellation; Cancel/Escape cancels. Completion never opens a
+modal automatically. The latest result is retained in memory until a new search
+replaces it or the application closes.
+`/search` opens deterministic local search;
 `/search query` prefills it without sending anything to a provider.
 There is no separate AI-search toolbar button.
 
@@ -92,7 +114,13 @@ and therefore grants the external agent its unattended execution mode.
 
 AI remains a restricted experiment. Settings exposes Foundry connection under
 its advanced panel. The app neither installs Azure CLI nor signs you in.
-Only explicitly confirmed prompts are sent, not enumerated local files.
+The file harness sends paths, metadata and supported contents only inside
+separately approved roots, with optional automatic OneDrive hydration.
+Its settings are in `%LOCALAPPDATA%\TomasCommander\ai-file-access.json`.
+No configured roots means no access. Favorites alone never expand authority.
+Each segment has ten model calls / two minutes; no lifetime spending cap is
+configured. Usage is recorded without document contents; old pilot counters stay.
+Text, DOCX and PPTX extraction are supported; other binary formats fail explicitly.
 Model output never approves or executes filesystem effects.
 See [AI runtime](decisions/ai-runtime.md),
 [AI search](decisions/ai-search.md),

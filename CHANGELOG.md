@@ -6,6 +6,35 @@ Completed changes are recorded here until the next release. Publish urgent
 fixes separately; otherwise group related changes into a release. Published
 tags and release assets remain unchanged.
 
+## v0.3.0 - 2026-10-14
+
+Ask, read-only AI file discovery and external file dragging for Windows x64.
+
+- Native Windows external file dragging (for example to Teams), offering Copy
+  only without moving or deleting sources; internal reviewed pane dragging stays.
+- Added Copy path to file/folder context menus to copy the full path and filename.
+- Renamed the shared prompt/command surface to Ask, opened with Ctrl+Space.
+- AI tasks run without blocking file panes; a notification bell shows progress
+  and unread results. Hide preserves work; cancellation remains explicit.
+- Read-only Foundry file harness in Ask with separately approved
+  roots, listing/glob/grep/paged reads and DOCX/PPTX text extraction.
+- Ten-call/two-minute segments with cancellation, retained partial results and
+  explicit continuation; keyboard result activation and previews.
+- Plain prompt submission no longer accidentally executes a matching command.
+- Separate durable agent usage history; old pilot budgets remain untouched.
+- Explicit medium reasoning and batched, path-filtered candidate globs; unrelated
+  file metadata is no longer opened before filename/type filtering.
+- Local-tool timeouts are distinguished from uncertain model submissions, and
+  worker errors are displayed once.
+
+AI requires an existing configured Foundry connection and separately approved
+roots/content access; no roots or credentials are shipped. PDF/OCR, image,
+spreadsheet and legacy Office content remain unsupported. Whole-drive search
+quality and latency are not guaranteed. External dragging passes real files to
+Windows targets; an actual Teams upload has not been verified.
+
+Unsigned, unsupported and provided at your own risk.
+
 ## v0.2.1 - 2026-10-13
 
 Directory metadata display fix for Windows x64.

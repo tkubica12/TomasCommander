@@ -489,6 +489,12 @@ enum Work {
         pane: usize,
         result: search::Match,
     },
+    LocateAgent {
+        pane: usize,
+        settings: Box<tomas_commander::file_tools::Settings>,
+        record: tomas_commander::file_tools::Observed,
+        preview: bool,
+    },
 }
 
 fn drop_work(
@@ -578,6 +584,11 @@ enum WorkResult {
     },
     Located {
         pane: usize,
+        result: FileResult<PathBuf>,
+    },
+    AgentLocated {
+        pane: usize,
+        preview: bool,
         result: FileResult<PathBuf>,
     },
 }
@@ -779,9 +790,7 @@ fn palette_submission(query: &str, selected: Option<Command>) -> Result<(Command
         }
         return Ok((command, argument.to_owned()));
     }
-    if let Some(command) = selected {
-        Ok((command, String::new()))
-    } else if !query.is_empty() {
+    if !query.is_empty() {
         Ok((Command::AiSearch, query.to_owned()))
     } else {
         Err("Enter a command or search prompt.".into())
@@ -898,6 +907,7 @@ pub struct Ledger {
     zip_dialog: Option<ZipDialog>,
     change_plan: Option<Change>,
     ai: crate::ai_ui::AiPanel,
+    file_agent: crate::file_agent_ui::FileAgentPanel,
     answers: crate::answers_ui::AnswerPanel,
     command_dialog: Option<CommandDialog>,
     panes: [Pane; 2],
@@ -934,6 +944,7 @@ pub struct Ledger {
     palette_query: String,
     palette_focus: bool,
     palette_index: usize,
+    palette_command_selection: bool,
     rail_open: bool,
     places_popup: Option<usize>,
     drives_popup: Option<DrivePicker>,
@@ -1258,6 +1269,17 @@ impl Ledger {
                         pane,
                         result: search::locate(&worker_scope, &result),
                     },
+                    Work::LocateAgent {
+                        pane,
+                        settings,
+                        record,
+                        preview,
+                    } => WorkResult::AgentLocated {
+                        pane,
+                        preview,
+                        result: tomas_commander::file_agent::locate(&settings, &record)
+                            .and_then(|path| worker_scope.resolve(&path)),
+                    },
                 };
                 if results.send(result).is_err() {
                     break;
@@ -1271,6 +1293,7 @@ impl Ledger {
             archive: crate::viewer_ui::ReaderPanel::new(scope.clone(), creation.egui_ctx.clone()),
             zip_dialog: None,
             ai: crate::ai_ui::AiPanel::new(),
+            file_agent: crate::file_agent_ui::FileAgentPanel::new(),
             answers: crate::answers_ui::AnswerPanel::new(),
             command_dialog: None,
             panes: [Pane::new(initial.clone()), Pane::new(initial.clone())],
@@ -1307,6 +1330,7 @@ impl Ledger {
             palette_query: String::new(),
             palette_focus: false,
             palette_index: 0,
+            palette_command_selection: false,
             rail_open: false,
             places_popup: None,
             drives_popup: None,
@@ -1491,6 +1515,37 @@ impl Ledger {
         let Some(payload) = egui::DragAndDrop::payload::<DragItems>(ctx) else {
             return;
         };
+        #[cfg(windows)]
+        if self.drag_allowed()
+            && let DragItems::Files(paths) = &*payload
+        {
+            match platform::external_drag::pointer_outside_source() {
+                Ok(true) => {
+                    egui::DragAndDrop::clear_payload(ctx);
+                    let sources = paths
+                        .iter()
+                        .map(|path| self.scope.resolve(path))
+                        .collect::<FileResult<Vec<_>>>();
+                    let result =
+                        sources.and_then(|paths| platform::external_drag::copy_files(&paths));
+                    ctx.input_mut(|input| input.pointer = Default::default());
+                    ctx.request_repaint();
+                    match result {
+                        Ok(true) => self.log("Files handed to the target application as Copy; source files unchanged."),
+                        Ok(false) => {},
+                        Err(error) => self.fail(error),
+                    }
+                    return;
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    egui::DragAndDrop::clear_payload(ctx);
+                    self.fail(error);
+                    return;
+                }
+            }
+            ctx.request_repaint_after(Duration::from_millis(16));
+        }
         let hover = ctx.data(|data| data.get_temp::<DropHover>(Id::new("file-drop-hover")));
         let copy = ctx.input(|input| input.modifiers.ctrl);
         let supported = !matches!(
@@ -1586,6 +1641,7 @@ impl Ledger {
             && self.search_dialog.is_none()
             && self.command_dialog.is_none()
             && !self.ai.open
+            && !self.file_agent.open
             && !self.answers.open
             && !self.help_open
             && self.places_popup.is_none()
@@ -2060,10 +2116,13 @@ impl Ledger {
             }
             Command::Filter => self.editor_focus = Some(Id::new(("filter", self.active))),
             Command::AiSearch => {
-                self.palette = true;
-                self.palette_focus = true;
-                self.palette_index = 0;
-                self.palette_query = "/ai-search ".into();
+                self.palette = false;
+                self.file_agent.prepare(
+                    String::new(),
+                    self.panes[self.active].path.clone(),
+                    self.active,
+                    self.scope.clone(),
+                );
             }
             Command::Search => {
                 self.search_dialog = Some(SearchDialog {
@@ -2189,6 +2248,7 @@ impl Ledger {
             || self.settings_open
             || self.operations_open
             || self.ai.open
+            || self.file_agent.open
             || self.answers.open
             || self.help_open
             || self.places_popup.is_some()
@@ -2251,11 +2311,12 @@ impl Ledger {
             shift: true,
             ..Default::default()
         };
-        if ctx.input_mut(|input| input.consume_key(chord, Key::P)) {
+        if consume_prompt_key(ctx, Modifiers::CTRL, Key::Space) {
             self.palette = !self.palette;
             self.palette_focus = self.palette;
             self.palette_query.clear();
             self.palette_index = 0;
+            self.palette_command_selection = false;
         }
         if self.palette || self.plan.is_some() || self.error.is_some() {
             return;
@@ -2891,6 +2952,29 @@ impl Ledger {
                     }
                     Err(error) => self.fail(error),
                 },
+                WorkResult::AgentLocated {
+                    pane,
+                    preview,
+                    result,
+                } => match result {
+                    Ok(path) if preview => {
+                        if let Err(error) = self.reader.start(pane, path) {
+                            self.fail(error);
+                        }
+                    }
+                    Ok(path) => {
+                        let directory = path.is_dir();
+                        if directory {
+                            self.active = pane;
+                            self.navigate(pane, path);
+                        } else if let Some(parent) = path.parent() {
+                            self.active = pane;
+                            self.navigate(pane, parent.to_owned());
+                            self.panes[pane].focused = Some(path);
+                        }
+                    }
+                    Err(error) => self.fail(error),
+                },
             }
         }
         if self.save_pending && self.preferences_writable {
@@ -3435,6 +3519,7 @@ impl Ledger {
                             }
                             if !navigation {
                                 response.context_menu(|ui| {
+                                    copy_path_menu_item(ui, &path);
                                     for (command, label) in [(Command::OpenWith, "Open with / Shift Enter"), (Command::Preview, "Internal preview"), (Command::Rename, "Rename"), (Command::Copy, "Copy"), (Command::Move, "Move"), (Command::Recycle, "Recycle")] {
                                         if ui.button(label).clicked() {
                                             if !pane.selected.contains(&path) {
@@ -4096,7 +4181,7 @@ impl Ledger {
                             .striped(true)
                             .show(ui, |ui| {
                                 for (key, label) in [
-                                    ("Ctrl Shift P", "Command palette"),
+                                    ("Ctrl Space", "Ask / AI and slash commands"),
                                     ("Tab", "Switch file pane"),
                                     ("Type in file pane", "Filter immediately"),
                                     ("Down from filter", "Focus first matching file"),
@@ -4241,7 +4326,7 @@ impl Ledger {
             let mut configure = false;
             let modal = egui::Modal::new(Id::new(if dialog.ai_assisted { "palette" } else { "filename-search" })).show(ctx, |ui| {
                 ui.set_width(680.0);
-                ui.heading(if dialog.ai_assisted { "Commands" } else { "Search files / local" });
+                ui.heading(if dialog.ai_assisted { "Ask" } else { "Search files / local" });
                 if !dialog.ai_assisted {
                     ui.label(format!("In: {}", files::display_path(&dialog.root)))
                         .on_hover_text(format!("Includes subfolders; matches filenames without case sensitivity. Links are skipped.\nLimits: {} examined items, {} results.", search::MAX_EXAMINED, search::MAX_RESULTS));
@@ -4429,17 +4514,18 @@ impl Ledger {
             let mut dismiss = false;
             let modal = egui::Modal::new(Id::new("palette")).show(ctx, |ui| {
                 ui.set_width(680.0);
-                ui.heading("Commands");
+                ui.heading("Ask");
                 let query_id = Id::new("palette-query");
                 let keyboard = ui.memory(|memory| memory.has_focus(query_id));
-                let enter = keyboard
-                    && ui.input_mut(|input| input.consume_key(Modifiers::NONE, Key::Enter));
+                let enter = keyboard && consume_prompt_key(ctx, Modifiers::NONE, Key::Enter);
                 if keyboard {
-                    if ui.input_mut(|input| input.consume_key(Modifiers::NONE, Key::ArrowDown)) {
+                    if consume_prompt_key(ctx, Modifiers::NONE, Key::ArrowDown) {
                         self.palette_index += 1;
+                        self.palette_command_selection = true;
                     }
-                    if ui.input_mut(|input| input.consume_key(Modifiers::NONE, Key::ArrowUp)) {
+                    if consume_prompt_key(ctx, Modifiers::NONE, Key::ArrowUp) {
                         self.palette_index = self.palette_index.saturating_sub(1);
+                        self.palette_command_selection = true;
                     }
                 }
                 if accessible_text_value(
@@ -4448,6 +4534,7 @@ impl Ledger {
                     &mut self.palette_query,
                 ) {
                     self.palette_index = 0;
+                    self.palette_command_selection = false;
                 }
                 let response = ui.add(
                     egui::TextEdit::multiline(&mut self.palette_query)
@@ -4463,9 +4550,10 @@ impl Ledger {
                 }
                 if response.changed() {
                     self.palette_index = 0;
+                    self.palette_command_selection = false;
                 }
                 ui.ctx().accesskit_node_builder(response.id, |node| {
-                    node.set_label("Command or AI search prompt");
+                    node.set_label("Ask prompt / AI and slash commands");
                     node.add_action(egui::accesskit::Action::SetValue)
                 });
                 let matches: Vec<_> = COMMANDS
@@ -4497,17 +4585,25 @@ impl Ledger {
                             }
                         }
                     });
-                if enter && let Some((command, _, _)) = matches.get(self.palette_index) {
+                if enter
+                    && (self.palette_query.trim().starts_with('/')
+                        || self.palette_command_selection
+                        || self.palette_query.trim().is_empty())
+                    && let Some((command, _, _)) = matches.get(self.palette_index)
+                {
                     chosen = Some(*command);
                 }
-                submit = enter;
-                if matches.is_empty() && !self.palette_query.trim().starts_with('/') {
+                submit = enter && chosen.is_none();
+                if !self.palette_query.trim().starts_with('/') {
                     submit |= ui
                         .add_enabled(
-                            !self.palette_query.trim().is_empty(),
+                            !self.palette_query.trim().is_empty() && !self.file_agent.busy(),
                             egui::Button::new("Search with AI"),
                         )
                         .clicked();
+                }
+                if self.file_agent.busy() {
+                    ui.label("An AI task is running. Open Notifications for progress; slash commands remain available.");
                 }
                 dismiss = ui.button("Close / Escape").clicked();
             });
@@ -4517,8 +4613,33 @@ impl Ledger {
                 self.file_focus_requested = true;
             }
             if !dismiss && (chosen.is_some() || submit) {
-                match palette_submission(&self.palette_query, chosen) {
+                let submission = if let Some(command) = chosen
+                    && !submit
+                    && !self.palette_query.trim().starts_with('/')
+                {
+                    Ok((command, String::new()))
+                } else {
+                    palette_submission(&self.palette_query, chosen)
+                };
+                match submission {
                     Ok((command, prompt)) => {
+                        if command == Command::AiSearch && !prompt.is_empty() {
+                            #[cfg(feature = "native-search-tests")]
+                            let legacy_test = self.ai.test_scenario.is_some();
+                            #[cfg(not(feature = "native-search-tests"))]
+                            let legacy_test = false;
+                            if !legacy_test {
+                                self.palette = false;
+                                self.file_agent.prepare(
+                                    prompt,
+                                    self.panes[self.active].path.clone(),
+                                    self.active,
+                                    self.scope.clone(),
+                                );
+                                self.file_agent.start(ctx, false);
+                                return;
+                            }
+                        }
                         if matches!(command, Command::Search | Command::AiSearch)
                             && !prompt.is_empty()
                         {
@@ -4686,6 +4807,7 @@ impl eframe::App for Ledger {
             metrics.begin(ctx);
         }
         self.ai.poll();
+        self.file_agent.poll();
         self.answers.poll();
         self.reader.poll();
         self.archive.poll();
@@ -4731,6 +4853,7 @@ impl eframe::App for Ledger {
             || self.command_dialog.is_some()
             || self.close_after_save
             || self.ai.open
+            || self.file_agent.open
             || self.answers.open
         {
             ui.disable();
@@ -4745,6 +4868,10 @@ impl eframe::App for Ledger {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             self.answers.cancel();
             self.answers.open = true;
+        } else if self.file_agent.busy() && ctx.input(|input| input.viewport().close_requested()) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.file_agent.cancel();
+            self.file_agent.open = true;
         } else if self.ai.busy() && ctx.input(|input| input.viewport().close_requested()) {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             self.ai.cancel();
@@ -4796,11 +4923,13 @@ impl eframe::App for Ledger {
                         {
                             self.dispatch(Command::AiPlan);
                         }
-                        if action_button(ui, "Commands", "Ctrl Shift P", true).clicked() {
+                        if action_button(ui, "Ask", "Ctrl Space", true).clicked() {
                             self.palette = true;
                             self.palette_focus = true;
+                            self.palette_command_selection = false;
                             self.palette_query.clear();
                         }
+                        self.file_agent.notification_button(ui);
                         if action_button(
                             ui,
                             if self.preferences.dark {
@@ -4835,6 +4964,7 @@ impl eframe::App for Ledger {
                     && self.search_dialog.is_none()
                     && self.command_dialog.is_none()
                     && !self.ai.open
+                    && !self.file_agent.open
                     && !self.answers.open
                     && self.places_popup.is_none()
                     && self.drives_popup.is_none()
@@ -5102,6 +5232,26 @@ impl eframe::App for Ledger {
             });
         self.dialogs(&ctx);
         self.ai.show(&ctx);
+        if let Some(action) = self.file_agent.show(&ctx) {
+            match action {
+                crate::file_agent_ui::Action::Settings => self.ai.open = true,
+                crate::file_agent_ui::Action::Locate {
+                    pane,
+                    settings,
+                    record,
+                    preview,
+                } => {
+                    if let Err(error) = self.work.try_send(Work::LocateAgent {
+                        pane,
+                        settings,
+                        record,
+                        preview,
+                    }) {
+                        self.fail(format!("AI result activation was not queued: {error}"));
+                    }
+                }
+            }
+        }
         self.answers.show(&ctx);
         self.finish_drag(&ctx);
         #[cfg(feature = "native-desktop-tests")]
@@ -5121,6 +5271,31 @@ impl eframe::App for Ledger {
 }
 
 // egui 0.36 text editors expose ValuePattern but do not process SetValue.
+pub(crate) fn consume_prompt_key(ctx: &egui::Context, chord: Modifiers, key: Key) -> bool {
+    ctx.input_mut(|input| {
+        let mut consumed = false;
+        input.events.retain(|event| {
+            if let egui::Event::Key {
+                key: actual,
+                pressed: true,
+                modifiers,
+                ..
+            } = event
+                && *actual == key
+                && modifiers.matches_logically(chord)
+                && modifiers.shift == chord.shift
+                && modifiers.alt == chord.alt
+            {
+                consumed = true;
+                false
+            } else {
+                true
+            }
+        });
+        consumed
+    })
+}
+
 pub(crate) fn accessible_text_value(ctx: &egui::Context, id: Id, text: &mut String) -> bool {
     let mut changed = false;
     ctx.input_mut(|input| {
@@ -5244,6 +5419,15 @@ impl DrivePicker {
 fn inline_name_submitted(ui: &mut egui::Ui, edit: &egui::Response) -> bool {
     (edit.has_focus() || edit.lost_focus())
         && ui.input_mut(|input| input.consume_key(Modifiers::NONE, Key::Enter))
+}
+
+fn copy_path_menu_item(ui: &mut egui::Ui, path: &std::path::Path) -> egui::Response {
+    let response = ui.button("Copy path");
+    if response.clicked() {
+        ui.ctx().copy_text(files::display_path(path));
+        ui.close();
+    }
+    response
 }
 
 fn file_name_label(ui: &mut egui::Ui, rect: egui::Rect, name: &str) -> egui::Response {
@@ -5641,7 +5825,12 @@ fn trailing_field(
     .inner
 }
 
-fn action_button(ui: &mut egui::Ui, label: &str, hint: &str, enabled: bool) -> egui::Response {
+pub(crate) fn action_button(
+    ui: &mut egui::Ui,
+    label: &str,
+    hint: &str,
+    enabled: bool,
+) -> egui::Response {
     let font = egui::TextStyle::Button.resolve(ui.style());
     let label_size = ui
         .painter()
@@ -5820,6 +6009,37 @@ mod tests {
         )
         .textures_delta
         .clear();
+    }
+
+    #[test]
+    fn ask_shortcut_uses_ctrl_space_without_consuming_selection_or_modified_variants() {
+        let ctx = egui::Context::default();
+        for (modifiers, opens) in [
+            (Modifiers::CTRL, true),
+            (Modifiers::NONE, false),
+            (Modifiers::SHIFT, false),
+            (Modifiers::CTRL | Modifiers::SHIFT, false),
+            (Modifiers::CTRL | Modifiers::ALT, false),
+        ] {
+            ctx.run_ui(
+                egui::RawInput {
+                    events: vec![egui::Event::Key {
+                        key: Key::Space,
+                        physical_key: Some(Key::Space),
+                        pressed: true,
+                        repeat: false,
+                        modifiers,
+                    }],
+                    ..Default::default()
+                },
+                |_| {
+                    assert_eq!(consume_prompt_key(&ctx, Modifiers::CTRL, Key::Space), opens);
+                    assert_eq!(ctx.input(|input| input.events.len()), usize::from(!opens));
+                },
+            )
+            .textures_delta
+            .clear();
+        }
     }
 
     #[test]
@@ -6260,6 +6480,61 @@ mod tests {
     }
 
     #[test]
+    fn copy_path_menu_copies_the_exact_clicked_path_including_filename() {
+        for (path, expected) in [
+            (
+                r"D:\Presentations\PPF intro.html",
+                r"D:\Presentations\PPF intro.html",
+            ),
+            (
+                r"\\?\D:\Presentations\PPF intro.html",
+                r"D:\Presentations\PPF intro.html",
+            ),
+            (
+                r"\\?\UNC\server\share\PPF intro.html",
+                r"\\server\share\PPF intro.html",
+            ),
+        ] {
+            let ctx = egui::Context::default();
+            let mut id = Id::NULL;
+            ctx.run_ui(egui::RawInput::default(), |ui| {
+                id = copy_path_menu_item(ui, std::path::Path::new(path)).id;
+            })
+            .textures_delta
+            .clear();
+            let output = ctx.run_ui(
+                egui::RawInput {
+                    events: vec![egui::Event::AccessKitActionRequest(
+                        egui::accesskit::ActionRequest {
+                            action: egui::accesskit::Action::Click,
+                            target_tree: egui::accesskit::TreeId::ROOT,
+                            target_node: id.accesskit_id(),
+                            data: None,
+                        },
+                    )],
+                    ..Default::default()
+                },
+                |ui| {
+                    copy_path_menu_item(ui, std::path::Path::new(path));
+                },
+            );
+            let copied: Vec<_> = output
+                .platform_output
+                .commands
+                .iter()
+                .filter_map(|command| {
+                    if let egui::OutputCommand::CopyText(text) = command {
+                        Some(text.as_str())
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            assert_eq!(copied, vec![expected]);
+        }
+    }
+
+    #[test]
     fn filename_right_click_reaches_the_shared_row_context_menu() {
         let ctx = egui::Context::default();
         let rect = egui::Rect::from_min_size(egui::pos2(80.0, 60.0), Vec2::new(300.0, 29.0));
@@ -6292,6 +6567,7 @@ mod tests {
                     let label = file_name_label(ui, rect, "alpha.txt");
                     row.union(label).context_menu(|ui| {
                         menu_opened = true;
+                        copy_path_menu_item(ui, std::path::Path::new(r"D:\alpha.txt"));
                         ui.label("Open with");
                     });
                 },
@@ -6742,7 +7018,7 @@ mod tests {
         );
         assert_eq!(
             palette_submission("rename", Some(Command::Rename)).unwrap(),
-            (Command::Rename, String::new()),
+            (Command::AiSearch, "rename".into()),
         );
         assert!(palette_submission("/missing prompt", None).is_err());
         assert!(palette_submission("/rename alpha.txt", Some(Command::Rename)).is_err());
@@ -7037,6 +7313,45 @@ mod tests {
     }
 
     #[test]
+    fn prompt_enter_chords_preserve_newlines_and_alt_variants() {
+        let ctx = egui::Context::default();
+        for (modifiers, plain, preview) in [
+            (Modifiers::NONE, true, false),
+            (Modifiers::SHIFT, false, false),
+            (Modifiers::CTRL, false, true),
+            (Modifiers::CTRL | Modifiers::SHIFT, false, false),
+            (Modifiers::ALT, false, false),
+            (Modifiers::CTRL | Modifiers::ALT, false, false),
+        ] {
+            ctx.run_ui(
+                egui::RawInput {
+                    events: vec![egui::Event::Key {
+                        key: Key::Enter,
+                        physical_key: None,
+                        pressed: true,
+                        repeat: false,
+                        modifiers,
+                    }],
+                    ..Default::default()
+                },
+                |_| {
+                    assert_eq!(consume_prompt_key(&ctx, Modifiers::NONE, Key::Enter), plain);
+                    assert_eq!(
+                        consume_prompt_key(&ctx, Modifiers::CTRL, Key::Enter),
+                        preview
+                    );
+                    assert_eq!(
+                        ctx.input(|input| input.events.len()),
+                        usize::from(!plain && !preview)
+                    );
+                },
+            )
+            .textures_delta
+            .clear();
+        }
+    }
+
+    #[test]
     fn sorting_retains_focused_item_identity() {
         let mut pane = Pane::new(PathBuf::from("fixture"));
         pane.entries = vec![entry("Zulu"), entry("Alpha")];
@@ -7296,12 +7611,17 @@ mod tests {
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
-                                    let commands =
-                                        action_button(ui, "Commands", "Ctrl Shift P", true);
+                                    let commands = action_button(ui, "Ask", "Ctrl Space", true);
+                                    let notifications = action_button(ui, "    ", "", true);
                                     let theme = action_button(ui, "Light mode", "", true);
                                     let accent = action_button(ui, "Accent: Green", "", true);
                                     assert!(commands.rect.right() <= right);
-                                    assert!(theme.rect.right() <= commands.rect.left());
+                                    assert!(notifications.rect.right() <= commands.rect.left());
+                                    assert!(theme.rect.right() <= notifications.rect.left());
+                                    assert!(
+                                        (commands.rect.top() - notifications.rect.top()).abs()
+                                            < 1.0
+                                    );
                                     assert!(accent.rect.right() <= theme.rect.left());
                                     assert!(accent.rect.left() > title.rect.right());
                                     assert!((commands.rect.top() - theme.rect.top()).abs() < 1.0);

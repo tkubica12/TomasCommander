@@ -1,6 +1,6 @@
 # Commands and intent
 
-The palette dispatches typed allowlisted application commands. Text does not
+Ask (Ctrl+Space) dispatches typed allowlisted application commands. Text does not
 become arbitrary shell code. Deterministic file commands use the same planners,
 guards, workers and journal as keyboard/mouse actions.
 

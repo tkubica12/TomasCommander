@@ -1,6 +1,231 @@
 use crate::files::FileResult;
 use std::{path::Path, process::Command};
 
+#[cfg(windows)]
+pub mod external_drag {
+    use super::*;
+    use std::path::PathBuf;
+    use windows::{
+        Win32::{
+            Foundation::{POINT, RECT},
+            Graphics::Gdi::ScreenToClient,
+            System::{
+                Com::{CoTaskMemFree, IDataObject},
+                Ole::{DROPEFFECT_COPY, DROPEFFECT_NONE, OleInitialize, OleUninitialize},
+            },
+            UI::{
+                Input::KeyboardAndMouse::{GetAsyncKeyState, GetCapture, VK_LBUTTON},
+                Shell::{
+                    BHID_DataObject, Common::ITEMIDLIST, SHCreateShellItemArrayFromIDLists,
+                    SHDoDragDrop, SHParseDisplayName,
+                },
+                WindowsAndMessaging::{GetClientRect, GetCursorPos},
+            },
+        },
+        core::PCWSTR,
+    };
+
+    pub fn pointer_outside_source() -> FileResult<bool> {
+        let window = unsafe { GetCapture() };
+        if window.is_invalid() || unsafe { GetAsyncKeyState(i32::from(VK_LBUTTON.0)) } >= 0 {
+            return Ok(false);
+        }
+        let mut cursor = POINT::default();
+        let mut bounds = RECT::default();
+        unsafe {
+            GetCursorPos(&mut cursor).map_err(|e| format!("Read drag cursor: {e}"))?;
+            GetClientRect(window, &mut bounds).map_err(|e| format!("Read drag window: {e}"))?;
+            ScreenToClient(window, &mut cursor)
+                .ok()
+                .map_err(|e| format!("Convert drag cursor: {e}"))?;
+        }
+        Ok(outside(cursor, bounds))
+    }
+
+    fn outside(cursor: POINT, bounds: RECT) -> bool {
+        cursor.x < bounds.left
+            || cursor.y < bounds.top
+            || cursor.x >= bounds.right
+            || cursor.y >= bounds.bottom
+    }
+
+    struct OleApartment;
+
+    impl OleApartment {
+        fn new() -> FileResult<Self> {
+            unsafe { OleInitialize(None) }.map_err(|e| format!("Initialize file drag: {e}"))?;
+            Ok(Self)
+        }
+    }
+
+    impl Drop for OleApartment {
+        fn drop(&mut self) {
+            unsafe { OleUninitialize() };
+        }
+    }
+
+    struct ItemId(*mut ITEMIDLIST);
+
+    impl Drop for ItemId {
+        fn drop(&mut self) {
+            unsafe { CoTaskMemFree(Some(self.0.cast())) };
+        }
+    }
+
+    fn data_object(paths: &[PathBuf]) -> FileResult<IDataObject> {
+        if paths.is_empty() {
+            return Err("No files were selected for external dragging.".into());
+        }
+        let mut items = Vec::with_capacity(paths.len());
+        let mut parent = None;
+        for path in paths {
+            if !path.is_absolute() {
+                return Err("External dragging requires absolute file paths.".into());
+            }
+            let metadata = std::fs::symlink_metadata(path).map_err(|e| {
+                format!(
+                    "Read dragged file {}: {e}",
+                    crate::files::display_path(path)
+                )
+            })?;
+            if metadata.file_type().is_symlink()
+                || std::os::windows::fs::MetadataExt::file_attributes(&metadata) & 0x400 != 0
+                    && metadata.file_type().is_dir()
+            {
+                return Err(
+                    "External dragging of links or directory junctions is unsupported.".into(),
+                );
+            }
+            if parent.is_some_and(|parent| path.parent() != Some(parent)) {
+                return Err("Externally dragged files must belong to the same folder.".into());
+            }
+            parent = path.parent();
+            let name = wide(&shell_path(path)?)?;
+            let mut item = ItemId(std::ptr::null_mut());
+            unsafe { SHParseDisplayName(PCWSTR(name.as_ptr()), None, &mut item.0, 0, None) }
+                .map_err(|e| {
+                    format!(
+                        "Prepare dragged file {}: {e}",
+                        crate::files::display_path(path)
+                    )
+                })?;
+            items.push(item);
+        }
+        let ids: Vec<_> = items.iter().map(|item| item.0.cast_const()).collect();
+        let array = unsafe { SHCreateShellItemArrayFromIDLists(&ids) }
+            .map_err(|e| format!("Prepare dragged file selection: {e}"))?;
+        unsafe { array.BindToHandler(None, &BHID_DataObject) }
+            .map_err(|e| format!("Prepare Windows file drag data: {e}"))
+    }
+
+    pub fn copy_files(paths: &[PathBuf]) -> FileResult<bool> {
+        let _apartment = OleApartment::new()?;
+        let data = data_object(paths)?;
+        // OLE owns the mouse loop until drop or Escape; never offer a source move.
+        let effect = unsafe { SHDoDragDrop(None, &data, None, DROPEFFECT_COPY) }
+            .map_err(|e| format!("External file drag failed: {e}"))?;
+        if effect != DROPEFFECT_COPY && effect != DROPEFFECT_NONE {
+            return Err(
+                "External drop returned an unsupported effect; source files were not changed."
+                    .into(),
+            );
+        }
+        Ok(effect == DROPEFFECT_COPY)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use windows::Win32::{
+            System::{
+                Com::{DVASPECT_CONTENT, FORMATETC, TYMED_HGLOBAL},
+                Ole::ReleaseStgMedium,
+            },
+            UI::Shell::{DragQueryFileW, HDROP},
+        };
+
+        #[test]
+        fn native_drag_boundary_uses_client_pixels_including_negative_coordinates() {
+            let rect = RECT {
+                left: 0,
+                top: 0,
+                right: 1240,
+                bottom: 800,
+            };
+            for (point, expected) in [
+                ((0, 0), false),
+                ((1239, 799), false),
+                ((-1, 300), true),
+                ((200, -1), true),
+                ((1240, 300), true),
+                ((200, 800), true),
+            ] {
+                assert_eq!(
+                    outside(
+                        POINT {
+                            x: point.0,
+                            y: point.1
+                        },
+                        rect
+                    ),
+                    expected
+                );
+            }
+        }
+
+        #[test]
+        fn shell_drag_data_contains_exact_unicode_file_paths_and_preserves_sources() {
+            let _apartment = OleApartment::new().unwrap();
+            let root = std::env::temp_dir().join(format!("tc-drag-{}", std::process::id()));
+            std::fs::create_dir(&root).unwrap();
+            let paths = vec![
+                root.join("presentation intro.txt"),
+                root.join("příloha.txt"),
+            ];
+            for path in &paths {
+                std::fs::write(path, b"Synthetic drag fixture").unwrap();
+            }
+            let data = data_object(&paths).unwrap();
+            let format = FORMATETC {
+                cfFormat: 15,
+                dwAspect: DVASPECT_CONTENT.0,
+                lindex: -1,
+                tymed: TYMED_HGLOBAL.0 as u32,
+                ..Default::default()
+            };
+            let mut medium = unsafe { data.GetData(&format) }.unwrap();
+            let hdrop = HDROP(unsafe { medium.u.hGlobal }.0);
+            let count = unsafe { DragQueryFileW(hdrop, u32::MAX, None) };
+            let actual: Vec<_> = (0..count)
+                .map(|index| {
+                    let length = unsafe { DragQueryFileW(hdrop, index, None) };
+                    let mut value = vec![0; length as usize + 1];
+                    assert_eq!(
+                        unsafe { DragQueryFileW(hdrop, index, Some(&mut value)) },
+                        length
+                    );
+                    PathBuf::from(String::from_utf16(&value[..length as usize]).unwrap())
+                })
+                .collect();
+            unsafe { ReleaseStgMedium(&mut medium) };
+            assert_eq!(actual, paths);
+            drop(data);
+            for path in &paths {
+                assert_eq!(std::fs::read(path).unwrap(), b"Synthetic drag fixture");
+                std::fs::remove_file(path).unwrap();
+            }
+            std::fs::remove_dir(root).unwrap();
+        }
+
+        #[test]
+        fn invalid_external_sources_are_explicit_errors() {
+            let _apartment = OleApartment::new().unwrap();
+            assert!(data_object(&[]).is_err());
+            assert!(data_object(&[PathBuf::from("relative.txt")]).is_err());
+        }
+    }
+}
+
 pub fn logical_drives() -> FileResult<Vec<std::path::PathBuf>> {
     #[cfg(windows)]
     {

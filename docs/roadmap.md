@@ -15,8 +15,8 @@ replacement or a supported commercial file manager.
 
 - Incremental type-to-focus, remappable shortcuts and better physical CZ/US,
   DPI and accessibility coverage.
-- Drag autoscroll, optional folder-hover navigation and reviewed Explorer
-  drag interoperability.
+- Drag autoscroll, optional folder-hover navigation and reviewed incoming
+  Explorer drops. Outgoing native file dragging already offers Copy only.
 - Saved-place ordering, reader fit preferences and search scope/history.
 - Broader workload-bound startup, memory and input-to-display measurements.
   Rust/native rendering is a design choice, not proof of a speed guarantee.

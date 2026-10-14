@@ -5,6 +5,7 @@ mod answers_ui;
 mod app;
 #[cfg(feature = "native-desktop-tests")]
 mod desktop_metrics;
+mod file_agent_ui;
 mod viewer_ui;
 
 use eframe::egui;
@@ -12,6 +13,50 @@ use std::{path::PathBuf, time::Instant};
 use tomas_commander::files::Scope;
 
 fn main() {
+    if std::env::args().nth(1).as_deref() == Some("--file-agent-worker") {
+        if tomas_commander::file_agent::worker().is_err() {
+            std::process::exit(1);
+        }
+        return;
+    }
+    if std::env::args().nth(1).as_deref() == Some("--file-agent-run") {
+        use std::io::Read;
+        let result = (|| -> Result<(), String> {
+            let mut bytes = Vec::new();
+            std::io::stdin()
+                .take(tomas_commander::file_agent::MAX_FRAME as u64 + 1)
+                .read_to_end(&mut bytes)
+                .map_err(|_| "Read file-agent CLI request failed.")?;
+            if bytes.len() > tomas_commander::file_agent::MAX_FRAME {
+                return Err("File-agent CLI frame too large.".into());
+            }
+            let request =
+                serde_json::from_slice(&bytes).map_err(|_| "Invalid file-agent CLI request.")?;
+            let result = tomas_commander::file_agent::run(
+                request,
+                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                |_, _| {},
+            );
+            println!(
+                "{}",
+                serde_json::to_string(&result)
+                    .map_err(|_| "Encode file-agent CLI result failed.")?
+            );
+            result.map(|_| ())
+        })();
+        if let Err(error) = result {
+            eprintln!("{error}");
+            std::process::exit(1);
+        }
+        return;
+    }
+    if std::env::args().nth(1).as_deref() == Some("--file-agent-configure-favorites") {
+        if let Err(error) = tomas_commander::file_agent::configure_from_favorites() {
+            eprintln!("{error}");
+            std::process::exit(1);
+        }
+        return;
+    }
     if std::env::args().nth(1).as_deref() == Some("--answer-worker") {
         if tomas_commander::answers::worker().is_err() {
             std::process::exit(1);

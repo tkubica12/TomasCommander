@@ -22,7 +22,7 @@ before the release cleanup.
 ## Download and run
 
 Download `tomas-commander.exe` from [GitHub Releases](https://github.com/tkubica12/TomasCommander/releases).
-The latest version is **v0.2.1**, an experimental Windows x64 release.
+The latest version is **v0.3.0**, an experimental Windows x64 release.
 No installer or Rust toolchain is needed to run the downloaded executable.
 The binary is unsigned; this project does not provide code-signing or support.
 
@@ -44,10 +44,12 @@ The binary is unsigned; this project does not provide code-signing or support.
   text/config/source files, formatted JSON and comma-delimited CSV.
 - Source editing with guarded Save; ZIP browsing, creation, insertion and
   extraction with reviewed operation plans.
-- Command palette and Open with choices for VS Code, GitHub Copilot CLI and
+- Ask for AI prompts and slash commands, and Open with choices for VS Code, GitHub Copilot CLI and
   GitHub Copilot App, when installed.
 - Light/dark mode, four accent choices, proportional UI zoom and internal
   drag-and-drop: Move by default, Ctrl for Copy.
+- Native Windows dragging of real files to external applications, offering Copy
+  only. Virtual ZIP members must be extracted first.
 
 ## Keyboard essentials
 
@@ -60,7 +62,7 @@ The binary is unsigned; this project does not provide code-signing or support.
 | Space / Shift+arrows / Ctrl+A | Toggle / range / select all |
 | Ctrl+Enter | Toggle preview; a different file replaces it |
 | Shift+Enter | Open with menu |
-| Ctrl+Shift+P | Command palette |
+| Ctrl+Space | Ask / AI prompts and slash commands |
 | Alt+Up | Saved places, including Add current folder |
 | Ctrl+F / Ctrl+Shift+F | Filter / recursive filename search |
 | Ctrl+Shift+C / Ctrl+Shift+M / Ctrl+Shift+D | Copy / move / Recycle Bin |
@@ -72,9 +74,15 @@ The binary is unsigned; this project does not provide code-signing or support.
 Typing in a file pane goes directly into its filter. Down from the filter
 focuses the first matching file; further arrows navigate the list. Escape clears
 the filter from the field or file list.
-The command palette has multiline input and slash actions such as `/rename`
+Ask has multiline input and slash actions such as `/rename`
 and `/preview`, alongside command-name filtering. Enter runs; Shift+Enter
-inserts a newline. `/ai-search your prompt` uses the existing bounded AI search.
+inserts a newline. `/ai-search your prompt` starts the read-only Foundry file
+harness inside explicitly configured roots. Ordinary text Enter goes to AI;
+click or explicitly select a filtered command with arrows to run it.
+AI submission closes Ask and runs in the background, leaving both file panes
+usable. The header bell opens progress, partial results or the latest answer;
+an unread badge appears on completion without interrupting work. One AI task
+runs at a time. Hide keeps it running; Cancel/Escape stops it. Continue is explicit.
 The workspace rail starts collapsed; expand it with `>` or the places/recent
 keyboard shortcuts. See [release notes](CHANGELOG.md) for version history.
 
@@ -100,14 +108,20 @@ are not supported.
 
 HTML previews are semantic, not full CSS/browser rendering; scripts and external
 assets are not loaded. ZIP support is limited to Store/Deflate and excludes
-encrypted, split and ZIP64 archives. Voice, remappable shortcuts and external
+encrypted, split and ZIP64 archives. Voice, remappable shortcuts and incoming
 Explorer drag-and-drop are not implemented. Broad hardware, performance,
 accessibility and physical CZ/US keyboard acceptance are not complete.
 
 Copilot CLI is launched with `--yolo`, allowing that external agent to act
 without its usual permission prompts. Only use it in a folder you trust.
 
-Foundry prompt-only interpretation/search/file-command pilots require your own
+The read-only Foundry file harness requires separately approved roots and
+supports names, metadata, text and DOCX/PPTX extraction. It has ten calls /
+two minutes per segment, explicit continuation and no lifetime spending cap.
+It uses the standard Responses tool loop with explicit medium reasoning, not
+subagents. Batched candidate globs can search approved roots and file types in
+one call, filter names/folder paths, and avoid opening unrelated file metadata.
+Prompt-only interpretation/file-command pilots still require your own
 explicit configuration, consent and existing Azure CLI sign-in. They have
 durable attempt limits and no automatic retries. Connected WebIQ answers have
 an experimental app-side implementation but no completed live acceptance;

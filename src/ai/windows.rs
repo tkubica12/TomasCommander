@@ -164,7 +164,15 @@ fn validate_deployment(value: &Value, deployment: &str, model: &str) -> Result<(
 }
 
 fn verify(c: &Config) -> Result<(AuthTimings, String)> {
+    verify_with_progress(c, &mut |_| Ok(()))
+}
+
+fn verify_with_progress(
+    c: &Config,
+    progress: &mut impl FnMut(&str) -> Result<()>,
+) -> Result<(AuthTimings, String)> {
     c.validate()?;
+    progress("Checking Azure account")?;
     let started = Instant::now();
     let account = cli_json(&[
         "account",
@@ -178,6 +186,7 @@ fn verify(c: &Config) -> Result<(AuthTimings, String)> {
     validate_account(c, &account)?;
     let account_ms = started.elapsed().as_millis() as u64;
     let started = Instant::now();
+    progress("Checking Foundry endpoint")?;
     let resource = cli_json(&[
         "cognitiveservices",
         "account",
@@ -195,6 +204,7 @@ fn verify(c: &Config) -> Result<(AuthTimings, String)> {
     validate_resource(c, &resource)?;
     let resource_ms = started.elapsed().as_millis() as u64;
     let started = Instant::now();
+    progress("Checking model deployments")?;
     let query = format!(
         "[?name=='{}' || name=='{}'].{{name:name,properties:{{provisioningState:properties.provisioningState,model:{{format:properties.model.format,name:properties.model.name,version:properties.model.version}}}}}}",
         c.deployment, c.stronger_deployment
@@ -682,6 +692,81 @@ pub(crate) fn post_web_mcp(
             body: bytes,
         })
     }
+}
+
+pub(crate) fn execute_file_agent(
+    request: crate::file_agent::Request,
+    progress: &mut impl FnMut(String, crate::file_agent::State) -> Result<()>,
+) -> Result<crate::file_agent::Outcome> {
+    request.validate()?;
+    let config = request.settings.connection.clone();
+    let job = Job {
+        config: config.clone(),
+        prompt: None,
+        config_path: request.config_path.clone(),
+        recheck: true,
+        task: Task::Text,
+    };
+    let mut cache = AuthCache::default();
+    progress(
+        "Checking Foundry identity".into(),
+        request.state.clone().unwrap_or_default(),
+    )?;
+    cache.prepare(&job, || {
+        let snapshot = request.state.clone().unwrap_or_default();
+        let (_, version) = verify_with_progress(&config, &mut |stage| {
+            progress(stage.into(), snapshot.clone())
+        })?;
+        progress("Getting Foundry access token".into(), snapshot)?;
+        Ok((token(&config)?, version))
+    })?;
+    let directory = request
+        .config_path
+        .parent()
+        .ok_or("AI state directory unavailable.")?
+        .to_path_buf();
+    let config_path = request.config_path.clone();
+    crate::file_agent::orchestrate(
+        request,
+        |body| {
+            if Config::load(&config_path)? != config {
+                return Err("Foundry configuration changed; spending blocked.".into());
+            }
+            let (attempt, lease) = reserve_counter(
+                &directory,
+                "ai-file-agent-usage.json",
+                "ai-budget.lock",
+                |_| Ok(u32::MAX),
+            )?;
+            let verified = cache
+                .0
+                .as_ref()
+                .ok_or("Verified agent identity unavailable.")?;
+            let (bytes, request_id) = post(&config, &verified.token.secret, body)
+            .map_err(|error| format!("{error} Uncertain spending lease retained; inspect ai-budget.lock before any new submission."))?;
+            let parsed =
+                crate::file_agent::parse_response(&bytes, &config.model, &verified.version);
+            let record = json!({"attempt":attempt,"request_id":request_id,"completed":parsed.is_ok(),
+                "input_tokens":parsed.as_ref().ok().map(|reply|reply.input_tokens),
+                "output_tokens":parsed.as_ref().ok().map(|reply|reply.output_tokens)});
+            let mut usage = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(directory.join("ai-file-agent-calls.jsonl"))
+                .map_err(|_| "Usage record cannot be opened; spending lease retained.")?;
+            let encoded = serde_json::to_vec(&record)
+                .map_err(|_| "Encode usage record failed; lease retained.")?;
+            usage
+                .write_all(&encoded)
+                .and_then(|()| usage.write_all(b"\n"))
+                .and_then(|()| usage.sync_all())
+                .map_err(|_| "Usage record write failed; spending lease retained.")?;
+            lease.release()?;
+            parsed
+        },
+        progress,
+        || false,
+    )
 }
 
 pub(super) fn execute(job: Job, cache: &mut AuthCache) -> Result<Completion> {
