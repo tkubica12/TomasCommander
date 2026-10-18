@@ -2,9 +2,43 @@
 
 ## Unreleased
 
-Completed changes are recorded here until the next release. Publish urgent
-fixes separately; otherwise group related changes into a release. Published
-tags and release assets remain unchanged.
+No unreleased changes.
+
+## v0.4.0 - 2026-10-18
+
+Unified Recent activity, configurable tracking and keyboard/file-workflow refinements
+for Windows x64.
+
+- Copy path now copies all selected paths, one per line, when invoked on a
+  selected row; unselected rows still copy only their own path.
+- Ctrl+Shift+S and `/sort` now cycle exactly three sorting modes: name A-Z,
+  newest first, largest first, preserving focus, selection and filtering.
+- PageUp/PageDown jump ten rows in file panes, like Ctrl+Up/Ctrl+Down.
+- Clicking a noncurrent filename only focuses it. A further slow click on the
+  current filename starts inline rename; rapid double-click still opens it.
+  New input or dragging cancels pending rename.
+- Unified Recent activity merges document changes in watched folders, Commander
+  opens/previews/saves/operations and best-effort Windows Recent. Background native
+  notifications, bounded startup discovery and durable newest-first history.
+- Recent rows support Copy path, Windows Open with, preview, Open containing folder and
+  internal/external dragging, with keyboard actions and stable row identity.
+- Settings now separates Appearance, Recent activity and AI connections.
+  Watched folders are configurable, defaulting to D: and detected personal/work
+  OneDrives; changes apply in the background and persist separately from AI roots.
+- Ctrl+Shift+H now toggles the workspace rail open/closed, opening on Recent.
+  Places no longer has its own shortcut. Recent uses the file-pane font and row
+  height, a minimal shortcut hint, and an explicit Open containing folder action.
+  Tracking diagnostics stay in Settings/Operations instead of the Recent rail.
+- A single click on a Recent file opens its containing folder and focuses the
+  file; a double-click opens the file itself. Enter and dragging are unchanged.
+- Recent also tracks ZIP archives, including external changes and successful
+  internal archive opens, within the same 100-file limit.
+
+Recent tracks metadata while Commander is running, not ZIP member contents.
+Startup discovery is bounded; Windows Recent does not report every application's
+internal previews. No background service or AI access expansion is added.
+
+Unsigned, unsupported and provided at your own risk.
 
 ## v0.3.0 - 2026-10-14
 

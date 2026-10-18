@@ -868,6 +868,7 @@ fn actual_preferences_roundtrip_and_invalid_file_preservation() {
         favorites: vec![fixture.root.join("Česká složka")],
         favorite_names: Default::default(),
         recent_documents: Vec::new(),
+        recent_roots: Some(vec![fixture.root.clone()]),
     };
     let favorite = preferences.favorites[0].clone();
     preferences
@@ -880,6 +881,7 @@ fn actual_preferences_roundtrip_and_invalid_file_preservation() {
     assert_eq!(loaded.accent, 2);
     assert_eq!(loaded.zoom, 1.25);
     assert_eq!(loaded.favorites, preferences.favorites);
+    assert_eq!(loaded.recent_roots, preferences.recent_roots);
     assert_eq!(loaded.favorite_name(&favorite), "Moje projekty = CZ");
     let mut removed = loaded.clone();
     removed.remove_favorite(&favorite);
@@ -990,6 +992,7 @@ fn recent_documents_are_bounded_deduplicated_and_old_preferences_load() {
     assert!(preferences.recent_documents.is_empty());
     assert_eq!(preferences.zoom, 1.0);
     assert!(!preferences.record_document_open(fixture.root.join("application.exe")));
+    assert!(preferences.record_document_open(fixture.root.join("bundle.ZIP")));
     for index in 0..30 {
         assert!(
             preferences.record_document_open(fixture.root.join(format!("document-{index}.PPTX")))
@@ -1011,10 +1014,22 @@ fn recent_documents_are_bounded_deduplicated_and_old_preferences_load() {
     preferences.save(&settings).unwrap();
     let loaded = Preferences::load(&settings).unwrap();
     assert_eq!(loaded.recent_documents, preferences.recent_documents);
+    assert_eq!(loaded.recent_roots, None);
+    let mut configured = loaded.clone();
+    configured.recent_roots = Some(Vec::new());
+    configured.save(&settings).unwrap();
+    assert_eq!(
+        Preferences::load(&settings).unwrap().recent_roots,
+        Some(Vec::new())
+    );
+    let preserved = fs::read(&settings).unwrap();
+    configured.recent_roots = Some(vec![PathBuf::from("relative")]);
+    assert!(configured.save(&settings).is_err());
+    assert_eq!(fs::read(&settings).unwrap(), preserved);
     assert!(
         fs::read_to_string(settings)
             .unwrap()
-            .starts_with("TomasCommander preferences v4\n")
+            .starts_with("TomasCommander preferences v5\n")
     );
 }
 

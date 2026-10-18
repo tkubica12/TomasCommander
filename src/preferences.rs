@@ -14,6 +14,7 @@ pub struct Preferences {
     pub favorites: Vec<PathBuf>,
     pub favorite_names: std::collections::BTreeMap<PathBuf, String>,
     pub recent_documents: Vec<PathBuf>,
+    pub recent_roots: Option<Vec<PathBuf>>,
 }
 
 impl Default for Preferences {
@@ -25,6 +26,7 @@ impl Default for Preferences {
             favorites: Vec::new(),
             favorite_names: Default::default(),
             recent_documents: Vec::new(),
+            recent_roots: None,
         }
     }
 }
@@ -92,6 +94,7 @@ impl Preferences {
                     | "TomasCommander preferences v2"
                     | "TomasCommander preferences v3"
                     | "TomasCommander preferences v4"
+                    | "TomasCommander preferences v5"
             )
         ) {
             return Err(
@@ -126,6 +129,14 @@ impl Preferences {
                 let (path, name): (PathBuf, String) = serde_json::from_str(value)
                     .map_err(|error| format!("Invalid saved place name: {error}"))?;
                 preferences.name_favorite(path, name)?;
+            } else if let Some(value) = line.strip_prefix("recent_roots=") {
+                if preferences.recent_roots.is_some() {
+                    return Err("Duplicate Recent root configuration.".into());
+                }
+                let roots: Vec<PathBuf> = serde_json::from_str(value)
+                    .map_err(|error| format!("Invalid Recent roots: {error}"))?;
+                validate_recent_roots(&roots)?;
+                preferences.recent_roots = Some(roots);
             } else if let Some(value) = line.strip_prefix("recent=") {
                 let path = PathBuf::from(value);
                 if !document_path(&path) || preferences.recent_documents.len() >= Self::MAX_RECENT {
@@ -158,9 +169,17 @@ impl Preferences {
             .as_nanos();
         let temporary = parent.join(format!("preferences-{nonce}.tmp"));
         let mut text = format!(
-            "TomasCommander preferences v4\ndark={}\naccent={}\nzoom={}\n",
+            "TomasCommander preferences v5\ndark={}\naccent={}\nzoom={}\n",
             self.dark, self.accent, self.zoom
         );
+        if let Some(roots) = &self.recent_roots {
+            validate_recent_roots(roots)?;
+            text.push_str(&format!(
+                "recent_roots={}\n",
+                serde_json::to_string(roots)
+                    .map_err(|error| format!("Encode Recent roots: {error}"))?
+            ));
+        }
         for (field, paths) in [
             ("favorite", &self.favorites),
             ("recent", &self.recent_documents),
@@ -211,7 +230,14 @@ impl Preferences {
     }
 }
 
-fn document_path(path: &Path) -> bool {
+fn validate_recent_roots(roots: &[PathBuf]) -> FileResult<()> {
+    if roots.len() > 16 || roots.iter().any(|path| !path.is_absolute()) {
+        return Err("Recent roots must be at most 16 absolute folder paths.".into());
+    }
+    Ok(())
+}
+
+pub(crate) fn document_path(path: &Path) -> bool {
     path.extension()
         .and_then(|extension| extension.to_str())
         .is_some_and(|extension| {
@@ -231,6 +257,12 @@ fn document_path(path: &Path) -> bool {
                     | "html"
                     | "htm"
                     | "pdf"
+                    | "xls"
+                    | "xlsx"
+                    | "xlsm"
+                    | "ods"
+                    | "csv"
+                    | "zip"
             )
         })
 }

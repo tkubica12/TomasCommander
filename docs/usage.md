@@ -16,9 +16,20 @@ Ctrl+F still focuses the filter explicitly. Text editors, dialogs,
 the places rail and previews retain their own keyboard handling.
 Selected rows operate on their selected group; an unselected row targets itself.
 Rename always targets the focused item.
+PageUp/PageDown jump ten rows, just like Ctrl+Up/Ctrl+Down.
+Clicking a filename that is not current only moves the cursor. A further slow
+click on the current filename starts inline rename; a rapid double-click opens
+it instead. Starting a drag or another input cancels pending inline rename.
+Ctrl+Shift+S cycles the active file pane through name A-Z, newest modified first,
+and largest first, then repeats. From the default name sort, the first press
+selects newest first. `/sort` uses the same cycle. The current column
+header shows the mode/direction; clicking headers still allows either direction.
+Filtering, selection and the focused file are preserved.
 Right-click a file or folder and choose **Copy path** to copy its full Windows
-path, including the filename, as plain text to the clipboard. This targets the
-clicked row, not the selected group; the `..` navigation row has no such action.
+path, including the filename, as plain text to the clipboard. On a selected row,
+this copies every selected item's full path, one per line (Windows CRLF),
+including selected items hidden by the filter. On an unselected row it copies
+only that item's path. The `..` navigation row has no such action.
 
 Drag a row or selected group to the opposite pane/folder. Move is the default;
 hold Ctrl at release for Copy. Drops prepare a plan, not an immediate effect.
@@ -31,8 +42,48 @@ to internal pane operations. Virtual ZIP members cannot be dragged externally,
 and ZIP-to-ZIP transfers are unsupported.
 
 Saved places are available in the left rail and Alt+Up popup. Edit changes the
-display name; Delete removes only its bookmark. Recent documents records files
-opened through this app, not system-wide activity.
+display name; Delete removes only its bookmark.
+
+### Recent activity
+
+Ctrl+Shift+H toggles the workspace rail open/closed, regardless of keyboard focus.
+Opening it selects Recent by default. This global list includes documents created/modified
+in watched folders, successful Commander opens/previews/saves and operations,
+plus local Windows Recent shortcuts when another application reports an open.
+There is one entry per file, with the newest activity first, capped at 100 files.
+A single click opens the containing folder in a file pane and focuses the file;
+a double-click opens the file itself. Enter still opens the file directly.
+Hover shows the full path, activity and age. Right-click offers Open, Preview,
+**Open containing folder** (opens its parent in a file pane and focuses the file),
+Windows **Open with...**, and Copy path. File names use the same font, size and
+row height as the file panes. Drag a row to a pane for
+a reviewed Copy/Move or outside the window for the existing Copy-only Shell drag.
+Arrows select; Enter opens, Ctrl+Enter previews, Shift+Enter opens the system
+application chooser, Alt+Enter locates, Ctrl+Shift+C copies the full path.
+
+**Settings > Recent activity** configures watched folders, one absolute path per
+line, including subfolders. Defaults are D: and detected personal/work OneDrive
+folders. Apply validates and switches watchers in the background; unavailable
+roots are reported, not silently accepted. Empty roots disable external tracking,
+not explicitly requested Commander activity. The app keeps these paths separate
+from AI access roots: Recent does not authorize AI reads or uploads.
+
+Native notifications run only while Commander is open; there is no background
+service. Startup scans modification times from the last 30 days, capped at
+100,000 directory entries / five seconds, and imports up to 2,000 Windows Recent
+shortcuts / two seconds. Details about bounded discovery, inaccessible trees and
+notification overflows remain in Settings and Operations, not a persistent rail warning.
+A bounded startup scan is not a complete
+offline activity log. Windows Recent is best effort, restricted to watched roots;
+internal previews in Total Commander or another app cannot be guaranteed.
+Typical Office, PDF, HTML, Markdown, TXT, spreadsheet documents and ZIP archives
+are included in the shared 100-file limit. Successful internal ZIP opens also
+count as activity; archive members are not separate physical Recent files.
+System/hidden files, temporary Office files, links/junctions and known
+build/cache folders are excluded. Metadata monitoring does not read document
+contents or deliberately hydrate OneDrive files; opening/previewing a file can.
+Missing files are pruned. Fixture mode never discovers personal roots or reads
+Windows Recent.
 
 Folder sizes sum descendant files; dates show the newest descendant-file
 modification time in UTC. They share a bounded watched in-memory cache.
@@ -75,8 +126,11 @@ Only Store/Deflate; ZIP64, encrypted, split and unsafe/ambiguous archives fail.
 ## Settings and integrations
 
 The workspace rail starts collapsed on every launch. Use its `>` / `<` controls
-to expand/collapse it; Ctrl+Shift+B or Ctrl+Shift+H expands it for places/recent
-documents. Saved places remain available through Alt+Up while it is collapsed.
+to expand/collapse it, or Ctrl+Shift+H to toggle it. Opening selects Recent.
+The Places tab has no dedicated shortcut; saved places remain available through
+the separate Alt+Up chooser while the rail is collapsed.
+Settings has separate Appearance, Recent activity and AI connections tabs;
+appearance controls stay immediate, while watched-folder changes use Apply.
 
 Ctrl+Space opens Ask, with multiline input for AI and commands. Every existing action has a
 slash command, for example `/rename`, `/preview`, `/settings` or `/copilot-cli`.
@@ -104,11 +158,14 @@ replaces it or the application closes.
 `/search query` prefills it without sending anything to a provider.
 There is no separate AI-search toolbar button.
 
-Preferences: `%LOCALAPPDATA%\TomasCommander\preferences.txt`. v1-v3 remain
-readable; custom saved-place names use v4. Appearance, zoom, favorites/names and
-recent documents persist. Operations use a durable journal beside preferences.
+Preferences: `%LOCALAPPDATA%\TomasCommander\preferences.txt`. v1-v4 remain
+readable; v5 adds watched Recent folders. Appearance, zoom, favorites/names and
+Recent folder settings persist. Activity is stored separately in
+`recent-activity.json` beside preferences; legacy Recent entries migrate using
+known modification times, not invented opening times. Operations use a durable
+journal beside preferences.
 
-Shift+Enter opens VS Code/Copilot choices for the active context. These require
+In file panes, Shift+Enter opens VS Code/Copilot choices for the active context. These require
 installed tools. Copilot App requests an idle folder session; CLI uses `--yolo`
 and therefore grants the external agent its unattended execution mode.
 

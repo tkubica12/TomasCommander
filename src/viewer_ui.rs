@@ -42,6 +42,7 @@ pub struct ReaderPanel {
     quarter_turns: u8,
     pub edit_requested: bool,
     pub save_requested: bool,
+    pub recent_activity: Option<PathBuf>,
     close_prompt: bool,
     virtual_entry: Option<String>,
     pub open_entry: Option<String>,
@@ -115,6 +116,7 @@ impl ReaderPanel {
             quarter_turns: 0,
             edit_requested: false,
             save_requested: false,
+            recent_activity: None,
             close_prompt: false,
             virtual_entry: None,
             open_entry: None,
@@ -474,6 +476,9 @@ impl ReaderPanel {
             }
             match result {
                 Ok(preview) => {
+                    if self.virtual_entry.is_none() {
+                        self.recent_activity = Some(preview.path.clone());
+                    }
                     if let Content::Markdown { links, .. } = &preview.content {
                         for link in links {
                             self.markdown_cache.add_link_hook(link);
@@ -821,6 +826,40 @@ mod tests {
     use super::*;
 
     #[test]
+    fn recent_preview_activity_requires_a_successful_current_physical_result() {
+        let mut panel = ReaderPanel::new(Scope::unrestricted(), egui::Context::default());
+        let (sender, results) = mpsc::sync_channel(4);
+        panel.results = results;
+        panel.generation.store(3, Ordering::Release);
+        panel.target = Some(1);
+        let path = PathBuf::from(r"D:\synthetic\preview.md");
+        let preview = || Preview {
+            path: path.clone(),
+            content: Content::Text(vec!["synthetic".into()]),
+            notice: "TEST ONLY",
+        };
+        sender.send((2, Ok(preview()))).unwrap();
+        panel.poll();
+        assert!(panel.recent_activity.is_none());
+        sender
+            .send((3, Err("Synthetic failed preview".into())))
+            .unwrap();
+        panel.poll();
+        assert!(panel.recent_activity.is_none());
+        sender.send((3, Ok(preview()))).unwrap();
+        panel.poll();
+        assert_eq!(panel.recent_activity.take(), Some(path.clone()));
+        panel.virtual_entry = Some("member.md".into());
+        sender.send((3, Ok(preview()))).unwrap();
+        panel.poll();
+        assert!(panel.recent_activity.is_none());
+        panel.target = None;
+        sender.send((3, Ok(preview()))).unwrap();
+        panel.poll();
+        assert!(panel.recent_activity.is_none());
+    }
+
+    #[test]
     fn preview_toggle_closes_same_document_and_replaces_different_document() {
         let mut panel = ReaderPanel::new(Scope::unrestricted(), egui::Context::default());
         let first = PathBuf::from(r"C:\synthetic-preview\first.txt");
@@ -947,6 +986,7 @@ mod tests {
             edit_requested: false,
             save_requested: false,
             close_prompt: false,
+            recent_activity: None,
             virtual_entry: None,
             open_entry: None,
             selected_archive: Default::default(),
@@ -1018,6 +1058,7 @@ mod tests {
             edit_requested: false,
             save_requested: false,
             close_prompt: false,
+            recent_activity: None,
             virtual_entry: None,
             open_entry: None,
             selected_archive: Default::default(),
@@ -1065,6 +1106,7 @@ mod tests {
             edit_requested: false,
             save_requested: false,
             close_prompt: false,
+            recent_activity: None,
             virtual_entry: None,
             open_entry: None,
             selected_archive: Default::default(),
@@ -1152,6 +1194,7 @@ mod tests {
             edit_requested: false,
             save_requested: false,
             close_prompt: false,
+            recent_activity: None,
             virtual_entry: None,
             open_entry: None,
             selected_archive: Default::default(),

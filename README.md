@@ -22,7 +22,7 @@ before the release cleanup.
 ## Download and run
 
 Download `tomas-commander.exe` from [GitHub Releases](https://github.com/tkubica12/TomasCommander/releases).
-The latest version is **v0.3.0**, an experimental Windows x64 release.
+The latest version is **v0.4.0**, an experimental Windows x64 release.
 No installer or Rust toolchain is needed to run the downloaded executable.
 The binary is unsigned; this project does not provide code-signing or support.
 
@@ -38,8 +38,14 @@ The binary is unsigned; this project does not provide code-signing or support.
   filename search and sortable size/date columns.
 - Copy, same-volume move, Recycle Bin deletion, rename and new folder, with
   exact-path confirmation and durable operation receipts.
-- Saved locations with editable names and removal, recent documents, compact
+- Saved locations with editable names and removal, unified Recent activity, compact
   clickable breadcrumbs and inline filename editing.
+- Recent document and ZIP-file changes in configurable folders (D: and both detected OneDrive
+  roots by default), Commander opens/views/saves and best-effort Windows Recent.
+  Ctrl+Shift+H toggles the rail, opening on Recent; Places has no dedicated shortcut.
+  Recent rows match file-pane typography and support preview, Copy path, system
+  Open with, Open containing folder and dragging.
+  Settings separates Appearance, Recent activity and AI connections.
 - Native previews for Markdown, semantic HTML, PDF, JPEG/PNG/BMP, UTF-8
   text/config/source files, formatted JSON and comma-delimited CSV.
 - Source editing with guarded Save; ZIP browsing, creation, insertion and
@@ -58,13 +64,15 @@ The binary is unsigned; this project does not provide code-signing or support.
 | Tab / arrows | Switch pane / navigate |
 | Enter / Backspace | Open / parent folder |
 | Ctrl+Left / Ctrl+Right | Parent / return after parent navigation |
-| Ctrl+Up / Ctrl+Down | Jump ten rows |
+| PageUp / PageDown or Ctrl+Up / Ctrl+Down | Jump ten rows |
 | Space / Shift+arrows / Ctrl+A | Toggle / range / select all |
 | Ctrl+Enter | Toggle preview; a different file replaces it |
 | Shift+Enter | Open with menu |
 | Ctrl+Space | Ask / AI prompts and slash commands |
+| Ctrl+Shift+H | Toggle workspace rail, opening on Recent |
 | Alt+Up | Saved places, including Add current folder |
 | Ctrl+F / Ctrl+Shift+F | Filter / recursive filename search |
+| Ctrl+Shift+S | Cycle sorting: name A-Z / newest first / largest first |
 | Ctrl+Shift+C / Ctrl+Shift+M / Ctrl+Shift+D | Copy / move / Recycle Bin |
 | Ctrl+N / Ctrl+Shift+N | New folder / rename |
 | Ctrl+plus / Ctrl+minus / Ctrl+wheel | Global UI zoom |
@@ -83,16 +91,17 @@ AI submission closes Ask and runs in the background, leaving both file panes
 usable. The header bell opens progress, partial results or the latest answer;
 an unread badge appears on completion without interrupting work. One AI task
 runs at a time. Hide keeps it running; Cancel/Escape stops it. Continue is explicit.
-The workspace rail starts collapsed; expand it with `>` or the places/recent
-keyboard shortcuts. See [release notes](CHANGELOG.md) for version history.
+The workspace rail starts collapsed; expand it with `>` or toggle it with
+Ctrl+Shift+H. See [release notes](CHANGELOG.md) for version history.
 
 No function keys or Z/Y bindings are required. Mouse access remains available.
 At a drive root, opening `..`, Backspace, Ctrl+Left or the header's `..` button
 opens the Windows drive chooser. Use Up/Down and Enter, or click a drive;
 Escape cancels. The chosen drive replaces only the active pane. Unavailable
 or disconnected drives report an ordinary folder-read error.
-Single-click a filename to edit it in place; Enter reviews the rename and
-Escape cancels. Double-click opens normally; Ctrl-double-click previews and
+Click a filename to focus it. A further slow click on the current filename
+starts in-place editing; Enter reviews the rename and Escape cancels.
+Rapid double-click opens normally; Ctrl-double-click previews and
 Shift-double-click opens the chooser.
 
 Preferences, saved-location names and appearance persist in

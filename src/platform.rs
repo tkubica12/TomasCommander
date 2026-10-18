@@ -312,7 +312,7 @@ fn wide(path: &Path) -> FileResult<Vec<u16>> {
 }
 
 #[cfg(windows)]
-fn shell_path(path: &Path) -> FileResult<std::path::PathBuf> {
+pub(crate) fn shell_path(path: &Path) -> FileResult<std::path::PathBuf> {
     use std::os::windows::ffi::{OsStrExt, OsStringExt};
     let value: Vec<u16> = path.as_os_str().encode_wide().collect();
     let normalized = if let Some(unc) = value.strip_prefix(&[92, 92, 63, 92, 85, 78, 67, 92]) {
@@ -358,6 +358,42 @@ pub fn open_file(path: &Path) -> FileResult<()> {
 #[cfg(not(windows))]
 pub fn open_file(_path: &Path) -> FileResult<()> {
     Err("Opening files with their associated application requires Windows.".into())
+}
+
+#[cfg(windows)]
+pub fn open_file_with(path: &Path) -> FileResult<()> {
+    use windows::{
+        Win32::{
+            Foundation::ERROR_CANCELLED,
+            System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx, CoUninitialize},
+            UI::Shell::{OAIF_EXEC, OPENASINFO, SHOpenWithDialog},
+        },
+        core::PCWSTR,
+    };
+    let value = wide(&shell_path(path)?)?;
+    unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }
+        .ok()
+        .map_err(|error| format!("Initialize Open with: {error}"))?;
+    let result = unsafe {
+        SHOpenWithDialog(
+            None,
+            &OPENASINFO {
+                pcszFile: PCWSTR(value.as_ptr()),
+                pcszClass: PCWSTR::null(),
+                oaifInFlags: OAIF_EXEC,
+            },
+        )
+    };
+    unsafe { CoUninitialize() };
+    match result {
+        Err(error) if error.code() == ERROR_CANCELLED.to_hresult() => Ok(()),
+        result => result.map_err(|error| format!("Open file with another application: {error}")),
+    }
+}
+
+#[cfg(not(windows))]
+pub fn open_file_with(_path: &Path) -> FileResult<()> {
+    Err("The system Open with dialog requires Windows.".into())
 }
 
 #[cfg(windows)]

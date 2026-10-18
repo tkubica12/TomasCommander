@@ -14,6 +14,7 @@ pub mod naming;
 pub mod pdf;
 pub mod platform;
 pub mod preferences;
+pub mod recent;
 pub mod search;
 pub mod viewer;
 
