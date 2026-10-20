@@ -109,6 +109,7 @@ impl Intent {
 pub fn fold(text: &str) -> String {
     text.to_lowercase()
         .chars()
+        .filter(|c| !matches!(c, '\u{0300}'..='\u{036f}'))
         .map(|c| match c {
             'á' | 'ä' => 'a',
             'č' => 'c',
@@ -244,13 +245,15 @@ pub fn discover(
     if query.trim().is_empty() {
         return Err("Enter a filename query before searching.".into());
     }
-    let query = query.to_lowercase();
+    let query = fold(query);
+    if query.trim().is_empty() {
+        return Err("Enter a filename query before searching.".into());
+    }
     walk(
         scope,
         root,
         |entry, _| {
-            entry
-                .folded
+            fold(&entry.name)
                 .contains(&query)
                 .then(|| (0, "filename contains query".into()))
         },
@@ -539,6 +542,9 @@ mod tests {
     #[test]
     fn token_matching_is_diacritic_aware_and_not_arbitrary_substring_search() {
         assert_eq!(fold("ČERVENEC DOVOLENÁ ŘÍJEN"), "cervenec dovolena rijen");
+        assert_eq!(fold("ČEZ"), "cez");
+        assert_eq!(fold("C\u{030c}EZ"), "cez");
+        assert_eq!(fold("PŘÍLIŠ ŽLUŤOUČKÝ KŮŇ"), "prilis zlutoucky kun");
         assert_eq!(term_score("Srbsko", "srbsko"), Some(30));
         assert_eq!(term_score("my-holiday-photo", "holiday"), Some(20));
         assert_eq!(term_score("Dovolene", "dovolen"), Some(10));

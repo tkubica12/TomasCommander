@@ -75,6 +75,10 @@ pub struct Plan {
 }
 
 impl Plan {
+    pub fn source(&self) -> Option<&Path> {
+        self.source.as_deref()
+    }
+
     pub fn target(&self) -> &Path {
         &self.target
     }

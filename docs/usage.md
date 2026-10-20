@@ -8,6 +8,8 @@ mapped/removable drives reported by Windows. Up/Down and Enter select; Escape
 cancels. Backspace, Ctrl+Left and the header's `..` use the same route.
 Fixture-root boundaries remain closed and never offer an escape to other drives.
 Filter is local; recursive search examines actual filenames without following links/junctions.
+File-pane filters, recursive filename search and ZIP filters ignore letter case
+and Czech diacritics: `cez` matches `ČEZ`. File names and sorting are unchanged.
 Typing in a file pane appends to its filter and focuses the filter field.
 Down from the filter focuses the first matching file; subsequent arrows navigate
 the list. Escape clears a nonempty filter from either the field or the file list,
@@ -16,6 +18,16 @@ Ctrl+F still focuses the filter explicitly. Text editors, dialogs,
 the places rail and previews retain their own keyboard handling.
 Selected rows operate on their selected group; an unselected row targets itself.
 Rename always targets the focused item.
+New folder needs only a name and Enter (or Create); there is no second
+confirmation. Other file changes show a compact review: Enter confirms, Escape
+cancels. The confirming button has initial focus; Tab can select Cancel instead.
+Technical details remain available under Details. A held Enter does not confirm
+a subsequent dialog.
+Prompt editors keep their existing submit/newline shortcuts; they are not
+confirmation dialogs.
+Ctrl+Shift+N creates a new folder, Ctrl+Shift+E renames the focused item,
+and Ctrl+Shift+R refreshes the active folder. Ctrl+N and Ctrl+R are no longer
+file-pane shortcuts.
 PageUp/PageDown jump ten rows, just like Ctrl+Up/Ctrl+Down.
 Clicking a filename that is not current only moves the cursor. A further slow
 click on the current filename starts inline rename; a rapid double-click opens
@@ -33,6 +45,16 @@ only that item's path. The `..` navigation row has no such action.
 
 Drag a row or selected group to the opposite pane/folder. Move is the default;
 hold Ctrl at release for Copy. Drops prepare a plan, not an immediate effect.
+Dragging any selected file (including its selection checkbox) carries the entire
+selected group, including selected files hidden by the filter. An unselected
+file is dragged alone.
+Press **Alt before or during a drag** to send physical files straight to another
+application: Commander temporarily hides so the target underneath is accessible,
+then reappears without taking focus after drop, Escape or failure.
+Alt also works after the pointer has left Commander and Windows owns the drag.
+Release Alt once the window hides; keep holding the mouse button until the drop.
+This is an external **Copy-only** drag; plain dragging between panes is unchanged.
+The drag bubble shows only the filename or item count, without shortcut hints.
 Escape cancels. Drag real files/folders outside the window to hand them to Windows
 applications such as Teams or Explorer. External dragging offers Copy only:
 the source is never moved/deleted, even with Shift. The target decides whether

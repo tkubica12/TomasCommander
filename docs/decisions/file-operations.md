@@ -1,8 +1,20 @@
 # File-operation policy
 
-Every filesystem mutation, including Copy, reviews an immutable exact-path plan.
-Cancel is the default; Ctrl+Enter explicitly confirms. Model output, redraws
+Filesystem mutations, including Copy, review an immutable exact-path plan.
+The confirmation action has initial keyboard focus: Enter confirms and Escape
+cancels. Tab can select Cancel; Enter then activates Cancel, not the default.
+Held/repeated Enter never approves a newly displayed plan. Model output, redraws
 and restarting the app never grant approval.
+
+New folder is the exception to a separate review dialog: submitting its name
+with Create or Enter is the approval. The worker still prepares, validates and
+journals the exact target before creating the empty folder. Name collisions,
+invalid names, cancellation and changed parents still prevent creation.
+Rename continues to show a separate review.
+
+Confirmations show the operation, exact destination/source names and the main
+effect. Technical snapshot, staging and ZIP member information is under Details;
+it is not discarded or omitted from execution validation.
 
 ## Snapshots and journal
 

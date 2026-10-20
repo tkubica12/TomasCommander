@@ -22,7 +22,7 @@ before the release cleanup.
 ## Download and run
 
 Download `tomas-commander.exe` from [GitHub Releases](https://github.com/tkubica12/TomasCommander/releases).
-The latest version is **v0.4.0**, an experimental Windows x64 release.
+The latest version is **v0.5.0**, an experimental Windows x64 release.
 No installer or Rust toolchain is needed to run the downloaded executable.
 The binary is unsigned; this project does not provide code-signing or support.
 
@@ -74,7 +74,7 @@ The binary is unsigned; this project does not provide code-signing or support.
 | Ctrl+F / Ctrl+Shift+F | Filter / recursive filename search |
 | Ctrl+Shift+S | Cycle sorting: name A-Z / newest first / largest first |
 | Ctrl+Shift+C / Ctrl+Shift+M / Ctrl+Shift+D | Copy / move / Recycle Bin |
-| Ctrl+N / Ctrl+Shift+N | New folder / rename |
+| Ctrl+Shift+N / Ctrl+Shift+E / Ctrl+Shift+R | New folder / rename / refresh |
 | Ctrl+plus / Ctrl+minus / Ctrl+wheel | Global UI zoom |
 | Ctrl+0 | Reset zoom |
 | ? / status-bar Help | Shortcut help |

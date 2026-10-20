@@ -44,6 +44,7 @@ pub struct ReaderPanel {
     pub save_requested: bool,
     pub recent_activity: Option<PathBuf>,
     close_prompt: bool,
+    close_prompt_focus: bool,
     virtual_entry: Option<String>,
     pub open_entry: Option<String>,
     selected_archive: std::collections::BTreeSet<String>,
@@ -118,6 +119,7 @@ impl ReaderPanel {
             save_requested: false,
             recent_activity: None,
             close_prompt: false,
+            close_prompt_focus: false,
             virtual_entry: None,
             open_entry: None,
             selected_archive: Default::default(),
@@ -317,7 +319,7 @@ impl ReaderPanel {
         else {
             return Vec::new();
         };
-        let query = self.filter.to_lowercase();
+        let query = tomas_commander::search::fold(&self.filter);
         let mut rows: Vec<_> = inventory
             .entries
             .iter()
@@ -328,7 +330,7 @@ impl ReaderPanel {
                 if query.is_empty() {
                     !relative.contains('/') && !relative.is_empty()
                 } else {
-                    relative.to_lowercase().contains(&query)
+                    tomas_commander::search::fold(relative).contains(&query)
                 }
             })
             .collect();
@@ -436,6 +438,9 @@ impl ReaderPanel {
 
     pub fn close(&mut self) {
         if self.dirty() {
+            if !self.close_prompt {
+                self.close_prompt_focus = true;
+            }
             self.close_prompt = true;
             return;
         }
@@ -501,7 +506,7 @@ impl ReaderPanel {
             } else {
                 "Reading pane"
             });
-            close = ui.button("Close / Escape").clicked();
+            close = ui.button("Close").on_hover_text("Escape").clicked();
         });
         ui.label(files::display_path(&self.path));
         if let Some(entry) = &self.virtual_entry {
@@ -511,20 +516,38 @@ impl ReaderPanel {
         if self.close_prompt {
             let mut discard = false;
             let mut keep = false;
-            let modal = egui::Modal::new(egui::Id::new("reader-dirty-close")).show(ui.ctx(), |ui| {
-                ui.heading("Unsaved edits");
-                ui.label("No source changes have been saved. Keep editing, request exact Save approval, or explicitly discard this buffer.");
-                keep = ui.button("Keep editing / Escape").clicked();
-                self.save_requested |= ui.button("Save / exact approval").clicked();
-                discard = ui.button("Discard edits and close").clicked();
-            });
+            let mut save = false;
+            let modal =
+                egui::Modal::new(egui::Id::new("reader-dirty-close")).show(ui.ctx(), |ui| {
+                    ui.set_width(460.0);
+                    ui.heading("Unsaved edits");
+                    ui.label(files::display_path(&self.path));
+                    ui.label("Save changes before closing?");
+                    ui.horizontal(|ui| {
+                        let button = ui.button("Discard");
+                        discard = button.clicked()
+                            || (button.has_focus()
+                                && crate::app::consume_prompt_key(
+                                    ui.ctx(),
+                                    egui::Modifiers::NONE,
+                                    egui::Key::Enter,
+                                ));
+                        (save, keep) = crate::app::confirmation_buttons(
+                            ui,
+                            "Save",
+                            &mut self.close_prompt_focus,
+                        );
+                    });
+                });
             if keep || modal.should_close() {
                 self.close_prompt = false;
-            }
-            if discard {
+            } else if discard {
                 self.preview = None;
                 self.close();
                 return true;
+            } else if save {
+                self.close_prompt = false;
+                self.save_requested = true;
             }
         }
         if let Some(error) = &self.error {
@@ -543,7 +566,7 @@ impl ReaderPanel {
             } else {
                 "Original source / unchanged"
             });
-            self.save_requested |= ui.button("Save source / Ctrl S / exact approval").clicked();
+            self.save_requested |= ui.button("Save").on_hover_text("Ctrl S").clicked();
             let id = egui::Id::new("reader-editor");
             if ui.is_enabled() {
                 crate::app::accessible_text_value(ui.ctx(), id, &mut editor.text);
@@ -562,7 +585,7 @@ impl ReaderPanel {
             return close;
         }
         if self.preview.is_some() && tomas_commander::changes::editable(&self.path) {
-            self.edit_requested |= ui.button("Edit original source / Ctrl E").clicked();
+            self.edit_requested |= ui.button("Edit").on_hover_text("Ctrl E").clicked();
         }
         if self.is_archive() && self.preview.is_some() {
             ui.label(format!(
@@ -927,6 +950,39 @@ mod tests {
             })
             .textures_delta
             .clear();
+        for key in [egui::Key::Escape, egui::Key::Enter] {
+            if key == egui::Key::Enter {
+                panel.close();
+                context
+                    .run_ui(egui::RawInput::default(), |ui| {
+                        assert!(!panel.show(ui));
+                    })
+                    .textures_delta
+                    .clear();
+            }
+            context
+                .run_ui(
+                    egui::RawInput {
+                        events: vec![egui::Event::Key {
+                            key,
+                            physical_key: Some(key),
+                            pressed: true,
+                            repeat: false,
+                            modifiers: egui::Modifiers::NONE,
+                        }],
+                        ..Default::default()
+                    },
+                    |ui| {
+                        assert!(!panel.show(ui));
+                    },
+                )
+                .textures_delta
+                .clear();
+            assert!(!panel.close_prompt);
+            assert!(panel.dirty());
+            assert_eq!(panel.save_requested, key == egui::Key::Enter);
+            assert_eq!(panel.target, Some(1));
+        }
         assert!(panel.dirty());
         assert!(panel.save_plan(1).is_ok());
         assert_eq!(std::fs::read(&path).unwrap(), b"# Original\n");
@@ -986,6 +1042,7 @@ mod tests {
             edit_requested: false,
             save_requested: false,
             close_prompt: false,
+            close_prompt_focus: false,
             recent_activity: None,
             virtual_entry: None,
             open_entry: None,
@@ -1000,6 +1057,10 @@ mod tests {
         assert_eq!(panel.open_entry.as_deref(), Some("Příliš/file.txt"));
         assert_eq!(panel.path, PathBuf::from("owned.zip"));
         assert!(!panel.archive_parent());
+        for query in ["prilis", "PŘÍLIŠ", "Pr\u{030c}i\u{0301}lis\u{030c}"] {
+            panel.filter = query.into();
+            assert_eq!(panel.archive_rows().len(), 2);
+        }
         panel.filter = "FILE".into();
         assert_eq!(panel.archive_rows().len(), 1);
         let context = egui::Context::default();
@@ -1058,6 +1119,7 @@ mod tests {
             edit_requested: false,
             save_requested: false,
             close_prompt: false,
+            close_prompt_focus: false,
             recent_activity: None,
             virtual_entry: None,
             open_entry: None,
@@ -1106,6 +1168,7 @@ mod tests {
             edit_requested: false,
             save_requested: false,
             close_prompt: false,
+            close_prompt_focus: false,
             recent_activity: None,
             virtual_entry: None,
             open_entry: None,
@@ -1194,6 +1257,7 @@ mod tests {
             edit_requested: false,
             save_requested: false,
             close_prompt: false,
+            close_prompt_focus: false,
             recent_activity: None,
             virtual_entry: None,
             open_entry: None,

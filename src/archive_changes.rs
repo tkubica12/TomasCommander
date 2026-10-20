@@ -492,6 +492,22 @@ pub fn prepare(scope: &Scope, id: u64, request: Request, cancel: &AtomicBool) ->
 }
 
 impl Plan {
+    pub fn destination(&self) -> &Path {
+        if self.outputs.is_empty() {
+            self.target.as_deref().unwrap_or(&self.parent)
+        } else {
+            &self.parent
+        }
+    }
+
+    pub fn member_count(&self) -> usize {
+        self.member_rows.len()
+    }
+
+    pub fn removes_sources(&self) -> bool {
+        self.remove_sources || (self.replacement && !self.outputs.is_empty())
+    }
+
     pub fn summary(&self) -> String {
         let publication = if self.replacement {
             "Only the verified original archive is replaced."

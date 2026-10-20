@@ -45,6 +45,30 @@ impl DragItems {
             Self::Zip { selected, .. } => selected.len(),
         }
     }
+
+    fn label(&self) -> String {
+        match self {
+            Self::Files(paths) if paths.len() == 1 => {
+                let path = &paths[0];
+                files::display_path(path.file_name().map(std::path::Path::new).unwrap_or(path))
+            }
+            Self::Zip { selected, .. } if selected.len() == 1 => selected[0].clone(),
+            _ => format!("{} items", self.count()),
+        }
+    }
+}
+
+fn start_file_drag(ctx: &egui::Context, paths: Vec<PathBuf>) {
+    let reveal_target = ctx.input(|input| input.modifiers.alt);
+    ctx.data_mut(|data| data.insert_temp(Id::new("file-drag-reveal-target"), reveal_target));
+    egui::DragAndDrop::set_payload(ctx, DragItems::Files(paths));
+}
+
+fn drag_reveal_requested(ctx: &egui::Context) -> bool {
+    ctx.data(|data| {
+        data.get_temp::<bool>(Id::new("file-drag-reveal-target"))
+            .unwrap_or(false)
+    }) || ctx.input(|input| input.modifiers.alt && input.pointer.primary_down())
 }
 
 #[derive(Clone, Debug)]
@@ -231,12 +255,12 @@ impl Pane {
     }
 
     fn rebuild(&mut self) {
-        let query = self.filter.to_lowercase();
+        let query = search::fold(&self.filter);
         self.visible = self
             .entries
             .iter()
             .enumerate()
-            .filter(|(_, entry)| entry.folded.contains(&query))
+            .filter(|(_, entry)| search::fold(&entry.name).contains(&query))
             .map(|(index, _)| index)
             .collect();
         if self.focused.is_some()
@@ -439,6 +463,58 @@ impl Change {
             Self::Name(plan) => plan.summary(),
         }
     }
+    fn confirm_label(&self) -> &'static str {
+        match self {
+            Self::Save(_) => "Save",
+            Self::Archive(_) => "Confirm",
+            Self::Name(_) => "Rename",
+        }
+    }
+
+    fn show_summary(&self, ui: &mut egui::Ui) {
+        match self {
+            Self::Save(plan) => {
+                confirmation_path(ui, "File", plan.source());
+                ui.label("Replace this file with your edited contents.");
+            }
+            Self::Name(plan) => {
+                if let Some(source) = plan.source() {
+                    confirmation_path(ui, "From", source);
+                }
+                confirmation_path(ui, "To", plan.target());
+                ui.label("No overwrite.");
+            }
+            Self::Archive(plan) => {
+                confirmation_path(ui, "To", plan.destination());
+                let count = plan.member_count();
+                ui.label(format!(
+                    "{count} ZIP {}",
+                    if count == 1 { "entry" } else { "entries" }
+                ));
+                ui.label(if plan.removes_sources() {
+                    "Move: sources are removed after the destination is verified."
+                } else {
+                    "Copy: sources are kept."
+                });
+            }
+        }
+        ui.collapsing("Details", |ui| {
+            ui.add(egui::Label::new(self.summary()).wrap());
+            if let Self::Archive(archive) = self {
+                egui::ScrollArea::both()
+                    .id_salt("zip-exact-plan-rows")
+                    .max_height(180.0)
+                    .show_rows(ui, ROW_HEIGHT, archive.row_count(), |ui, range| {
+                        for index in range {
+                            ui.add(
+                                egui::Label::new(archive.row(index))
+                                    .wrap_mode(egui::TextWrapMode::Extend),
+                            );
+                        }
+                    });
+            }
+        });
+    }
 }
 struct ZipDialog {
     sources: Vec<PathBuf>,
@@ -614,6 +690,27 @@ enum WorkResult {
         preview: bool,
         result: FileResult<PathBuf>,
     },
+}
+
+fn prepare_name_work(
+    scope: &Scope,
+    journal: &tomas_commander::journal::Journal,
+    id: u64,
+    folder: &std::path::Path,
+    source: Option<&std::path::Path>,
+    name: &str,
+    cancel: &AtomicBool,
+) -> WorkResult {
+    let result = journal
+        .initialize()
+        .and_then(|()| tomas_commander::naming::Plan::prepare(scope, id, folder, source, name));
+    match result {
+        Ok(plan) if source.is_none() => WorkResult::Changed {
+            outcome: plan.execute(scope, journal, true, cancel),
+            editor: false,
+        },
+        result => WorkResult::NamePrepared(result),
+    }
 }
 
 struct SearchRequest {
@@ -824,9 +921,13 @@ const COMMANDS: [(Command, &str, &str); 41] = [
     (
         Command::Rename,
         "Rename focused file / folder",
+        "Ctrl Shift E",
+    ),
+    (
+        Command::NewFolder,
+        "New folder in active pane",
         "Ctrl Shift N",
     ),
-    (Command::NewFolder, "New folder in active pane", "Ctrl N"),
     (
         Command::OpenWith,
         "Open with / development workspace",
@@ -879,7 +980,7 @@ const COMMANDS: [(Command, &str, &str); 41] = [
     (Command::Copy, "Copy to opposite pane", "Ctrl Shift C"),
     (Command::Move, "Move to opposite pane", "Ctrl Shift M"),
     (Command::Recycle, "Delete selected items", "Ctrl Shift D"),
-    (Command::Refresh, "Refresh folder", "Ctrl R"),
+    (Command::Refresh, "Refresh folder", "Ctrl Shift R"),
     (Command::Favorites, "Show pinned locations", ""),
     (Command::Recent, "Toggle workspace / Recent", "Ctrl Shift H"),
     (Command::Pin, "Pin current folder", ""),
@@ -1234,15 +1335,15 @@ impl Ledger {
                         folder,
                         source,
                         name,
-                    } => WorkResult::NamePrepared(journal.initialize().and_then(|()| {
-                        tomas_commander::naming::Plan::prepare(
-                            &worker_scope,
-                            id,
-                            &folder,
-                            source.as_deref(),
-                            &name,
-                        )
-                    })),
+                    } => prepare_name_work(
+                        &worker_scope,
+                        &journal,
+                        id,
+                        &folder,
+                        source.as_deref(),
+                        &name,
+                        &cancel,
+                    ),
                     Work::Change(change) => {
                         let (outcome, editor) = match change {
                             Change::Save(plan) => {
@@ -1591,21 +1692,30 @@ impl Ledger {
 
     fn finish_drag(&mut self, ctx: &egui::Context) {
         let Some(payload) = egui::DragAndDrop::payload::<DragItems>(ctx) else {
+            ctx.data_mut(|data| data.remove::<bool>(Id::new("file-drag-reveal-target")));
             return;
         };
         #[cfg(windows)]
         if self.drag_allowed()
             && let DragItems::Files(paths) = &*payload
         {
-            match platform::external_drag::pointer_outside_source() {
+            let reveal_target = drag_reveal_requested(ctx);
+            let external = if reveal_target {
+                Ok(true)
+            } else {
+                platform::external_drag::pointer_outside_source()
+            };
+            match external {
                 Ok(true) => {
                     egui::DragAndDrop::clear_payload(ctx);
+                    ctx.data_mut(|data| data.remove::<bool>(Id::new("file-drag-reveal-target")));
                     let sources = paths
                         .iter()
                         .map(|path| self.scope.resolve(path))
                         .collect::<FileResult<Vec<_>>>();
-                    let result =
-                        sources.and_then(|paths| platform::external_drag::copy_files(&paths));
+                    let result = sources.and_then(|paths| {
+                        platform::external_drag::copy_files(&paths, reveal_target)
+                    });
                     ctx.input_mut(|input| input.pointer = Default::default());
                     ctx.request_repaint();
                     match result {
@@ -1658,34 +1768,14 @@ impl Ledger {
             egui::CursorIcon::Move
         });
         if let Some(pos) = ctx.input(|input| input.pointer.interact_pos()) {
-            let destination = hover
-                .as_ref()
-                .map(|hover| match &hover.location {
-                    DropLocation::Folder(path) => files::display_path(path),
-                    DropLocation::Zip { archive, prefix } => {
-                        format!("{} / {prefix}", files::display_path(archive))
-                    }
-                })
-                .unwrap_or_else(|| "Drop on a folder or file pane".into());
             egui::Area::new(Id::new("file-drag-label"))
                 .order(egui::Order::Tooltip)
                 .interactable(false)
                 .fixed_pos(pos + Vec2::new(18.0, 18.0))
                 .show(ctx, |ui| {
                     egui::Frame::popup(ui.style()).show(ui, |ui| {
-                        ui.label(format!(
-                            "{} / {} item(s)",
-                            if !valid {
-                                "Cannot drop"
-                            } else if copy {
-                                "+ COPY"
-                            } else {
-                                "MOVE"
-                            },
-                            payload.count()
-                        ));
-                        ui.add(egui::Label::new(destination).truncate());
-                        ui.label("Ctrl = Copy / Escape = Cancel / approval before effects");
+                        ui.set_max_width(320.0);
+                        ui.add(egui::Label::new(payload.label()).truncate());
                     });
                 });
         }
@@ -2569,12 +2659,8 @@ impl Ledger {
             self.dispatch(Command::OpenWith);
             return;
         }
-        if ctx.input_mut(|input| input.consume_key(chord, Key::N)) {
-            self.dispatch(Command::Rename);
-            return;
-        }
-        if ctx.input_mut(|input| input.consume_key(Modifiers::CTRL, Key::N)) {
-            self.dispatch(Command::NewFolder);
+        if let Some(command) = consume_file_action(ctx) {
+            self.dispatch(command);
             return;
         }
         if ctx.input_mut(|input| input.consume_key(Modifiers::ALT, Key::ArrowUp)) {
@@ -2618,10 +2704,6 @@ impl Ledger {
         }
         if ctx.input_mut(|input| input.consume_key(Modifiers::CTRL, Key::F)) {
             self.dispatch(Command::Filter);
-            return;
-        }
-        if ctx.input_mut(|input| input.consume_key(Modifiers::CTRL, Key::R)) {
-            self.dispatch(Command::Refresh);
             return;
         }
         if ctx.input_mut(|input| input.consume_key(chord, Key::ArrowLeft)) {
@@ -2938,6 +3020,10 @@ impl Ledger {
                 }
                 WorkResult::NamePrepared(result) => {
                     self.operation_busy = false;
+                    if self.cancellation.load(Ordering::Acquire) {
+                        self.log("Name change cancelled; no effects.");
+                        continue;
+                    }
                     match result {
                         Ok(plan) => {
                             self.change_plan = Some(Change::Name(plan));
@@ -3483,7 +3569,7 @@ impl Ledger {
                             });
                             if !navigation && drag_allowed && response.drag_started_by(egui::PointerButton::Primary) {
                                 self.inline_pending = None;
-                                egui::DragAndDrop::set_payload(ui.ctx(), DragItems::Files(pane.drag_targets(&path)));
+                                start_file_drag(ui.ctx(), pane.drag_targets(&path));
                                 pane.focused = Some(path.clone());
                                 self.active = index;
                                 self.rail_index = None;
@@ -3538,6 +3624,11 @@ impl Ledger {
                                         egui::Checkbox::without_text(&mut checked),
                                     )
                                     .on_hover_text(format!("Select {name}"));
+                                let checkbox = if drag_allowed {
+                                    checkbox.interact(egui::Sense::click_and_drag())
+                                } else {
+                                    checkbox
+                                };
                                 checkbox.widget_info(|| {
                                     egui::WidgetInfo::selected(
                                         egui::WidgetType::Checkbox,
@@ -3556,6 +3647,13 @@ impl Ledger {
                                     self.rail_index = None;
                                     pane.focused = Some(path.clone());
                                     pane.anchor = position;
+                                }
+                                if drag_allowed && checkbox.drag_started_by(egui::PointerButton::Primary) {
+                                    self.inline_pending = None;
+                                    start_file_drag(ui.ctx(), pane.drag_targets(&path));
+                                    pane.focused = Some(path.clone());
+                                    self.active = index;
+                                    self.rail_index = None;
                                 }
                             }
                             let columns = RowColumns::new(rect);
@@ -3583,7 +3681,7 @@ impl Ledger {
                                 let label = file_name_label(ui, columns.name, &name);
                                 if !navigation && drag_allowed && label.drag_started_by(egui::PointerButton::Primary) {
                                     self.inline_pending = None;
-                                    egui::DragAndDrop::set_payload(ui.ctx(), DragItems::Files(pane.drag_targets(&path)));
+                                    start_file_drag(ui.ctx(), pane.drag_targets(&path));
                                     pane.focused = Some(path.clone());
                                     self.active = index;
                                     self.rail_index = None;
@@ -3851,9 +3949,9 @@ impl Ledger {
                 "Send only this harmless prompt; resolve names within these two roots locally."));
             ui.horizontal(|ui| {
                 start = ui.add_enabled(!busy && dialog.consent,
-                    egui::Button::new("Interpret command once")).clicked();
+                    egui::Button::new("Interpret")).clicked();
                 configure = ui.add_enabled(!busy,
-                    egui::Button::new("Foundry connection / Check")).clicked();
+                    egui::Button::new("Connection")).clicked();
             });
             if busy {
                 ui.horizontal(|ui| {
@@ -3902,15 +4000,15 @@ impl Ledger {
                         }
                     });
                 }
-                ui.label("Choosing candidates is not approval. The immutable exact-target plan requires separate confirmation.");
+                ui.label("Review the operation before confirming.");
                 if mutation {
                     prepare = ui.add_enabled(dialog.source.is_some() && (!needs_destination || dialog.destination.is_some()),
-                        egui::Button::new("Prepare exact plan / no effects")).clicked();
+                        egui::Button::new("Review")).clicked();
                 } else {
-                    reveal = ui.add_enabled(dialog.source.is_some(), egui::Button::new("Reveal chosen file")).clicked();
+                    reveal = ui.add_enabled(dialog.source.is_some(), egui::Button::new("Locate")).clicked();
                 }
             }
-            close = ui.button(if busy { "Cancel command / Escape" } else { "Close / Escape" }).clicked();
+            close = ui.button(if busy { "Cancel" } else { "Close" }).on_hover_text("Escape").clicked();
         });
         close |= modal.should_close();
         if start && !close {
@@ -4162,9 +4260,7 @@ impl Ledger {
                 if let Some(error) = &self.error {
                     ui.colored_label(ui.visuals().error_fg_color, error);
                 }
-                save = ui.button("Save").clicked()
-                    || ui.input_mut(|input| input.consume_key(Modifiers::NONE, Key::Enter));
-                cancel = ui.button("Cancel / Escape").clicked();
+                (save, cancel) = confirmation_buttons(ui, "Save", &mut false);
             });
             if cancel || modal.should_close() {
                 self.place_edit = None;
@@ -4244,7 +4340,7 @@ impl Ledger {
                 });
                 if let Some(error) = &self.error { ui.colored_label(ui.visuals().error_fg_color, error); }
                 ui.separator();
-                close = ui.button("Close / Escape").clicked();
+                close = ui.button("Close").on_hover_text("Escape").clicked();
             });
             if connection {
                 self.settings_open = false;
@@ -4297,7 +4393,7 @@ impl Ledger {
                             }
                         });
                 });
-                close = ui.button("Close / Escape").clicked();
+                close = ui.button("Close").on_hover_text("Escape").clicked();
             });
             if close || modal.should_close() {
                 self.operations_open = false;
@@ -4331,7 +4427,7 @@ impl Ledger {
                         chosen = Some(index);
                     }
                 }
-                close = ui.button("Cancel / Escape").clicked();
+                close = ui.button("Cancel").on_hover_text("Escape").clicked();
             });
             if close || modal.should_close() {
                 self.open_with = None;
@@ -4371,9 +4467,9 @@ impl Ledger {
                 } else {
                     "New folder"
                 });
-                ui.label(format!("Folder: {}", files::display_path(&dialog.folder)));
+                confirmation_path(ui, "Folder", &dialog.folder);
                 if let Some(source) = &dialog.source {
-                    ui.label(format!("Source: {}", files::display_path(source)));
+                    confirmation_path(ui, "File", source);
                 }
                 let id = Id::new("name-input");
                 accessible_text_value(ui.ctx(), id, &mut dialog.name);
@@ -4394,9 +4490,15 @@ impl Ledger {
                 if let Some(error) = &dialog.error {
                     ui.colored_label(ui.visuals().error_fg_color, error);
                 }
-                prepare = ui.button("Review exact change / Enter").clicked()
-                    || ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Enter));
-                close = ui.button("Cancel / Escape").clicked();
+                (prepare, close) = confirmation_buttons(
+                    ui,
+                    if dialog.source.is_some() {
+                        "Review"
+                    } else {
+                        "Create"
+                    },
+                    &mut false,
+                );
             });
             if close || modal.should_close() {
                 self.name_dialog = None;
@@ -4414,16 +4516,17 @@ impl Ledger {
             let mut close = false;
             let modal = egui::Modal::new(Id::new("create-zip-name")).show(ctx, |ui| {
                 ui.set_width(600.0);
-                ui.heading("Create ZIP / choose exact filename");
-                ui.label(format!("{} selected roots / destination {}", dialog.sources.len(), files::display_path(&dialog.destination)));
+                ui.heading("Create ZIP");
+                confirmation_path(ui, "Folder", &dialog.destination);
+                ui.label(format!("{} selected items", dialog.sources.len()));
                 let id = Id::new("zip-output-name");
                 accessible_text_value(ctx, id, &mut dialog.name);
                 let response = ui.add(egui::TextEdit::singleline(&mut dialog.name).id(id));
-                if dialog.focus { response.request_focus(); dialog.focus = false; }
-                ui.label("This only prepares a plan. The archive is created after separate exact-target confirmation.");
-                prepare = ui.button("Prepare ZIP plan / Enter").clicked();
-                prepare |= ui.input_mut(|input| input.consume_key(Modifiers::NONE, Key::Enter));
-                close = ui.button("Cancel / Escape").clicked();
+                if dialog.focus {
+                    response.request_focus();
+                    dialog.focus = false;
+                }
+                (prepare, close) = confirmation_buttons(ui, "Review", &mut false);
             });
             close |= modal.should_close();
             if close {
@@ -4481,7 +4584,7 @@ impl Ledger {
                                 ui.end_row();
                             });
                     });
-                close = ui.button("Close / Escape").clicked();
+                close = ui.button("Close").on_hover_text("Escape").clicked();
             });
             if close || modal.should_close() {
                 self.help_open = false;
@@ -4557,7 +4660,7 @@ impl Ledger {
                 );
                 pin |= response.clicked();
                 response.on_hover_text(files::display_path(&self.panes[self.active].path));
-                close = ui.button("Cancel / Escape").clicked();
+                close = ui.button("Cancel").on_hover_text("Escape").clicked();
             });
             self.places_popup = Some(index);
             if let Some(path) = remove {
@@ -4876,7 +4979,7 @@ impl Ledger {
                 if self.file_agent.busy() {
                     ui.label("An AI task is running. Open Notifications for progress; slash commands remain available.");
                 }
-                dismiss = ui.button("Close / Escape").clicked();
+                dismiss = ui.button("Close").on_hover_text("Escape").clicked();
             });
             dismiss |= modal.should_close();
             if dismiss {
@@ -4940,23 +5043,15 @@ impl Ledger {
         if let Some(plan) = &self.change_plan {
             let mut approve = false;
             let mut cancel = false;
-            let modal = egui::Modal::new(Id::new(("source-change-approval", plan.id()))).show(ctx, |ui| {
-                ui.set_width(620.0);
-                ui.heading(plan.label());
-                ui.label(plan.summary());
-                if let Change::Archive(archive) = plan {
-                    egui::ScrollArea::both().id_salt("zip-exact-plan-rows").max_height(220.0)
-                        .show_rows(ui, ROW_HEIGHT, archive.row_count(), |ui, range| {
-                            for index in range { ui.add(egui::Label::new(archive.row(index)).wrap_mode(egui::TextWrapMode::Extend)); }
-                        });
-                }
-                ui.label("Only this frozen plan is approved. External changes and duplicate replay are refused.");
-                let response = ui.button("Cancel / Escape");
-                if self.approval_focus { response.request_focus(); self.approval_focus = false; }
-                cancel = response.clicked();
-                approve = ui.button("Confirm exact change / Ctrl Enter").clicked();
-                approve |= ui.input_mut(|input| input.consume_key(Modifiers::CTRL, Key::Enter));
-            });
+            let modal =
+                egui::Modal::new(Id::new(("source-change-approval", plan.id()))).show(ctx, |ui| {
+                    ui.set_width(520.0);
+                    ui.heading(plan.label());
+                    plan.show_summary(ui);
+                    ui.separator();
+                    (approve, cancel) =
+                        confirmation_buttons(ui, plan.confirm_label(), &mut self.approval_focus);
+                });
             cancel |= modal.should_close();
             if cancel {
                 self.change_plan = None;
@@ -4977,64 +5072,29 @@ impl Ledger {
             let mut approve = false;
             let mut cancel = false;
             let modal = egui::Modal::new(Id::new(("approval", plan.id()))).show(ctx, |ui| {
-                ui.set_width(620.0);
-                ui.spacing_mut().item_spacing.y = 10.0;
+                ui.set_width(520.0);
                 let count = plan.sources().len();
                 ui.heading(format!(
                     "{} {count} {}",
                     plan.operation().name(),
                     if count == 1 { "item" } else { "items" }
                 ));
-                egui::Frame::group(ui.style())
-                    .inner_margin(12.0)
-                    .show(ui, |ui| {
-                        ui.set_width(ui.available_width());
-                        ui.label(RichText::new("Destination").strong());
-                        let destination = plan
-                            .destination()
-                            .map(files::display_path)
-                            .unwrap_or_else(|| {
-                                "Windows Recycle Bin (never permanently delete)".into()
-                            });
-                        ui.add(
-                            egui::Label::new(RichText::new(destination).monospace().size(12.0))
-                                .wrap(),
-                        );
-                    });
-                ui.label(RichText::new("Sources").strong());
-                egui::ScrollArea::vertical()
-                    .id_salt("approval-sources")
-                    .max_height(220.0)
-                    .show(ui, |ui| {
-                        for source in plan.sources() {
-                            ui.add(
-                                egui::Label::new(
-                                    RichText::new(files::display_path(source))
-                                        .monospace()
-                                        .size(12.0),
-                                )
-                                .wrap(),
-                            );
-                        }
-                    });
-                ui.separator();
-                ui.horizontal(|ui| {
-                    let cancel_button = action_button(ui, "Cancel", "Escape", true);
-                    if self.approval_focus {
-                        cancel_button.request_focus();
-                        self.approval_focus = false;
+                if let Some(destination) = plan.destination() {
+                    confirmation_path(ui, "To", destination);
+                } else {
+                    ui.label("To: Recycle Bin");
+                }
+                confirmation_sources(ui, plan.sources());
+                ui.label(match plan.operation() {
+                    Operation::Copy => "Sources are kept. No overwrite.",
+                    Operation::Move => "Sources are moved. No overwrite.",
+                    Operation::Recycle => {
+                        "Recoverable from the Recycle Bin. No permanent deletion."
                     }
-                    cancel = cancel_button.clicked();
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let response =
-                            action_button(ui, plan.operation().name(), "Ctrl Enter", true);
-                        ui.ctx().accesskit_node_builder(response.id, |node| {
-                            node.set_label(format!("Confirm {}", plan.operation().name()))
-                        });
-                        approve = response.clicked();
-                    });
                 });
-                approve |= ui.input_mut(|input| input.consume_key(Modifiers::CTRL, Key::Enter));
+                ui.separator();
+                (approve, cancel) =
+                    confirmation_buttons(ui, plan.operation().name(), &mut self.approval_focus);
             });
             cancel |= modal.should_close();
             if cancel {
@@ -5057,9 +5117,11 @@ impl Ledger {
             let mut dismiss = false;
             let modal = egui::Modal::new(Id::new("error")).show(ctx, |ui| {
                 ui.set_width(620.0);
-                ui.heading("Attention / operation or configuration error");
+                ui.heading("Error");
                 ui.label(error);
-                dismiss = ui.button("Acknowledge / Escape").clicked();
+                let button = ui.button("OK").on_hover_text("Enter / Escape");
+                button.request_focus();
+                dismiss = button.clicked() || consume_prompt_key(ctx, Modifiers::NONE, Key::Enter);
             });
             dismiss |= modal.should_close();
             if dismiss {
@@ -5347,10 +5409,10 @@ impl eframe::App for Ledger {
                     (Command::Copy, "Copy", "Ctrl Shift C"),
                     (Command::Move, "Move", "Ctrl Shift M"),
                     (Command::Recycle, "Delete", "Ctrl Shift D"),
-                    (Command::Refresh, "Refresh", "Ctrl R"),
+                    (Command::Refresh, "Refresh", "Ctrl Shift R"),
                     (Command::Search, "Search", "Ctrl Shift F"),
-                    (Command::Rename, "Rename", "Ctrl Shift N"),
-                    (Command::NewFolder, "New folder", "Ctrl N"),
+                    (Command::Rename, "Rename", "Ctrl Shift E"),
+                    (Command::NewFolder, "New folder", "Ctrl Shift N"),
                     (Command::OpenWith, "Open with", "Shift Enter"),
                 ] {
                     let response = action_button(ui, label, hint, !self.operation_busy && self.plan.is_none());
@@ -5567,7 +5629,98 @@ impl eframe::App for Ledger {
     }
 }
 
-// egui 0.36 text editors expose ValuePattern but do not process SetValue.
+pub(crate) fn confirmation_buttons(
+    ui: &mut egui::Ui,
+    label: &str,
+    focus: &mut bool,
+) -> (bool, bool) {
+    let (mut enter, mut escape) = (false, false);
+    let mut key_event = false;
+    ui.input_mut(|input| {
+        input.events.retain(|event| {
+            if let egui::Event::Key {
+                key,
+                pressed: true,
+                repeat,
+                modifiers,
+                ..
+            } = event
+                && matches!(key, Key::Enter | Key::Escape)
+            {
+                key_event = true;
+                if modifiers.is_none() {
+                    enter |= *key == Key::Enter && !repeat;
+                    escape |= *key == Key::Escape;
+                }
+                false
+            } else {
+                true
+            }
+        });
+    });
+    ui.horizontal(|ui| {
+        let cancel = ui.button("Cancel").on_hover_text("Escape");
+        let confirm = ui.button(label).on_hover_text("Enter");
+        if *focus {
+            confirm.request_focus();
+            *focus = false;
+        }
+        // egui can synthesize button clicks before the key event is consumed here.
+        let cancel_chosen =
+            (cancel.clicked() && !key_event) || escape || (enter && cancel.has_focus());
+        (
+            !cancel_chosen && ((confirm.clicked() && !key_event) || (enter && !cancel.has_focus())),
+            cancel_chosen,
+        )
+    })
+    .inner
+}
+
+fn confirmation_path(ui: &mut egui::Ui, label: &str, path: &std::path::Path) {
+    ui.horizontal_top(|ui| {
+        ui.label(RichText::new(format!("{label}:")).strong());
+        ui.add(
+            egui::Label::new(
+                RichText::new(files::display_path(path))
+                    .monospace()
+                    .size(12.0),
+            )
+            .wrap(),
+        );
+    });
+}
+
+fn confirmation_sources(ui: &mut egui::Ui, sources: &[PathBuf]) {
+    let parent = sources
+        .first()
+        .and_then(|path| path.parent())
+        .filter(|parent| sources.iter().all(|path| path.parent() == Some(*parent)));
+    if let Some(parent) = parent {
+        confirmation_path(ui, "From", parent);
+    }
+    egui::ScrollArea::vertical()
+        .id_salt("confirmation-sources")
+        .max_height(ROW_HEIGHT * 5.0)
+        .show(ui, |ui| {
+            for path in sources {
+                let name = if parent.is_some() {
+                    path.file_name().map(std::path::Path::new).unwrap_or(path)
+                } else {
+                    path
+                };
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(files::display_path(name))
+                            .monospace()
+                            .size(12.0),
+                    )
+                    .wrap(),
+                )
+                .on_hover_text(files::display_path(path));
+            }
+        });
+}
+
 pub(crate) fn consume_prompt_key(ctx: &egui::Context, chord: Modifiers, key: Key) -> bool {
     ctx.input_mut(|input| {
         let mut consumed = false;
@@ -5593,6 +5746,22 @@ pub(crate) fn consume_prompt_key(ctx: &egui::Context, chord: Modifiers, key: Key
     })
 }
 
+fn consume_file_action(ctx: &egui::Context) -> Option<Command> {
+    let chord = Modifiers {
+        ctrl: true,
+        shift: true,
+        ..Modifiers::NONE
+    };
+    [
+        (Key::E, Command::Rename),
+        (Key::N, Command::NewFolder),
+        (Key::R, Command::Refresh),
+    ]
+    .into_iter()
+    .find_map(|(key, command)| consume_prompt_key(ctx, chord, key).then_some(command))
+}
+
+// egui 0.36 text editors expose ValuePattern but do not process SetValue.
 pub(crate) fn accessible_text_value(ctx: &egui::Context, id: Id, text: &mut String) -> bool {
     let mut changed = false;
     ctx.input_mut(|input| {
@@ -5707,7 +5876,7 @@ impl DrivePicker {
                     }
                 });
             ui.separator();
-            close = ui.button("Cancel / Escape").clicked();
+            close = ui.button("Cancel").on_hover_text("Escape").clicked();
         });
         (selected, close || modal.should_close())
     }
@@ -5824,7 +5993,7 @@ fn recent_row(
         }
     });
     if enabled && response.drag_started() {
-        response.dnd_set_drag_payload(DragItems::Files(vec![item.path.clone()]));
+        start_file_drag(ui.ctx(), vec![item.path.clone()]);
         action = None;
     }
     (response, action)
@@ -7095,6 +7264,325 @@ mod tests {
     }
 
     #[test]
+    fn confirmation_defaults_to_confirm_and_plain_enter_escape_are_unambiguous() {
+        for (keys, expected) in [
+            (vec![(Key::Enter, Modifiers::NONE, false)], (true, false)),
+            (vec![(Key::Escape, Modifiers::NONE, false)], (false, true)),
+            (
+                vec![
+                    (Key::Enter, Modifiers::NONE, false),
+                    (Key::Escape, Modifiers::NONE, false),
+                ],
+                (false, true),
+            ),
+            (vec![(Key::Enter, Modifiers::CTRL, false)], (false, false)),
+            (vec![(Key::Enter, Modifiers::SHIFT, false)], (false, false)),
+        ] {
+            let ctx = egui::Context::default();
+            let mut focus = true;
+            for frame in 0..2 {
+                let events = if frame == 0 {
+                    vec![]
+                } else {
+                    keys.iter()
+                        .map(|(key, modifiers, repeat)| egui::Event::Key {
+                            key: *key,
+                            physical_key: Some(*key),
+                            pressed: true,
+                            repeat: *repeat,
+                            modifiers: *modifiers,
+                        })
+                        .collect()
+                };
+                ctx.run_ui(
+                    egui::RawInput {
+                        events,
+                        ..Default::default()
+                    },
+                    |ui| {
+                        let chosen = confirmation_buttons(ui, "Confirm", &mut focus);
+                        assert_eq!(
+                            chosen,
+                            if frame == 0 { (false, false) } else { expected },
+                            "{keys:?}, frame {frame}"
+                        );
+                    },
+                )
+                .textures_delta
+                .clear();
+                assert!(!focus);
+                if frame == 0 {
+                    assert!(ctx.memory(|memory| memory.focused()).is_some());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn held_enter_cannot_confirm_a_newly_displayed_dialog() {
+        let ctx = egui::Context::default();
+        let mut focus = true;
+        for frame in 0..3 {
+            let events = if frame == 0 {
+                vec![]
+            } else {
+                vec![egui::Event::Key {
+                    key: Key::Enter,
+                    physical_key: Some(Key::Enter),
+                    pressed: true,
+                    repeat: frame == 2,
+                    modifiers: Modifiers::NONE,
+                }]
+            };
+            if frame == 2 {
+                focus = true;
+            }
+            ctx.run_ui(
+                egui::RawInput {
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    assert_eq!(
+                        confirmation_buttons(ui, "Confirm", &mut focus),
+                        if frame == 1 {
+                            (true, false)
+                        } else {
+                            (false, false)
+                        }
+                    );
+                },
+            )
+            .textures_delta
+            .clear();
+        }
+    }
+
+    #[test]
+    fn tab_can_focus_cancel_and_enter_cancels_instead_of_confirming() {
+        let ctx = egui::Context::default();
+        let mut focus = true;
+        for frame in 0..4 {
+            let events = match frame {
+                1 => vec![egui::Event::Key {
+                    key: Key::Tab,
+                    physical_key: Some(Key::Tab),
+                    pressed: true,
+                    repeat: false,
+                    modifiers: Modifiers::SHIFT,
+                }],
+                3 => vec![egui::Event::Key {
+                    key: Key::Enter,
+                    physical_key: Some(Key::Enter),
+                    pressed: true,
+                    repeat: false,
+                    modifiers: Modifiers::NONE,
+                }],
+                _ => vec![],
+            };
+            ctx.run_ui(
+                egui::RawInput {
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    assert_eq!(
+                        confirmation_buttons(ui, "Confirm", &mut focus),
+                        if frame == 3 {
+                            (false, true)
+                        } else {
+                            (false, false)
+                        }
+                    );
+                },
+            )
+            .textures_delta
+            .clear();
+        }
+    }
+
+    #[test]
+    fn submitted_folder_name_creates_once_but_rename_still_requires_review() {
+        use std::fs;
+        let root = std::env::temp_dir().join(format!(
+            "tc-name-submit-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&root).unwrap();
+        let scope = Scope::fixture(&root).unwrap();
+        let root = scope.resolve(&root).unwrap();
+        let journal_root = root.join("operations");
+        let journal = tomas_commander::journal::Journal::new(journal_root.clone());
+        let cancel = AtomicBool::new(false);
+        let created = root.join("Created");
+        match prepare_name_work(&scope, &journal, 1, &root, None, "Created", &cancel) {
+            WorkResult::Changed { outcome, editor } => {
+                assert!(!editor);
+                assert!(outcome.error.is_none(), "{:?}", outcome.error);
+                assert_eq!(outcome.created, vec![created.clone()]);
+            }
+            _ => panic!("New folder submission must execute without another review dialog."),
+        }
+        assert!(created.is_dir());
+        assert_eq!(fs::read_dir(&created).unwrap().count(), 0);
+        for name in ["Created", "bad\\name"] {
+            assert!(matches!(
+                prepare_name_work(&scope, &journal, 2, &root, None, name, &cancel),
+                WorkResult::NamePrepared(Err(_))
+            ));
+        }
+        cancel.store(true, Ordering::Release);
+        assert!(matches!(
+            prepare_name_work(&scope, &journal, 3, &root, None, "Cancelled", &cancel),
+            WorkResult::Changed {
+                outcome: Outcome {
+                    cancelled: true,
+                    ..
+                },
+                ..
+            }
+        ));
+        assert!(!root.join("Cancelled").exists());
+        cancel.store(false, Ordering::Release);
+        let source = root.join("source.txt");
+        fs::write(&source, b"unchanged").unwrap();
+        match prepare_name_work(
+            &scope,
+            &journal,
+            4,
+            &root,
+            Some(&source),
+            "renamed.txt",
+            &cancel,
+        ) {
+            WorkResult::NamePrepared(Ok(plan)) => {
+                assert_eq!(plan.source(), Some(source.as_path()));
+                assert_eq!(plan.target(), root.join("renamed.txt"));
+                let mut editor = tomas_commander::changes::Editor::open(&scope, &source).unwrap();
+                editor.text.push_str(" edited");
+                let archive = tomas_commander::archive_changes::prepare(
+                    &scope,
+                    6,
+                    tomas_commander::archive_changes::Request::Create {
+                        sources: vec![source.clone()],
+                        target: root.join("sample.zip"),
+                    },
+                    &cancel,
+                )
+                .unwrap();
+                for change in [
+                    Change::Name(plan),
+                    Change::Save(editor.plan(5).unwrap()),
+                    Change::Archive(archive),
+                ] {
+                    let ctx = egui::Context::default();
+                    let mut height = 0.0;
+                    let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+                        ui.set_width(520.0);
+                        change.show_summary(ui);
+                        height = ui.min_rect().height();
+                    });
+                    let text: String = output
+                        .shapes
+                        .iter()
+                        .filter_map(|shape| {
+                            if let egui::Shape::Text(text) = &shape.shape {
+                                Some(text.galley.job.text.as_str())
+                            } else {
+                                None
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    assert!(text.contains("Details"));
+                    assert!(!text.contains("Staging"));
+                    assert!(!text.contains("frozen"));
+                    assert!(height <= 220.0, "Compact summary exceeded 220 px: {height}");
+                    assert_eq!(change.confirm_label().split_whitespace().count(), 1);
+                    output.textures_delta.clear();
+                }
+            }
+            _ => panic!("Rename must still return a review plan."),
+        }
+        assert_eq!(fs::read(&source).unwrap(), b"unchanged");
+        assert!(!root.join("renamed.txt").exists());
+        let records: Vec<_> = fs::read_dir(&journal_root)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        assert_eq!(records.len(), 2);
+        for path in records {
+            if path.file_name().is_some_and(|name| name == "journal.lock") {
+                assert_eq!(fs::metadata(&path).unwrap().len(), 0);
+            } else {
+                assert_eq!(path.extension().unwrap(), "operation");
+                assert!(fs::read_to_string(&path).unwrap().contains("id=1\n"));
+            }
+            fs::remove_file(path).unwrap();
+        }
+        fs::remove_file(source).unwrap();
+        fs::remove_dir(created).unwrap();
+        fs::remove_dir(journal_root).unwrap();
+        fs::remove_dir(root).unwrap();
+    }
+
+    #[test]
+    fn file_action_shortcuts_require_ctrl_shift_and_have_distinct_commands() {
+        let chord = Modifiers {
+            ctrl: true,
+            shift: true,
+            ..Modifiers::NONE
+        };
+        for (key, command, label) in [
+            (Key::E, Command::Rename, "Ctrl Shift E"),
+            (Key::N, Command::NewFolder, "Ctrl Shift N"),
+            (Key::R, Command::Refresh, "Ctrl Shift R"),
+        ] {
+            assert!(
+                COMMANDS
+                    .iter()
+                    .any(|(action, _, shortcut)| *action == command && *shortcut == label)
+            );
+            for modifiers in [
+                chord,
+                Modifiers::CTRL,
+                Modifiers::SHIFT,
+                Modifiers::NONE,
+                Modifiers { alt: true, ..chord },
+            ] {
+                let ctx = egui::Context::default();
+                let expected = (modifiers == chord).then_some(command);
+                ctx.run_ui(
+                    egui::RawInput {
+                        events: vec![egui::Event::Key {
+                            key,
+                            physical_key: Some(key),
+                            pressed: true,
+                            repeat: false,
+                            modifiers,
+                        }],
+                        ..Default::default()
+                    },
+                    |_| {
+                        assert_eq!(consume_file_action(&ctx), expected);
+                        assert_eq!(consume_file_action(&ctx), None);
+                        assert_eq!(
+                            ctx.input(|input| input.events.len()),
+                            usize::from(expected.is_none())
+                        );
+                    },
+                )
+                .textures_delta
+                .clear();
+            }
+        }
+    }
+
+    #[test]
     fn file_page_keys_match_control_arrows_and_do_not_capture_modified_page_keys() {
         for (key, modifiers, expected) in [
             (Key::PageUp, Modifiers::NONE, Some(false)),
@@ -7832,6 +8320,138 @@ mod tests {
     }
 
     #[test]
+    fn selected_files_drag_from_name_or_checkbox_preserves_the_entire_group_and_alt_intent() {
+        for checkbox in [false, true] {
+            for alt in [false, true] {
+                let ctx = egui::Context::default();
+                let mut pane = Pane::new(PathBuf::from("root"));
+                let first = PathBuf::from("first.txt");
+                let second = PathBuf::from("second.txt");
+                pane.selected = BTreeSet::from([first.clone(), second.clone()]);
+                let expected = vec![first.clone(), second.clone()];
+                let modifiers = Modifiers {
+                    alt,
+                    ..Modifiers::NONE
+                };
+                let mut position = egui::pos2(30.0, 30.0);
+                let mut checked = true;
+                for step in 0..3 {
+                    let mut events = match step {
+                        1 => vec![
+                            egui::Event::PointerMoved(position),
+                            egui::Event::PointerButton {
+                                pos: position,
+                                button: egui::PointerButton::Primary,
+                                pressed: true,
+                                modifiers,
+                            },
+                        ],
+                        2 => vec![egui::Event::PointerMoved(position + Vec2::new(90.0, 60.0))],
+                        _ => vec![],
+                    };
+                    events.insert(0, egui::Event::ModifiersChanged(modifiers));
+                    ctx.run_ui(
+                        egui::RawInput {
+                            events,
+                            ..Default::default()
+                        },
+                        |ui| {
+                            let response = if checkbox {
+                                ui.add(egui::Checkbox::without_text(&mut checked))
+                                    .interact(egui::Sense::click_and_drag())
+                            } else {
+                                let (rect, _) = ui.allocate_exact_size(
+                                    Vec2::new(300.0, ROW_HEIGHT),
+                                    egui::Sense::hover(),
+                                );
+                                file_name_label(ui, rect, "first.txt")
+                            };
+                            position = response.rect.center();
+                            if response.drag_started_by(egui::PointerButton::Primary) {
+                                start_file_drag(&ctx, pane.drag_targets(&first));
+                            }
+                        },
+                    )
+                    .textures_delta
+                    .clear();
+                }
+                let payload = egui::DragAndDrop::payload::<DragItems>(&ctx);
+                assert!(
+                    matches!(payload.as_deref(), Some(DragItems::Files(paths)) if paths == &expected)
+                );
+                assert!(checked);
+                assert_eq!(pane.selected.len(), 2);
+                assert_eq!(
+                    ctx.data(|data| data.get_temp::<bool>(Id::new("file-drag-reveal-target"))),
+                    Some(alt)
+                );
+                assert_eq!(drag_reveal_requested(&ctx), alt);
+                let pointer = ctx.input(|input| input.pointer.interact_pos());
+                for late_alt in [true, false] {
+                    ctx.run_ui(
+                        egui::RawInput {
+                            events: vec![egui::Event::ModifiersChanged(Modifiers {
+                                alt: late_alt,
+                                ..Modifiers::NONE
+                            })],
+                            ..Default::default()
+                        },
+                        |_| assert_eq!(drag_reveal_requested(&ctx), alt || late_alt),
+                    )
+                    .textures_delta
+                    .clear();
+                    assert_eq!(ctx.input(|input| input.pointer.interact_pos()), pointer);
+                    let payload = egui::DragAndDrop::payload::<DragItems>(&ctx);
+                    assert!(
+                        matches!(payload.as_deref(), Some(DragItems::Files(paths)) if paths == &expected)
+                    );
+                }
+                let modifiers = Modifiers {
+                    alt: true,
+                    ..Modifiers::NONE
+                };
+                ctx.run_ui(
+                    egui::RawInput {
+                        events: vec![
+                            egui::Event::ModifiersChanged(modifiers),
+                            egui::Event::PointerButton {
+                                pos: pointer.unwrap(),
+                                button: egui::PointerButton::Primary,
+                                pressed: false,
+                                modifiers,
+                            },
+                        ],
+                        ..Default::default()
+                    },
+                    |_| assert_eq!(drag_reveal_requested(&ctx), alt),
+                )
+                .textures_delta
+                .clear();
+            }
+        }
+    }
+
+    #[test]
+    fn drag_bubble_labels_contain_only_the_dragged_contents() {
+        let first = PathBuf::from("folder").join("presentation.txt");
+        let second = PathBuf::from("folder").join("notes.txt");
+        assert_eq!(
+            DragItems::Files(vec![first.clone()]).label(),
+            "presentation.txt"
+        );
+        assert_eq!(DragItems::Files(vec![first, second]).label(), "2 items");
+        assert_eq!(
+            DragItems::Zip {
+                archive: PathBuf::from("bundle.zip"),
+                prefix: "nested/".into(),
+                selected: vec!["nested/slides.pdf".into()],
+            }
+            .label(),
+            "nested/slides.pdf"
+        );
+    }
+
+    #[test]
     fn drag_uses_selected_group_only_when_grabbed_item_is_selected() {
         let mut pane = Pane::new(PathBuf::from("root"));
         let a = PathBuf::from("a");
@@ -8205,6 +8825,25 @@ mod tests {
         assert_eq!(left.parent_returns.len(), 64);
         left.begin_navigation(PathBuf::from(r"C:\unrelated"));
         assert!(left.parent_returns.is_empty());
+    }
+
+    #[test]
+    fn filename_filter_ignores_czech_diacritics_without_changing_names_or_sort_keys() {
+        let mut pane = Pane::new(PathBuf::from("fixture"));
+        pane.entries = vec![
+            entry("ČEZ.txt"),
+            entry("C\u{030c}EZ.pdf"),
+            entry("other.txt"),
+        ];
+        pane.selected.insert(PathBuf::from("other.txt"));
+        for query in ["cez", "CEZ", "čez", "ČEZ", "c\u{030c}ez"] {
+            pane.filter = query.into();
+            pane.rebuild();
+            assert_eq!(pane.visible, vec![0, 1]);
+            assert!(pane.selected.contains(&PathBuf::from("other.txt")));
+            assert_eq!(pane.entries[0].name, "ČEZ.txt");
+            assert_eq!(pane.entries[0].folded, "čez.txt");
+        }
     }
 
     #[test]
@@ -8684,7 +9323,7 @@ mod tests {
                         ("Copy", "Ctrl Shift C"),
                         ("Move", "Ctrl Shift M"),
                         ("Delete", "Ctrl Shift D"),
-                        ("Refresh", "Ctrl R"),
+                        ("Refresh", "Ctrl Shift R"),
                         ("Search", "Ctrl Shift F"),
                         ("Run VS Code", ""),
                         ("Run GitHub Copilot CLI", ""),

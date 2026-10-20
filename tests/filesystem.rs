@@ -1168,6 +1168,25 @@ fn scans_and_planning_honor_cancellation_on_real_fixtures() {
 }
 
 #[test]
+fn recursive_search_ignores_czech_diacritics_and_preserves_original_paths() {
+    use tomas_commander::search;
+    let mut fixture = Fixture::new("diacritic-search");
+    fixture.directory("nested");
+    fixture.file("ČEZ.txt", b"synthetic");
+    fixture.file("nested\\C\u{030c}EZ.pdf", b"synthetic");
+    fixture.file("other.txt", b"synthetic");
+    for query in ["cez", "CEZ", "čez", "c\u{030c}ez"] {
+        let results = search::discover(&fixture.scope(), &fixture.root, query, || false).unwrap();
+        assert_eq!(results.matches.len(), 2);
+        assert!(results.matches.iter().all(|result| {
+            let name = result.entry.path.file_name().unwrap().to_string_lossy();
+            name == "ČEZ.txt" || name == "C\u{030c}EZ.pdf"
+        }));
+    }
+    assert!(search::discover(&fixture.scope(), &fixture.root, "\u{030c}", || false).is_err());
+}
+
+#[test]
 fn recursive_search_uses_real_relative_names_and_rejects_stale_results() {
     use tomas_commander::search;
     let mut fixture = Fixture::new("search");

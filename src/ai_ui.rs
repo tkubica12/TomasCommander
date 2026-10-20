@@ -528,7 +528,7 @@ impl AiPanel {
                         ui.horizontal(|ui| { ui.label("Deadline seconds"); ui.add(egui::DragValue::new(&mut self.config.limits.timeout_seconds).range(1..=60)); });
                         ui.label("Single request, no agent loop. Durable attempts include uncertain outcomes. No automatic budget reset.");
                     });
-                    check = ui.button("Save and check connection (no inference)").clicked();
+                    check = ui.button("Check").on_hover_text("Save settings and check connection; no model request.").clicked();
                     ui.separator();
                     ui.label(RichText::new("Explicit prompt").strong());
                     let id = Id::new("foundry-prompt");
@@ -541,9 +541,11 @@ impl AiPanel {
                         node.set_label("Explicit Foundry prompt");
                         node.add_action(egui::accesskit::Action::SetValue);
                     });
-                    ui.checkbox(&mut self.consent, "This prompt contains no secrets, filenames, private code or workplace data; send only this text.");
+                    ui.label(format!("To: Foundry / {}", self.config.deployment));
+                    ui.label("No secrets, filenames, private code or workplace data.");
+                    ui.checkbox(&mut self.consent, "Send this prompt only; no private data.");
                     send = ui.add_enabled(self.consent && !self.prompt.trim().is_empty(),
-                        egui::Button::new(format!("Send once / {}", self.config.deployment))).clicked();
+                        egui::Button::new("Send")).clicked();
                 });
                 ui.separator();
                 ui.label(RichText::new(&self.status).strong());
@@ -557,9 +559,9 @@ impl AiPanel {
                 }
             });
             ui.horizontal(|ui| {
-                if busy && ui.button("Cancel request").clicked() { self.cancel(); }
-                if !busy && ui.button("Disconnect / clear verified session").clicked() { self.disconnect(); }
-                close = ui.button(if busy { "Close and cancel / Escape" } else { "Close / Escape" }).clicked();
+                if busy && ui.button("Cancel").clicked() { self.cancel(); }
+                if !busy && ui.button("Disconnect").clicked() { self.disconnect(); }
+                close = ui.button("Close").on_hover_text(if busy { "Escape; cancels the request." } else { "Escape" }).clicked();
             });
             ui.label(RichText::new(&self.cache_status).small().weak());
         });

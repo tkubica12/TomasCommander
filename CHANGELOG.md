@@ -2,7 +2,31 @@
 
 ## Unreleased
 
-No unreleased changes.
+## v0.5.0 - 2026-10-20
+
+Compact confirmations, improved file dragging and accent-insensitive search
+for Windows x64.
+
+- New folder creates immediately after name submission, without a second
+  confirmation. Other file confirmations are compact and structured, with
+  one-word actions and technical information under Details. Enter activates the
+  initially focused confirmation; Escape cancels. Repeated Enter never approves.
+- Unsaved-edit choices are Save, Discard and Cancel; Save is the default.
+  Dialog, connection and consent actions use shorter labels without changing
+  network permissions or request limits.
+- File actions consistently use Ctrl+Shift: Ctrl+Shift+R refreshes the folder,
+  Ctrl+Shift+N creates a new folder, and rename moves to Ctrl+Shift+E.
+- Dragging from a selected file's checkbox now carries the entire selected group,
+  like dragging its filename. Alt before or during a drag hands physical files to
+  Windows as Copy and temporarily hides Commander to reveal the target application.
+  Drop, Escape and failures restore the window without stealing target focus.
+  Alt also works after Windows takes over the drag. The drag bubble shows only
+  the filename or item count, without instructions.
+- File-pane filters, recursive filename search and ZIP filters now ignore Czech
+  diacritics as well as letter case (`cez` matches `ČEZ`), including decomposed
+  combining accents. Original names and sorting remain unchanged.
+
+Unsigned, unsupported and provided at your own risk.
 
 ## v0.4.0 - 2026-10-18
 

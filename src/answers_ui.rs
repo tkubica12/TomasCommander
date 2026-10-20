@@ -429,7 +429,7 @@ impl AnswerPanel {
                             changed |= response.changed();
                             if changed { self.consent = false; self.retrieved = None; self.answer = None; self.receipt = None; }
                         }
-                        if ui.button("Save nonsecret settings / no network").clicked() {
+                        if ui.button("Save").on_hover_text("Save nonsecret settings; no network.").clicked() {
                             self.status = match &self.path {
                                 Some(path) => match self.config.save(path) {
                                     Ok(()) => "Settings saved, not connected; no source read/model request.".into(),
@@ -463,9 +463,14 @@ impl AnswerPanel {
                         let response = ui.add(egui::TextEdit::singleline(&mut self.key)
                             .id(Id::new("answer-memory-key")).password(true).desired_width(f32::INFINITY));
                         if response.changed() { self.consent = false; self.retrieved = None; self.answer = None; self.receipt = None; }
-                        if ui.button("Save existing WebIQ key securely / local vault").clicked() { self.save_key(); }
+                        if ui.button("Store").on_hover_text("Save the existing WebIQ key in this user's local credential vault.").clicked() { self.save_key(); }
                         ui.label("Read sources uses only that exact app-owned vault target; the key is never shown or written to JSON/logs.");
-                        ui.checkbox(&mut self.consent, "Confirm this approved public question: WebIQ <=8 POSTs/30 s, <=3 public passages to configured Sol, one <=512-output-token attempt, lifetime AI <=11. No retry/private data.");
+                        ui.checkbox(&mut self.consent, "Send this public question and public passages to Sol.");
+                        ui.collapsing("Limits", |ui| {
+                            ui.label("WebIQ: up to 8 requests / 30 seconds.");
+                            ui.label("Sol: up to 3 passages / 512 output tokens / 1 attempt.");
+                            ui.label("Lifetime: 11 AI attempts. No retries or private data.");
+                        });
                     } else {
                         ui.label(RichText::new("BLOCKED / workplace is not enabled").strong());
                         ui.label("Need owner-bound endpoint, delegated OAuth app/tenant/user, named workload/records and data routing. No mail, calendar, Teams or SharePoint reads/writes are authorized here.");
@@ -526,16 +531,16 @@ impl AnswerPanel {
                 }
             });
             ui.horizontal(|ui| {
-                start = ui.add_enabled(!busy && self.config.source == Source::PublicWeb, egui::Button::new("Answer approved question / Ctrl Enter")).clicked();
-                if ui.button("Check pilot grant / no request").clicked() { self.check_inference(); }
+                start = ui.add_enabled(!busy && self.config.source == Source::PublicWeb, egui::Button::new("Answer")).on_hover_text("Ctrl Enter").clicked();
+                if ui.button("Check").on_hover_text("Check the pilot grant; no model request.").clicked() { self.check_inference(); }
             });
             ui.horizontal(|ui| {
                 if self.retrieved.as_ref().is_some_and(|result| !result.passages.is_empty())
-                    && ui.button("Focus source links").clicked() {
+                    && ui.button("Sources").clicked() {
                     self.focus_sources = true;
                 }
-                if busy && ui.button("Cancel source read").clicked() { self.cancel(); }
-                close = ui.button("Close / Escape").clicked();
+                if busy && ui.button("Cancel").clicked() { self.cancel(); }
+                close = ui.button("Close").on_hover_text("Escape").clicked();
             });
         });
         if !busy

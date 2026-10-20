@@ -4,14 +4,21 @@ use std::{path::Path, process::Command};
 #[cfg(windows)]
 pub mod external_drag {
     use super::*;
-    use std::path::PathBuf;
+    use std::{cell::RefCell, path::PathBuf, rc::Rc};
     use windows::{
         Win32::{
-            Foundation::{POINT, RECT},
+            Foundation::{
+                DRAGDROP_S_CANCEL, DRAGDROP_S_DROP, DRAGDROP_S_USEDEFAULTCURSORS, HWND, POINT,
+                RECT, S_OK,
+            },
             Graphics::Gdi::ScreenToClient,
             System::{
                 Com::{CoTaskMemFree, IDataObject},
-                Ole::{DROPEFFECT_COPY, DROPEFFECT_NONE, OleInitialize, OleUninitialize},
+                Ole::{
+                    DROPEFFECT, DROPEFFECT_COPY, DROPEFFECT_NONE, IDropSource, IDropSource_Impl,
+                    MK_ALT, OleInitialize, OleUninitialize,
+                },
+                SystemServices::{MK_LBUTTON, MK_MBUTTON, MK_RBUTTON, MODIFIERKEYS_FLAGS},
             },
             UI::{
                 Input::KeyboardAndMouse::{GetAsyncKeyState, GetCapture, VK_LBUTTON},
@@ -19,10 +26,13 @@ pub mod external_drag {
                     BHID_DataObject, Common::ITEMIDLIST, SHCreateShellItemArrayFromIDLists,
                     SHDoDragDrop, SHParseDisplayName,
                 },
-                WindowsAndMessaging::{GetClientRect, GetCursorPos},
+                WindowsAndMessaging::{
+                    GA_ROOT, GetAncestor, GetClientRect, GetCursorPos, GetWindowThreadProcessId,
+                    IsWindow, IsWindowVisible, SW_HIDE, SW_SHOWNA, ShowWindow,
+                },
             },
         },
-        core::PCWSTR,
+        core::{BOOL, HRESULT, PCWSTR, implement},
     };
 
     pub fn pointer_outside_source() -> FileResult<bool> {
@@ -118,12 +128,118 @@ pub mod external_drag {
             .map_err(|e| format!("Prepare Windows file drag data: {e}"))
     }
 
-    pub fn copy_files(paths: &[PathBuf]) -> FileResult<bool> {
+    struct HiddenSource(HWND);
+
+    impl HiddenSource {
+        fn hide(window: HWND) -> FileResult<Self> {
+            let mut process = 0;
+            unsafe { GetWindowThreadProcessId(window, Some(&mut process)) };
+            if window.is_invalid()
+                || process != std::process::id()
+                || !unsafe { IsWindowVisible(window) }.as_bool()
+            {
+                return Err(
+                    "Could not identify the Commander window for external dragging.".into(),
+                );
+            }
+            let guard = Self(window);
+            let _ = unsafe { ShowWindow(window, SW_HIDE) };
+            if unsafe { IsWindowVisible(window) }.as_bool() {
+                return Err("Could not hide Commander for external dragging.".into());
+            }
+            Ok(guard)
+        }
+    }
+
+    impl Drop for HiddenSource {
+        fn drop(&mut self) {
+            if unsafe { IsWindow(Some(self.0)) }.as_bool() {
+                // Restore the existing maximized/normal state without stealing target focus.
+                let _ = unsafe { ShowWindow(self.0, SW_SHOWNA) };
+            }
+        }
+    }
+
+    struct DragSourceState {
+        window: HWND,
+        hidden: RefCell<Option<HiddenSource>>,
+        error: RefCell<Option<String>>,
+    }
+
+    impl DragSourceState {
+        fn new(window: HWND) -> Self {
+            Self {
+                window,
+                hidden: RefCell::new(None),
+                error: RefCell::new(None),
+            }
+        }
+
+        fn reveal(&self) -> FileResult<()> {
+            if self.hidden.borrow().is_none() {
+                let hidden = HiddenSource::hide(self.window)?;
+                *self.hidden.borrow_mut() = Some(hidden);
+            }
+            Ok(())
+        }
+
+        fn restore(&self) {
+            let hidden = self.hidden.borrow_mut().take();
+            drop(hidden);
+        }
+    }
+
+    #[implement(IDropSource)]
+    struct FileDragSource {
+        state: Rc<DragSourceState>,
+    }
+
+    #[allow(non_snake_case)]
+    impl IDropSource_Impl for FileDragSource_Impl {
+        fn QueryContinueDrag(&self, escape: BOOL, keys: MODIFIERKEYS_FLAGS) -> HRESULT {
+            if escape.as_bool()
+                || self.state.error.borrow().is_some()
+                || keys.0 & (MK_RBUTTON.0 | MK_MBUTTON.0) != 0
+            {
+                return DRAGDROP_S_CANCEL;
+            }
+            if keys.0 & MK_LBUTTON.0 == 0 {
+                return DRAGDROP_S_DROP;
+            }
+            // OLE owns input after the pointer leaves Commander.
+            if keys.0 & MK_ALT != 0
+                && let Err(error) = self.state.reveal()
+            {
+                *self.state.error.borrow_mut() = Some(error);
+                return DRAGDROP_S_CANCEL;
+            }
+            S_OK
+        }
+
+        fn GiveFeedback(&self, _effect: DROPEFFECT) -> HRESULT {
+            DRAGDROP_S_USEDEFAULTCURSORS
+        }
+    }
+
+    pub fn copy_files(paths: &[PathBuf], reveal_target: bool) -> FileResult<bool> {
         let _apartment = OleApartment::new()?;
         let data = data_object(paths)?;
+        let window = unsafe { GetAncestor(GetCapture(), GA_ROOT) };
+        let state = Rc::new(DragSourceState::new(window));
+        if reveal_target {
+            state.reveal()?;
+        }
+        let source: IDropSource = FileDragSource {
+            state: state.clone(),
+        }
+        .into();
         // OLE owns the mouse loop until drop or Escape; never offer a source move.
-        let effect = unsafe { SHDoDragDrop(None, &data, None, DROPEFFECT_COPY) }
-            .map_err(|e| format!("External file drag failed: {e}"))?;
+        let result = unsafe { SHDoDragDrop(None, &data, &source, DROPEFFECT_COPY) };
+        state.restore();
+        if let Some(error) = state.error.borrow_mut().take() {
+            return Err(error);
+        }
+        let effect = result.map_err(|e| format!("External file drag failed: {e}"))?;
         if effect != DROPEFFECT_COPY && effect != DROPEFFECT_NONE {
             return Err(
                 "External drop returned an unsupported effect; source files were not changed."
@@ -141,8 +257,46 @@ pub mod external_drag {
                 Com::{DVASPECT_CONTENT, FORMATETC, TYMED_HGLOBAL},
                 Ole::ReleaseStgMedium,
             },
-            UI::Shell::{DragQueryFileW, HDROP},
+            UI::{
+                Shell::{DragQueryFileW, HDROP},
+                WindowsAndMessaging::{
+                    CreateWindowExW, DestroyWindow, GetForegroundWindow, GetWindowRect,
+                    WS_EX_NOACTIVATE, WS_POPUP,
+                },
+            },
         };
+
+        struct OwnedWindow(HWND);
+
+        impl OwnedWindow {
+            fn new() -> Self {
+                let window = unsafe {
+                    CreateWindowExW(
+                        WS_EX_NOACTIVATE,
+                        windows::core::w!("STATIC"),
+                        windows::core::w!("Commander owned drag restoration test"),
+                        WS_POPUP,
+                        0,
+                        0,
+                        1,
+                        1,
+                        None,
+                        None,
+                        None,
+                        None,
+                    )
+                }
+                .unwrap();
+                let _ = unsafe { ShowWindow(window, SW_SHOWNA) };
+                Self(window)
+            }
+        }
+
+        impl Drop for OwnedWindow {
+            fn drop(&mut self) {
+                unsafe { DestroyWindow(self.0) }.unwrap();
+            }
+        }
 
         #[test]
         fn native_drag_boundary_uses_client_pixels_including_negative_coordinates() {
@@ -222,6 +376,128 @@ pub mod external_drag {
             let _apartment = OleApartment::new().unwrap();
             assert!(data_object(&[]).is_err());
             assert!(data_object(&[PathBuf::from("relative.txt")]).is_err());
+        }
+
+        #[test]
+        fn external_drag_restores_its_owned_window_on_cancel_and_failure() {
+            let owned = OwnedWindow::new();
+            let window = owned.0;
+            let foreground = unsafe { GetForegroundWindow() };
+            let mut before = RECT::default();
+            unsafe { GetWindowRect(window, &mut before) }.unwrap();
+            for fail in [false, true] {
+                let result = (|| -> FileResult<bool> {
+                    let _hidden = HiddenSource::hide(window)?;
+                    assert!(!unsafe { IsWindowVisible(window) }.as_bool());
+                    if fail {
+                        Err("Synthetic failed drop".into())
+                    } else {
+                        Ok(false)
+                    }
+                })();
+                assert_eq!(result.is_err(), fail);
+                assert!(unsafe { IsWindowVisible(window) }.as_bool());
+                let mut after = RECT::default();
+                unsafe { GetWindowRect(window, &mut after) }.unwrap();
+                assert_eq!(
+                    (before.left, before.top, before.right, before.bottom),
+                    (after.left, after.top, after.right, after.bottom)
+                );
+                assert_eq!(unsafe { GetForegroundWindow() }, foreground);
+            }
+            assert!(HiddenSource::hide(HWND::default()).is_err());
+        }
+
+        #[test]
+        fn native_drag_accepts_late_alt_and_restores_after_drop_or_escape() {
+            let owned = OwnedWindow::new();
+            let window = owned.0;
+            for escape in [false, true] {
+                let state = Rc::new(DragSourceState::new(window));
+                let source: IDropSource = FileDragSource {
+                    state: state.clone(),
+                }
+                .into();
+                assert_eq!(unsafe { source.QueryContinueDrag(false, MK_LBUTTON) }, S_OK);
+                assert!(unsafe { IsWindowVisible(window) }.as_bool());
+                for keys in [
+                    MODIFIERKEYS_FLAGS(MK_LBUTTON.0 | MK_ALT),
+                    MODIFIERKEYS_FLAGS(MK_LBUTTON.0 | MK_ALT),
+                    MK_LBUTTON,
+                ] {
+                    assert_eq!(unsafe { source.QueryContinueDrag(false, keys) }, S_OK);
+                    assert!(!unsafe { IsWindowVisible(window) }.as_bool());
+                }
+                assert_eq!(
+                    unsafe { source.GiveFeedback(DROPEFFECT_COPY) },
+                    DRAGDROP_S_USEDEFAULTCURSORS
+                );
+                assert_eq!(
+                    unsafe { source.QueryContinueDrag(escape, MODIFIERKEYS_FLAGS(MK_ALT)) },
+                    if escape {
+                        DRAGDROP_S_CANCEL
+                    } else {
+                        DRAGDROP_S_DROP
+                    }
+                );
+                state.restore();
+                assert!(unsafe { IsWindowVisible(window) }.as_bool());
+                assert!(state.error.borrow().is_none());
+            }
+        }
+
+        #[test]
+        fn native_drag_does_not_hide_on_cancellation_or_button_release() {
+            let owned = OwnedWindow::new();
+            let state = Rc::new(DragSourceState::new(owned.0));
+            let source: IDropSource = FileDragSource {
+                state: state.clone(),
+            }
+            .into();
+            for (escape, keys, expected) in [
+                (true, MK_LBUTTON.0 | MK_ALT, DRAGDROP_S_CANCEL),
+                (false, MK_ALT, DRAGDROP_S_DROP),
+                (
+                    false,
+                    MK_LBUTTON.0 | MK_RBUTTON.0 | MK_ALT,
+                    DRAGDROP_S_CANCEL,
+                ),
+                (
+                    false,
+                    MK_LBUTTON.0 | MK_MBUTTON.0 | MK_ALT,
+                    DRAGDROP_S_CANCEL,
+                ),
+            ] {
+                assert_eq!(
+                    unsafe { source.QueryContinueDrag(escape, MODIFIERKEYS_FLAGS(keys)) },
+                    expected
+                );
+                assert!(unsafe { IsWindowVisible(owned.0) }.as_bool());
+                assert!(state.hidden.borrow().is_none());
+                assert!(state.error.borrow().is_none());
+            }
+        }
+
+        #[test]
+        fn native_drag_cancels_and_reports_a_late_hide_failure() {
+            let state = Rc::new(DragSourceState::new(HWND::default()));
+            let source: IDropSource = FileDragSource {
+                state: state.clone(),
+            }
+            .into();
+            assert_eq!(
+                unsafe {
+                    source.QueryContinueDrag(false, MODIFIERKEYS_FLAGS(MK_LBUTTON.0 | MK_ALT))
+                },
+                DRAGDROP_S_CANCEL
+            );
+            assert!(state.error.borrow().as_deref().unwrap().contains("window"));
+            assert_eq!(
+                unsafe { source.QueryContinueDrag(false, MK_LBUTTON) },
+                DRAGDROP_S_CANCEL
+            );
+            state.restore();
+            assert!(state.hidden.borrow().is_none());
         }
     }
 }

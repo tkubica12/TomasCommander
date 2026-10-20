@@ -363,7 +363,7 @@ impl FileAgentPanel {
                 if busy {
                     ui.spinner();
                     ui.label(&self.status);
-                    cancel = ui.button("Cancel / Escape").clicked();
+                    cancel = ui.button("Cancel").on_hover_text("Escape").clicked();
                 }
                 if self
                     .outcome
@@ -463,10 +463,8 @@ impl FileAgentPanel {
             }
             ui.horizontal(|ui| {
                 if ui
-                    .add_enabled(
-                        !results.is_empty(),
-                        egui::Button::new("Show in pane / Enter"),
-                    )
+                    .add_enabled(!results.is_empty(), egui::Button::new("Locate"))
+                    .on_hover_text("Enter")
                     .clicked()
                 {
                     selected = Some((self.index, false));
@@ -474,8 +472,9 @@ impl FileAgentPanel {
                 if ui
                     .add_enabled(
                         results.get(self.index).is_some_and(|file| !file.directory),
-                        egui::Button::new("Preview / Ctrl Enter"),
+                        egui::Button::new("Preview"),
                     )
+                    .on_hover_text("Ctrl Enter")
                     .clicked()
                 {
                     selected = Some((self.index, true));
