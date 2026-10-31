@@ -19,8 +19,8 @@ fn drops_prepare_copy_move_and_zip_requests_without_execution() {
         .unwrap()
         .unwrap();
         assert!(
-            matches!(job, Work::Prepare { id: 7, operation, sources: paths, destination: target }
-            if operation == if copy { Operation::Copy } else { Operation::Move } && paths == sources && target == destination)
+            matches!(job, Work::Prepare { id: 7, operation, sources: paths, destination: target, policy }
+            if operation == if copy { Operation::Copy } else { Operation::Move } && paths == sources && target == destination && policy == ConflictPolicy::Skip)
         );
         let job = drop_work(
             8,

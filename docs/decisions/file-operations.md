@@ -39,12 +39,45 @@ Archive only reviewed/reconciled records deliberately.
 
 | Operation | Contract |
 |---|---|
-| Copy | Exclusive new files/folders; no overwrite/merge. Bounded streaming, length checks and flush. Sources remain. Does not preserve full ACLs, alternate streams or timestamps. |
-| Move | Identity-verified handle rename with pinned ancestors and replacement disabled. No cross-volume copy/delete fallback. |
+| Copy | New files/folders are created exclusively. Existing destinations follow the reviewed conflict policy (below); nothing is overwritten in place. Bounded streaming, length checks and flush. Sources remain. Preserves each copied file's modification time; does not preserve creation time, full ACLs or alternate streams. |
+| Move | Identity-verified handle rename with pinned ancestors and replacement disabled. Merged folders move their children individually; emptied source folders are then removed only if empty. No cross-volume copy/delete fallback. |
 | Recycle | Windows IFileOperation recycling with an abort when recycling is not advertised. No application permanent-delete fallback. |
 | Rename / New folder | Same-folder exact plan; validated Windows names; no collisions, case-only rename, merge or replay. New folder is empty. |
 | Source Save | Frozen original/UTF-8 bytes; BOM/LF/CRLF preservation; invalid JSON, readonly/mixed encoding and stale content fail. Protected staging, byte verification and ReplaceFileW replace only the approved original. |
-| ZIP effects | CRC-checked bounded members, exact member/physical plans and staged publication/rewrite. Source removal follows destination verification. No ZIP-to-ZIP or virtual recycling. |
+| ZIP effects | CRC-checked bounded members, exact member/physical plans and staged publication/rewrite. Source removal follows destination verification. No overwrite/merge, ZIP-to-ZIP or virtual recycling; conflict policies do not apply to ZIP flows. |
+
+## Copy/Move conflicts
+
+Planning detects existing destination items recursively and records each
+resolution in the plan. The review dialog chooses one policy for the whole plan;
+changing it prepares a new plan (new id) in the background and keeps
+confirmation disabled until that plan arrives. An approved plan is never edited.
+
+| Existing item | Skip | Replace older | Replace all | Keep both |
+|---|---|---|---|---|
+| Folder for a source folder | Merge | Merge | Merge | Merge |
+| File for a source file | Skip | Replace only if the source is strictly newer, otherwise skip | Replace | Copy/move as `name (2).ext`, `name (3).ext`, ... |
+| File/folder type differs | Skip | Planning fails | Planning fails | New unique name |
+| Link, junction or special item | Planning fails | Planning fails | Planning fails | Planning fails |
+
+Keep both names are unique case-insensitively, on disk and against every other
+planned target. A source can never replace or merge into itself: the same item
+is skipped (Skip), given a new name (Keep both) or refused (Replace). Replacement
+never truncates or overwrites data in place: Copy streams into a uniquely named
+`.tomas-commander-*.stage` file beside the target, flushes and verifies its
+length, rechecks the planned destination fingerprint, sends the old file to the
+Recycle Bin and publishes the staged file with a no-replace rename. Move checks
+the same volume and the destination fingerprint, recycles the old file and then
+performs the verified handle rename. Any failure stops the operation and leaves
+the staging file and the recycled original in place for inspection.
+
+The plan's identity includes the fingerprint of every existing destination it
+merges into, replaces or skips. Changed, removed or newly appearing conflicts
+fail validation with "Destination changed; create a new plan". The journal
+records the policy, each node's resolution (create/merge/replace/skip/rename),
+conflict fingerprints and staging paths; receipts list replaced, merged and
+skipped paths. AI commands and other non-interactive callers keep the legacy
+fail-on-conflict policy; there is no overwrite through AI.
 
 Copy pins ancestors/source identity and denies source writes/deletion during
 execution. Move rechecks the opened identity/type/size/times. These are not
@@ -65,4 +98,6 @@ prevent cleanup rather than being deleted. `--settings` is separately selected.
 External associations/launchers are not sandboxed by a fixture boundary.
 
 Real Recycle Bin recovery is opt-in and must identify the exact owned fixture.
-Never empty the Recycle Bin or touch unrelated items.
+Never empty the Recycle Bin or touch unrelated items. Automated conflict tests
+cover planning, validation and non-replacing execution; the replacement test that
+recycles and restores its own synthetic originals is ignored by default.

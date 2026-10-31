@@ -382,6 +382,8 @@ impl Ledger {
                     operation,
                     sources,
                     destination: self.panes[1 - self.active].path.clone(),
+                    // Conflicts start as Skip; the review offers the other policies.
+                    policy: ConflictPolicy::Skip,
                 };
                 self.next_id += 1;
                 match self.work.try_send(job) {

@@ -127,6 +127,7 @@ pub(super) fn drop_work(
                 },
                 sources,
                 destination,
+                policy: ConflictPolicy::Skip,
             }
         }
         (DragItems::Files(sources), DropLocation::Zip { archive, prefix }) => {

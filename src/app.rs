@@ -13,7 +13,9 @@ use std::{
 use eframe::egui::{self, Color32, Id, Key, Modifiers, RichText, Stroke, Vec2};
 use tomas_commander::{
     commands,
-    files::{self, Entry, FileResult, Listing, Operation, Outcome, Plan, Scope, Sort},
+    files::{
+        self, ConflictPolicy, Entry, FileResult, Listing, Operation, Outcome, Plan, Scope, Sort,
+    },
     platform,
     preferences::Preferences,
     recent::{self, Activity as RecentActivity},
@@ -96,6 +98,7 @@ pub struct Ledger {
     cancellation: Arc<AtomicBool>,
     operation_busy: bool,
     plan: Option<Plan>,
+    review: Option<PlanReview>,
     next_id: u64,
     last_outcome: Option<Outcome>,
     rail: Rail,

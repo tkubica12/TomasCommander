@@ -224,6 +224,9 @@ impl Ledger {
                 ui.label("Exact results, errors and partial paths. No automatic undo.");
                 if let Some(outcome) = &self.last_outcome {
                     ui.label(format!("Operation #{}", outcome.id));
+                    if let Some(summary) = outcome.summary() {
+                        ui.label(summary);
+                    }
                     if let Some(error) = &outcome.error {
                         ui.colored_label(ui.visuals().error_fg_color, error);
                     }
@@ -239,6 +242,9 @@ impl Ledger {
                             for (label, paths) in [
                                 ("CREATED", &outcome.created),
                                 ("COMPLETED", &outcome.completed),
+                                ("REPLACED (original in Recycle Bin)", &outcome.replaced),
+                                ("MERGED", &outcome.merged),
+                                ("SKIPPED", &outcome.skipped),
                                 ("NOT COMPLETED", &outcome.incomplete),
                             ] {
                                 for path in paths {
@@ -604,50 +610,80 @@ impl Ledger {
     }
 
     fn plan_approval_dialog(&mut self, ctx: &egui::Context) {
-        if let Some(plan) = &self.plan {
-            let mut approve = false;
-            let mut cancel = false;
-            let modal = egui::Modal::new(Id::new(("approval", plan.id()))).show(ctx, |ui| {
-                ui.set_width(520.0);
-                let count = plan.sources().len();
-                ui.heading(format!(
-                    "{} {count} {}",
-                    plan.operation().name(),
-                    if count == 1 { "item" } else { "items" }
-                ));
-                if let Some(destination) = plan.destination() {
-                    confirmation_path(ui, "To", destination);
-                } else {
-                    ui.label("To: Recycle Bin");
+        let Some(plan) = &self.plan else {
+            return;
+        };
+        let review = self.review.get_or_insert_with(|| PlanReview::new(plan));
+        let mut action = None;
+        // The first plan's id keeps the dialog and its focus stable while re-planning.
+        let modal = egui::Modal::new(Id::new(("approval", review.modal))).show(ctx, |ui| {
+            action = plan_review(ui, plan, review, &mut self.approval_focus);
+        });
+        if modal.should_close() {
+            action = Some(ReviewAction::Cancel);
+        }
+        match action {
+            Some(ReviewAction::Cancel) => {
+                if self
+                    .review
+                    .as_ref()
+                    .is_some_and(|review| review.pending.is_some())
+                {
+                    self.cancellation.store(true, Ordering::Relaxed);
                 }
-                confirmation_sources(ui, plan.sources());
-                ui.label(match plan.operation() {
-                    Operation::Copy => "Sources are kept. No overwrite.",
-                    Operation::Move => "Sources are moved. No overwrite.",
-                    Operation::Recycle => {
-                        "Recoverable from the Recycle Bin. No permanent deletion."
-                    }
-                });
-                ui.separator();
-                (approve, cancel) =
-                    confirmation_buttons(ui, plan.operation().name(), &mut self.approval_focus);
-            });
-            cancel |= modal.should_close();
-            if cancel {
                 self.plan = None;
+                self.review = None;
                 self.log("Plan cancelled. No filesystem changes.");
                 self.file_focus_requested = true;
             }
-            if approve && let Some(plan) = self.plan.take() {
-                self.cancellation.store(false, Ordering::Relaxed);
-                match self.work.try_send(Work::Execute(plan)) {
-                    Ok(()) => {
-                        self.operation_busy = true;
-                        self.log("Executing approved plan...");
+            Some(ReviewAction::Approve) => {
+                if let Some(plan) = self.plan.take() {
+                    self.review = None;
+                    self.cancellation.store(false, Ordering::Relaxed);
+                    match self.work.try_send(Work::Execute(plan)) {
+                        Ok(()) => {
+                            self.operation_busy = true;
+                            self.log("Executing approved plan...");
+                        }
+                        Err(error) => self.fail(format!("Operation was not queued: {error}")),
                     }
-                    Err(error) => self.fail(format!("Operation was not queued: {error}")),
                 }
             }
+            Some(ReviewAction::Policy(policy)) => {
+                if let (Some(plan), Some(review)) = (&self.plan, &mut self.review)
+                    && let Some(policy) = review.select(policy, plan)
+                {
+                    self.queue_replan(policy);
+                }
+            }
+            None => (),
+        }
+    }
+
+    pub(super) fn queue_replan(&mut self, policy: ConflictPolicy) {
+        let Some(job) = self
+            .plan
+            .as_ref()
+            .and_then(|plan| replan_work(plan, policy, self.next_id))
+        else {
+            return;
+        };
+        self.cancellation.store(false, Ordering::Relaxed);
+        let result = self.work.try_send(job);
+        let Some(review) = &mut self.review else {
+            return;
+        };
+        match result {
+            Ok(()) => {
+                review.pending = Some((self.next_id, policy));
+                self.next_id += 1;
+                self.operation_busy = true;
+                self.log(format!(
+                    "Updating plan for '{}' / no effects before approval.",
+                    policy.label()
+                ));
+            }
+            Err(error) => review.error = Some(format!("Plan update was not queued: {error}")),
         }
     }
 
@@ -675,6 +711,16 @@ pub(crate) fn confirmation_buttons(
     label: &str,
     focus: &mut bool,
 ) -> (bool, bool) {
+    confirmation_buttons_enabled(ui, label, focus, true)
+}
+
+/// Like `confirmation_buttons`; a disabled confirm still consumes Enter without approving.
+pub(crate) fn confirmation_buttons_enabled(
+    ui: &mut egui::Ui,
+    label: &str,
+    focus: &mut bool,
+    enabled: bool,
+) -> (bool, bool) {
     let (mut enter, mut escape) = (false, false);
     let mut key_event = false;
     ui.input_mut(|input| {
@@ -701,8 +747,10 @@ pub(crate) fn confirmation_buttons(
     });
     ui.horizontal(|ui| {
         let cancel = ui.button("Cancel").on_hover_text("Escape");
-        let confirm = ui.button(label).on_hover_text("Enter");
-        if *focus {
+        let confirm = ui
+            .add_enabled(enabled, egui::Button::new(label))
+            .on_hover_text("Enter");
+        if *focus && enabled {
             confirm.request_focus();
             *focus = false;
         }
@@ -710,11 +758,289 @@ pub(crate) fn confirmation_buttons(
         let cancel_chosen =
             (cancel.clicked() && !key_event) || escape || (enter && cancel.has_focus());
         (
-            !cancel_chosen && ((confirm.clicked() && !key_event) || (enter && !cancel.has_focus())),
+            enabled
+                && !cancel_chosen
+                && ((confirm.clicked() && !key_event) || (enter && !cancel.has_focus())),
             cancel_chosen,
         )
     })
     .inner
+}
+
+/// Conflict-policy state of the plan review; an approved plan is never mutated.
+pub(super) struct PlanReview {
+    pub(super) modal: u64,
+    pub(super) policy: ConflictPolicy,
+    pub(super) pending: Option<(u64, ConflictPolicy)>,
+    pub(super) error: Option<String>,
+    pub(super) option_ids: [Id; 4],
+}
+
+impl PlanReview {
+    pub(super) fn new(plan: &Plan) -> Self {
+        Self {
+            modal: plan.id(),
+            policy: plan.policy(),
+            pending: None,
+            error: None,
+            option_ids: [Id::NULL; 4],
+        }
+    }
+
+    pub(super) fn ready(&self, plan: &Plan) -> bool {
+        self.pending.is_none() && self.error.is_none() && plan.policy() == self.policy
+    }
+
+    /// Records a choice; returns a policy to plan now when no plan is in flight.
+    pub(super) fn select(&mut self, policy: ConflictPolicy, plan: &Plan) -> Option<ConflictPolicy> {
+        if policy == self.policy {
+            return None;
+        }
+        self.policy = policy;
+        self.error = None;
+        (self.pending.is_none() && plan.policy() != policy).then_some(policy)
+    }
+
+    /// Applies a re-plan result; returns a newer choice that still needs planning.
+    pub(super) fn arrived(
+        &mut self,
+        id: u64,
+        result: FileResult<Plan>,
+        plan: &mut Plan,
+    ) -> Option<ConflictPolicy> {
+        let (_, requested) = self.pending.filter(|(pending, _)| *pending == id)?;
+        self.pending = None;
+        if requested != self.policy {
+            return (plan.policy() != self.policy).then_some(self.policy);
+        }
+        match result {
+            Ok(fresh) => *plan = fresh,
+            Err(error) => self.error = Some(error),
+        }
+        None
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum ReviewAction {
+    Approve,
+    Cancel,
+    Policy(ConflictPolicy),
+}
+
+pub(super) fn replan_work(plan: &Plan, policy: ConflictPolicy, id: u64) -> Option<Work> {
+    Some(Work::Replan {
+        id,
+        operation: plan.operation(),
+        sources: plan.sources().to_vec(),
+        destination: plan.destination()?.to_owned(),
+        policy,
+    })
+}
+
+pub(super) fn plan_review(
+    ui: &mut egui::Ui,
+    plan: &Plan,
+    review: &mut PlanReview,
+    focus: &mut bool,
+) -> Option<ReviewAction> {
+    ui.set_width(520.0);
+    let count = plan.sources().len();
+    ui.heading(format!(
+        "{} {count} {}",
+        plan.operation().name(),
+        if count == 1 { "item" } else { "items" }
+    ));
+    if let Some(destination) = plan.destination() {
+        confirmation_path(ui, "To", destination);
+    } else {
+        ui.label("To: Recycle Bin");
+    }
+    confirmation_sources(ui, plan.sources());
+    let conflicts = plan.conflicts();
+    let mut chosen = None;
+    if conflicts.any() {
+        ui.label(match plan.operation() {
+            Operation::Move => "Sources are moved; emptied merged folders are removed.",
+            _ => "Sources are kept.",
+        });
+        chosen = conflict_section(ui, plan, &conflicts, review);
+    } else {
+        ui.label(match plan.operation() {
+            Operation::Copy => "Sources are kept. No overwrite.",
+            Operation::Move => "Sources are moved. No overwrite.",
+            Operation::Recycle => "Recoverable from the Recycle Bin. No permanent deletion.",
+        });
+    }
+    ui.separator();
+    let label = if conflicts.replace > 0 {
+        format!(
+            "{} + replace {}",
+            plan.operation().name(),
+            conflicts.replace
+        )
+    } else {
+        plan.operation().name().to_owned()
+    };
+    let (approve, cancel) = confirmation_buttons_enabled(ui, &label, focus, review.ready(plan));
+    // A choice made in the same frame as Enter must never approve the previous plan.
+    if cancel {
+        Some(ReviewAction::Cancel)
+    } else if let Some(policy) = chosen {
+        Some(ReviewAction::Policy(policy))
+    } else if approve {
+        Some(ReviewAction::Approve)
+    } else {
+        None
+    }
+}
+
+fn conflict_section(
+    ui: &mut egui::Ui,
+    plan: &Plan,
+    conflicts: &files::ConflictSummary,
+    review: &mut PlanReview,
+) -> Option<ConflictPolicy> {
+    let plural = |count: usize, one: &str, many: &str| {
+        format!("{count} {}", if count == 1 { one } else { many })
+    };
+    ui.add_space(4.0);
+    ui.label(RichText::new("Some items already exist in the destination").strong());
+    let mut counts = vec![plural(conflicts.new_items, "new item", "new items")];
+    if conflicts.merged > 0 {
+        counts.push(plural(conflicts.merged, "folder merged", "folders merged"));
+    }
+    ui.label(counts.join(" / "));
+    let files = conflicts.newer + conflicts.older_or_same;
+    if files > 0 {
+        ui.label(format!(
+            "{}: {} source newer / {} source older or same",
+            plural(files, "file conflict", "file conflicts"),
+            conflicts.newer,
+            conflicts.older_or_same
+        ));
+    }
+    if conflicts.mismatched > 0 {
+        ui.label(plural(
+            conflicts.mismatched,
+            "file/folder type conflict",
+            "file/folder type conflicts",
+        ));
+    }
+    if !conflicts.examples.is_empty() {
+        let mut names = conflicts
+            .examples
+            .iter()
+            .take(5)
+            .map(|path| files::display_path(path))
+            .collect::<Vec<_>>()
+            .join(", ");
+        if conflicts.examples.len() > 5 {
+            names.push_str(&format!(" (+{} more)", conflicts.examples.len() - 5));
+        }
+        ui.add(egui::Label::new(RichText::new(names).monospace().size(12.0)).wrap());
+    }
+    ui.collapsing("Details", |ui| {
+        egui::ScrollArea::vertical()
+            .id_salt("conflict-rows")
+            .max_height(ROW_HEIGHT * 5.0)
+            .show(ui, |ui| {
+                for row in plan.conflict_rows() {
+                    ui.add(egui::Label::new(row).wrap_mode(egui::TextWrapMode::Extend));
+                }
+            });
+    });
+    ui.label("If an item already exists:");
+    // Enter/Escape belong to the confirmation buttons, never to a focused choice.
+    let keys = ui.input(|input| {
+        input.events.iter().any(|event| {
+            matches!(
+                event,
+                egui::Event::Key {
+                    key: Key::Enter | Key::Escape,
+                    pressed: true,
+                    ..
+                }
+            )
+        })
+    });
+    let responses: Vec<egui::Response> = ui
+        .scope_builder(
+            egui::UiBuilder::new().id(Id::new("conflict-policy")),
+            |ui| {
+                ui.horizontal(|ui| {
+                    ConflictPolicy::CHOICES
+                        .iter()
+                        .map(|policy| {
+                            let response = ui.add(egui::Button::selectable(
+                                review.policy == *policy,
+                                policy.label(),
+                            ));
+                            ui.ctx().accesskit_node_builder(response.id, |node| {
+                                node.set_role(egui::accesskit::Role::RadioButton);
+                                node.set_label(format!(
+                                    "If an item already exists: {}",
+                                    policy.label()
+                                ));
+                            });
+                            response
+                        })
+                        .collect()
+                })
+                .inner
+            },
+        )
+        .inner;
+    let mut chosen = None;
+    for (index, response) in responses.iter().enumerate() {
+        review.option_ids[index] = response.id;
+        if response.clicked() && !keys {
+            chosen = Some(ConflictPolicy::CHOICES[index]);
+        }
+    }
+    if let Some(index) = responses.iter().position(egui::Response::has_focus) {
+        let step = ui.input_mut(|input| {
+            if input.consume_key(Modifiers::NONE, Key::ArrowLeft) {
+                Some(-1)
+            } else if input.consume_key(Modifiers::NONE, Key::ArrowRight) {
+                Some(1)
+            } else {
+                None
+            }
+        });
+        if let Some(step) = step {
+            // Arrows change the choice here instead of moving focus spatially.
+            ui.memory_mut(|memory| memory.move_focus(egui::FocusDirection::None));
+            let next = index.saturating_add_signed(step).min(responses.len() - 1);
+            responses[next].request_focus();
+            chosen = Some(ConflictPolicy::CHOICES[next]);
+        }
+    }
+    if review.pending.is_some() {
+        ui.label("Updating the plan for this choice...");
+    } else if let Some(error) = &review.error {
+        ui.colored_label(ui.visuals().error_fg_color, error);
+    } else {
+        let mut effects = Vec::new();
+        if conflicts.replace > 0 {
+            effects.push(format!(
+                "{} replaced; originals go to the Recycle Bin",
+                conflicts.replace
+            ));
+        }
+        if conflicts.skip > 0 {
+            effects.push(format!("{} skipped", conflicts.skip));
+        }
+        if conflicts.rename > 0 {
+            effects.push(format!("{} kept with a new name", conflicts.rename));
+        }
+        ui.label(if effects.is_empty() {
+            "Folders are merged; no existing file changes.".to_owned()
+        } else {
+            effects.join(" / ")
+        });
+    }
+    chosen.filter(|policy| *policy != review.policy)
 }
 
 pub(super) fn confirmation_path(ui: &mut egui::Ui, label: &str, path: &std::path::Path) {

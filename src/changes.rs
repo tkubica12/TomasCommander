@@ -268,6 +268,7 @@ impl Plan {
             incomplete: vec![self.original.path.clone()],
             error: None,
             cancelled: false,
+            ..Default::default()
         };
         if !approved || cancelled.load(Ordering::Acquire) {
             outcome.cancelled = cancelled.load(Ordering::Acquire);

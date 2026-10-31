@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+- Copy/Move conflict handling: the review shows new items, merged folders and
+  file conflicts (source newer / older or same) with examples, and offers Skip
+  (default), Replace older, Replace all or Keep both. Changing the choice
+  prepares a new exact plan; confirmation waits for it. Plans without conflicts
+  are unchanged.
+- Same-name folders are merged; Move moves merged contents individually and
+  removes only emptied source folders. Keep both picks the first free
+  `name (2).ext` case-insensitively.
+- Replacement never overwrites in place: originals go to the Recycle Bin after
+  a staged, verified copy or a verified same-volume move. Validation fails if
+  any conflict changed after review; receipts record the policy, resolutions and
+  replaced/merged/skipped paths.
+- Copy now preserves each file's modification time. AI commands and ZIP flows
+  keep refusing existing destinations.
+
 ## v0.6.0 - 2026-10-31
 
 ZIP workflows and developer-file previews for Windows x64.

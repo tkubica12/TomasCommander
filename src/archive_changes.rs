@@ -590,6 +590,7 @@ impl Plan {
                 .collect(),
             cancelled: false,
             error: None,
+            ..Default::default()
         };
         if !approved || cancel.load(Ordering::Acquire) {
             outcome.error = Some("Explicit exact ZIP plan approval is required.".into());

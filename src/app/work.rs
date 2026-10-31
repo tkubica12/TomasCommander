@@ -150,6 +150,14 @@ pub(super) enum Work {
         operation: Operation,
         sources: Vec<PathBuf>,
         destination: PathBuf,
+        policy: ConflictPolicy,
+    },
+    Replan {
+        id: u64,
+        operation: Operation,
+        sources: Vec<PathBuf>,
+        destination: PathBuf,
+        policy: ConflictPolicy,
     },
     Execute(Plan),
     #[cfg(feature = "native-desktop-tests")]
@@ -195,6 +203,10 @@ pub(super) enum WorkResult {
     CommandResolved(FileResult<commands::Resolution>),
     Recovery(String),
     Prepared(FileResult<Plan>),
+    Replanned {
+        id: u64,
+        result: FileResult<Plan>,
+    },
     Executed(Outcome),
     Saved(FileResult<()>),
     Code(FileResult<()>),
@@ -245,18 +257,30 @@ impl Ledger {
         ) {
             self.fail(error);
         }
-        self.log(format!(
-            "Operation #{}: {} completed nodes, {} created paths, {} not completed{}",
-            outcome.id,
-            outcome.completed.len(),
-            outcome.created.len(),
-            outcome.incomplete.len(),
-            if outcome.cancelled {
-                " / cancelled"
-            } else {
-                ""
-            }
-        ));
+        self.log(match outcome.summary() {
+            Some(summary) => format!(
+                "Operation #{}: {summary}, {} not completed{}",
+                outcome.id,
+                outcome.incomplete.len(),
+                if outcome.cancelled {
+                    " / cancelled"
+                } else {
+                    ""
+                }
+            ),
+            None => format!(
+                "Operation #{}: {} completed nodes, {} created paths, {} not completed{}",
+                outcome.id,
+                outcome.completed.len(),
+                outcome.created.len(),
+                outcome.incomplete.len(),
+                if outcome.cancelled {
+                    " / cancelled"
+                } else {
+                    ""
+                }
+            ),
+        });
         if let Some(error) = &outcome.error {
             self.fail(error.clone());
         }
@@ -463,10 +487,25 @@ impl Ledger {
                     }
                     match result {
                         Ok(plan) => {
+                            self.review = Some(PlanReview::new(&plan));
                             self.plan = Some(plan);
                             self.approval_focus = true;
                         }
                         Err(error) => self.fail(error),
+                    }
+                }
+                WorkResult::Replanned { id, result } => {
+                    self.operation_busy = false;
+                    if self.cancellation.load(Ordering::Relaxed) {
+                        self.log("Planning cancelled. No changes made.");
+                        continue;
+                    }
+                    let next = match (&mut self.plan, &mut self.review) {
+                        (Some(plan), Some(review)) => review.arrived(id, result, plan),
+                        _ => None,
+                    };
+                    if let Some(policy) = next {
+                        self.queue_replan(policy);
                     }
                 }
                 WorkResult::NamePrepared(result) => {

@@ -100,6 +100,7 @@ impl Ledger {
             cancellation,
             operation_busy: false,
             plan: None,
+            review: None,
             next_id: 1,
             last_outcome: None,
             rail: Rail::Recent,
@@ -487,16 +488,38 @@ fn spawn_file_worker(
                     operation,
                     sources,
                     destination,
+                    policy,
                 } => WorkResult::Prepared(journal.initialize().and_then(|()| {
-                    files::plan_cancellable(
+                    files::plan_with_policy(
                         &worker_scope,
                         id,
                         operation,
                         &sources,
                         Some(&destination),
+                        policy,
                         &cancel,
                     )
                 })),
+                Work::Replan {
+                    id,
+                    operation,
+                    sources,
+                    destination,
+                    policy,
+                } => WorkResult::Replanned {
+                    id,
+                    result: journal.initialize().and_then(|()| {
+                        files::plan_with_policy(
+                            &worker_scope,
+                            id,
+                            operation,
+                            &sources,
+                            Some(&destination),
+                            policy,
+                            &cancel,
+                        )
+                    }),
+                },
                 Work::Execute(plan) => {
                     WorkResult::Executed(journal.execute(&worker_scope, &plan, true, &cancel))
                 }

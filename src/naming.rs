@@ -160,6 +160,7 @@ impl Plan {
             incomplete: vec![self.source.clone().unwrap_or_else(|| self.target.clone())],
             error: None,
             cancelled: false,
+            ..Default::default()
         };
         if !approved || cancel.load(Ordering::Acquire) {
             outcome.error = Some(

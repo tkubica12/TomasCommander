@@ -23,6 +23,23 @@ confirmation. Other file changes show a compact review: Enter confirms, Escape
 cancels. The confirming button has initial focus; Tab can select Cancel instead.
 Technical details remain available under Details. A held Enter does not confirm
 a subsequent dialog.
+Copy and Move (buttons, Ctrl+Shift+C/M, `/copy`, `/move` or dragging between
+panes) check the destination for items that already exist. Without conflicts
+the review is unchanged. Otherwise it adds a compact conflict section: new items,
+folders merged, file conflicts split into source newer / source older or same,
+and up to five example names; Details lists every conflict. Choose **Skip**
+(default), **Replace older**, **Replace all** or **Keep both** with the mouse,
+or Tab to the choice and use Left/Right. Each change prepares a new plan;
+confirmation stays disabled until it is ready, and the confirm button shows
+replacements, for example **Copy + replace 3**. Folders with the same name are
+merged. Replaced files go to the Recycle Bin; nothing is overwritten in place.
+Replace older replaces only when the source is strictly newer. Keep both adds
+` (2)`, ` (3)`, ... before the extension. A file never replaces a folder or vice
+versa; links/junctions in the destination stop planning. Moving into a merged
+folder moves its contents and removes emptied source folders; folders that
+still hold skipped items stay. Copies keep the source's modification time.
+Operations lists replaced (original in Recycle Bin), merged and skipped paths.
+AI commands still refuse any existing destination.
 Prompt editors keep their existing submit/newline shortcuts; they are not
 confirmation dialogs.
 Ctrl+Shift+N creates a new folder, Ctrl+Shift+E renames the focused item,
@@ -176,7 +193,8 @@ The existing Extract all button always ignores the ZIP subfolder and filter.
 Copy/move can also extract selected members or insert files from the other pane.
 Changes review physical/member paths and use staged
 publication; move removes sources only after destination verification.
-No overwrite/merge, ZIP-to-ZIP transfer or virtual Recycle Bin operation.
+No overwrite/merge, ZIP-to-ZIP transfer or virtual Recycle Bin operation; the
+Copy/Move conflict choices do not apply inside ZIP.
 Only Store/Deflate; ZIP64, encrypted, split and unsafe/ambiguous archives fail.
 Temporary opening/dragging is Copy-only and never changes the source archive;
 edits saved by another app affect only its temporary copy. Successful handoffs

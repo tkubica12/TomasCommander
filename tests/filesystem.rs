@@ -8,7 +8,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 use tomas_commander::{
-    files::{self, Operation, Scope, Sort},
+    files::{self, ConflictPolicy, Operation, Scope, Sort},
     preferences::Preferences,
 };
 
@@ -2110,4 +2110,813 @@ fn handle_move_refuses_changed_content_even_when_source_identity_is_unchanged() 
     .unwrap_err();
     assert!(error.contains("source changed"));
     assert_eq!(hash_inventory(&fixture.root), before);
+}
+
+fn set_modified(path: &std::path::Path, seconds: u64) {
+    fs::File::options()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_modified(UNIX_EPOCH + std::time::Duration::from_secs(seconds))
+        .unwrap();
+}
+
+fn modified(path: &std::path::Path) -> SystemTime {
+    fs::metadata(path).unwrap().modified().unwrap()
+}
+
+fn plan_policy(
+    scope: &Scope,
+    id: u64,
+    operation: Operation,
+    sources: &[PathBuf],
+    destination: &std::path::Path,
+    policy: ConflictPolicy,
+) -> Result<files::Plan, String> {
+    files::plan_with_policy(
+        scope,
+        id,
+        operation,
+        sources,
+        Some(destination),
+        policy,
+        &AtomicBool::new(false),
+    )
+}
+
+#[test]
+fn file_conflict_policies_plan_exact_resolutions_without_overwriting() {
+    let mut fixture = Fixture::new("conflict-files");
+    fixture.directory("Source");
+    let fresh = fixture.file("Source\\fresh.txt", b"source fresh");
+    let newer = fixture.file("Source\\newer.txt", b"source newer");
+    let older = fixture.file("Source\\older.txt", b"source older");
+    let same = fixture.file("Source\\same.txt", b"source same");
+    let destination = fixture.directory("Destination");
+    for (name, seconds) in [
+        ("newer.txt", 1_000_000_000),
+        ("older.txt", 1_200_000_000),
+        ("same.txt", 1_100_000_000),
+    ] {
+        let existing = fixture.file(&format!("Destination\\{name}"), b"existing destination");
+        set_modified(&existing, seconds);
+    }
+    for source in [&newer, &older, &same] {
+        set_modified(source, 1_100_000_000);
+    }
+    set_modified(&fresh, 1_050_000_000);
+    let sources = vec![fresh.clone(), newer.clone(), older.clone(), same.clone()];
+    let scope = fixture.scope();
+    let canonical = destination.canonicalize().unwrap();
+    for error in [
+        files::plan(&scope, 1, Operation::Copy, &sources, Some(&destination)).unwrap_err(),
+        plan_policy(
+            &scope,
+            1,
+            Operation::Copy,
+            &sources,
+            &destination,
+            ConflictPolicy::Fail,
+        )
+        .unwrap_err(),
+    ] {
+        assert!(error.contains("Conflict; no overwrite allowed"), "{error}");
+    }
+    let before = hash_inventory(&destination);
+    let skip = plan_policy(
+        &scope,
+        2,
+        Operation::Copy,
+        &sources,
+        &destination,
+        ConflictPolicy::Skip,
+    )
+    .unwrap();
+    let summary = skip.conflicts();
+    assert_eq!(skip.policy(), ConflictPolicy::Skip);
+    assert_eq!(
+        (
+            summary.conflicts,
+            summary.new_items,
+            summary.newer,
+            summary.older_or_same,
+            summary.skip,
+            summary.replace,
+            summary.rename
+        ),
+        (3, 1, 1, 2, 3, 0, 0)
+    );
+    assert_eq!(
+        summary.examples,
+        ["newer.txt", "older.txt", "same.txt"].map(PathBuf::from)
+    );
+    for (policy, expected) in [
+        (
+            ConflictPolicy::ReplaceOlder,
+            [
+                "Replace: newer.txt (source newer)",
+                "Skip: older.txt (source older or same)",
+                "Skip: same.txt (source older or same)",
+            ],
+        ),
+        (
+            ConflictPolicy::ReplaceAll,
+            [
+                "Replace: newer.txt (source newer)",
+                "Replace: older.txt (source older or same)",
+                "Replace: same.txt (source older or same)",
+            ],
+        ),
+        (
+            ConflictPolicy::KeepBoth,
+            [
+                "Keep both: newer.txt (source newer) -> newer (2).txt",
+                "Keep both: older.txt (source older or same) -> older (2).txt",
+                "Keep both: same.txt (source older or same) -> same (2).txt",
+            ],
+        ),
+    ] {
+        let plan = plan_policy(&scope, 3, Operation::Copy, &sources, &destination, policy).unwrap();
+        assert_eq!(plan.conflict_rows(), expected, "{policy:?}");
+        let summary = plan.conflicts();
+        assert_eq!(
+            (summary.newer, summary.older_or_same),
+            (1, 2),
+            "Conflict facts do not depend on the policy."
+        );
+    }
+    assert_eq!(
+        hash_inventory(&destination),
+        before,
+        "Planning has no effects."
+    );
+
+    let outcome = files::execute(&scope, &skip, true, &AtomicBool::new(false));
+    fixture.own(&outcome.created);
+    assert!(outcome.error.is_none(), "{outcome:?}");
+    assert_eq!(outcome.created, vec![canonical.join("fresh.txt")]);
+    assert_eq!(outcome.skipped.len(), 3);
+    assert!(outcome.replaced.is_empty() && outcome.incomplete.is_empty());
+    assert_eq!(outcome.summary().as_deref(), Some("1 copied, 3 skipped"));
+    for name in ["newer.txt", "older.txt", "same.txt"] {
+        assert_eq!(
+            fs::read(destination.join(name)).unwrap(),
+            b"existing destination"
+        );
+    }
+    assert_eq!(
+        fs::read(destination.join("fresh.txt")).unwrap(),
+        b"source fresh"
+    );
+    assert_eq!(
+        modified(&destination.join("fresh.txt")),
+        modified(&fresh),
+        "Copy preserves the source modification time."
+    );
+
+    let keep = plan_policy(
+        &scope,
+        4,
+        Operation::Copy,
+        &sources,
+        &destination,
+        ConflictPolicy::KeepBoth,
+    )
+    .unwrap();
+    assert_eq!(keep.conflicts().rename, 4);
+    let outcome = files::execute(&scope, &keep, true, &AtomicBool::new(false));
+    fixture.own(&outcome.created);
+    assert!(outcome.error.is_none(), "{outcome:?}");
+    assert_eq!(outcome.created.len(), 4);
+    for (source, copy) in [
+        (&fresh, "fresh (2).txt"),
+        (&newer, "newer (2).txt"),
+        (&older, "older (2).txt"),
+        (&same, "same (2).txt"),
+    ] {
+        assert_eq!(
+            fs::read(destination.join(copy)).unwrap(),
+            fs::read(source).unwrap()
+        );
+        assert_eq!(modified(&destination.join(copy)), modified(source));
+    }
+    for name in ["newer.txt", "older.txt", "same.txt"] {
+        assert_eq!(
+            fs::read(destination.join(name)).unwrap(),
+            b"existing destination"
+        );
+    }
+    assert_eq!(
+        fs::read(destination.join("fresh.txt")).unwrap(),
+        b"source fresh"
+    );
+}
+
+#[test]
+fn keep_both_names_are_unique_case_insensitively_and_across_planned_items() {
+    let mut fixture = Fixture::new("conflict-names");
+    fixture.directory("Source");
+    let report = fixture.file("Source\\report.txt", b"new report");
+    let third = fixture.file("Source\\REPORT (3).TXT", b"selected third");
+    let archive = fixture.file("Source\\archive.tar.gz", b"new archive");
+    let folder = fixture.directory("Source\\Notes");
+    fixture.file("Source\\Notes\\inside.txt", b"inside");
+    let destination = fixture.directory("Destination");
+    for (name, data) in [
+        ("Report.TXT", b"existing report".as_slice()),
+        ("report (2).txt", b"existing second".as_slice()),
+        ("archive.tar.gz", b"existing archive".as_slice()),
+        ("notes", b"existing file named like the folder".as_slice()),
+    ] {
+        let path = fixture.file(&format!("Destination\\{name}"), data);
+        set_modified(&path, 1_000_000_000);
+    }
+    for path in [&report, &third, &archive] {
+        set_modified(path, 1_100_000_000);
+    }
+    let scope = fixture.scope();
+    let before = hash_inventory(&destination);
+    let sources = vec![report, third, archive, folder];
+    let plan = plan_policy(
+        &scope,
+        1,
+        Operation::Copy,
+        &sources,
+        &destination,
+        ConflictPolicy::KeepBoth,
+    )
+    .unwrap();
+    assert_eq!(
+        plan.conflict_rows(),
+        [
+            "Keep both: notes (file/folder type differs) -> Notes (2)",
+            "Keep both: archive.tar.gz (source newer) -> archive.tar (2).gz",
+            "Keep both: Report.TXT (source newer) -> report (4).txt",
+        ]
+    );
+    let outcome = files::execute(&scope, &plan, true, &AtomicBool::new(false));
+    fixture.own(&outcome.created);
+    assert!(outcome.error.is_none(), "{outcome:?}");
+    for (name, data) in [
+        ("report (4).txt", b"new report".as_slice()),
+        ("REPORT (3).TXT", b"selected third".as_slice()),
+        ("archive.tar (2).gz", b"new archive".as_slice()),
+        ("Notes (2)\\inside.txt", b"inside".as_slice()),
+    ] {
+        assert_eq!(fs::read(destination.join(name)).unwrap(), data, "{name}");
+    }
+    let after = hash_inventory(&destination);
+    for (name, state) in before {
+        assert_eq!(after[&name], state, "Existing {name} must be unchanged.");
+    }
+    assert_eq!(fs::read_dir(&destination).unwrap().count(), 8);
+}
+
+#[test]
+fn type_mismatches_are_skipped_or_kept_but_never_replaced() {
+    let mut fixture = Fixture::new("conflict-types");
+    fixture.directory("Source");
+    let item = fixture.file("Source\\item", b"source file");
+    let boxed = fixture.directory("Source\\box");
+    fixture.file("Source\\box\\child.txt", b"source child");
+    let destination = fixture.directory("Destination");
+    fixture.directory("Destination\\item");
+    fixture.file("Destination\\item\\keep.txt", b"existing folder child");
+    fixture.file("Destination\\box", b"existing file");
+    let scope = fixture.scope();
+    let before = hash_inventory(&fixture.root);
+    for policy in [ConflictPolicy::ReplaceOlder, ConflictPolicy::ReplaceAll] {
+        for operation in [Operation::Copy, Operation::Move] {
+            let error = plan_policy(
+                &scope,
+                1,
+                operation,
+                std::slice::from_ref(&item),
+                &destination,
+                policy,
+            )
+            .unwrap_err();
+            assert!(
+                error.contains("A folder cannot be replaced with a file"),
+                "{error}"
+            );
+            let error = plan_policy(
+                &scope,
+                2,
+                operation,
+                std::slice::from_ref(&boxed),
+                &destination,
+                policy,
+            )
+            .unwrap_err();
+            assert!(
+                error.contains("A file cannot be replaced with a folder"),
+                "{error}"
+            );
+        }
+    }
+    let sources = vec![item.clone(), boxed.clone()];
+    assert!(
+        plan_policy(
+            &scope,
+            3,
+            Operation::Copy,
+            &sources,
+            &destination,
+            ConflictPolicy::Fail
+        )
+        .unwrap_err()
+        .contains("Conflict")
+    );
+    for operation in [Operation::Copy, Operation::Move] {
+        let skip = plan_policy(
+            &scope,
+            4,
+            operation,
+            &sources,
+            &destination,
+            ConflictPolicy::Skip,
+        )
+        .unwrap();
+        assert_eq!(skip.conflicts().mismatched, 2);
+        assert_eq!(skip.conflicts().skip, 2);
+        let outcome = files::execute(&scope, &skip, true, &AtomicBool::new(false));
+        assert!(outcome.error.is_none(), "{outcome:?}");
+        assert!(outcome.created.is_empty() && outcome.completed.is_empty());
+        assert_eq!(outcome.skipped.len(), 2);
+        assert!(outcome.incomplete.is_empty());
+        assert_eq!(hash_inventory(&fixture.root), before);
+    }
+    let keep = plan_policy(
+        &scope,
+        5,
+        Operation::Copy,
+        &sources,
+        &destination,
+        ConflictPolicy::KeepBoth,
+    )
+    .unwrap();
+    let outcome = files::execute(&scope, &keep, true, &AtomicBool::new(false));
+    fixture.own(&outcome.created);
+    assert!(outcome.error.is_none(), "{outcome:?}");
+    assert_eq!(
+        fs::read(destination.join("item (2)")).unwrap(),
+        b"source file"
+    );
+    assert_eq!(
+        fs::read(destination.join("box (2)\\child.txt")).unwrap(),
+        b"source child"
+    );
+    assert_eq!(fs::read(destination.join("box")).unwrap(), b"existing file");
+    assert_eq!(
+        fs::read(destination.join("item\\keep.txt")).unwrap(),
+        b"existing folder child"
+    );
+}
+
+#[test]
+fn folder_merge_copies_and_moves_children_and_removes_only_emptied_sources() {
+    let mut fixture = Fixture::new("conflict-merge");
+    fixture.directory("Source");
+    let docs = fixture.directory("Source\\Docs");
+    fixture.file("Source\\Docs\\a.txt", b"source a");
+    let new = fixture.file("Source\\Docs\\new.txt", b"source new");
+    set_modified(&new, 1_000_000_000);
+    fixture.directory("Source\\Docs\\Sub");
+    fixture.file("Source\\Docs\\Sub\\b.txt", b"source b");
+    let destination = fixture.directory("Destination");
+    fixture.directory("Destination\\Docs");
+    fixture.file("Destination\\Docs\\a.txt", b"existing a");
+    fixture.file("Destination\\Docs\\keep.txt", b"keep");
+    fixture.directory("Destination\\Docs\\Sub");
+    let scope = fixture.scope();
+    let target = destination.canonicalize().unwrap().join("Docs");
+    let source_before = hash_inventory(&docs);
+    assert!(
+        files::plan(
+            &scope,
+            1,
+            Operation::Copy,
+            std::slice::from_ref(&docs),
+            Some(&destination)
+        )
+        .unwrap_err()
+        .contains("Conflict")
+    );
+    let plan = plan_policy(
+        &scope,
+        2,
+        Operation::Copy,
+        std::slice::from_ref(&docs),
+        &destination,
+        ConflictPolicy::Skip,
+    )
+    .unwrap();
+    let summary = plan.conflicts();
+    assert_eq!(
+        (
+            summary.conflicts,
+            summary.merged,
+            summary.new_items,
+            summary.skip
+        ),
+        (3, 2, 2, 1)
+    );
+    assert_eq!(summary.examples, [PathBuf::from("Docs\\a.txt")]);
+    let outcome = files::execute(&scope, &plan, true, &AtomicBool::new(false));
+    fixture.own(&outcome.created);
+    assert!(outcome.error.is_none(), "{outcome:?}");
+    assert_eq!(outcome.merged, vec![target.clone(), target.join("Sub")]);
+    assert_eq!(
+        outcome.skipped,
+        vec![docs.canonicalize().unwrap().join("a.txt")]
+    );
+    assert_eq!(
+        outcome.summary().as_deref(),
+        Some("2 copied, 2 folders merged, 1 skipped")
+    );
+    for (name, data) in [
+        ("a.txt", b"existing a".as_slice()),
+        ("keep.txt", b"keep".as_slice()),
+        ("new.txt", b"source new".as_slice()),
+        ("Sub\\b.txt", b"source b".as_slice()),
+    ] {
+        assert_eq!(fs::read(target.join(name)).unwrap(), data, "{name}");
+    }
+    assert_eq!(modified(&target.join("new.txt")), modified(&new));
+    assert_eq!(hash_inventory(&docs), source_before);
+
+    fixture.directory("Incoming");
+    let incoming = fixture.directory("Incoming\\Docs");
+    fixture.file("Incoming\\Docs\\a.txt", b"incoming a");
+    fixture.file("Incoming\\Docs\\c.txt", b"incoming c");
+    fixture.directory("Incoming\\Docs\\Deep");
+    fixture.file("Incoming\\Docs\\Deep\\d.txt", b"incoming d");
+    fixture.directory("Incoming\\Docs\\Sub");
+    fixture.file("Incoming\\Docs\\Sub\\e.txt", b"incoming e");
+    let plan = plan_policy(
+        &scope,
+        3,
+        Operation::Move,
+        std::slice::from_ref(&incoming),
+        &destination,
+        ConflictPolicy::Skip,
+    )
+    .unwrap();
+    let outcome = files::execute(&scope, &plan, true, &AtomicBool::new(false));
+    fixture.own(&outcome.created);
+    fixture.own(&[target.join("Deep\\d.txt")]);
+    assert!(outcome.error.is_none(), "{outcome:?}");
+    let incoming_canonical = incoming.canonicalize().unwrap();
+    assert_eq!(outcome.skipped, vec![incoming_canonical.join("a.txt")]);
+    assert_eq!(outcome.merged, vec![target.join("Sub"), target.clone()]);
+    assert!(outcome.incomplete.is_empty());
+    assert_eq!(
+        outcome.summary().as_deref(),
+        Some("3 moved, 2 folders merged, 1 skipped")
+    );
+    for (name, data) in [
+        ("a.txt", b"existing a".as_slice()),
+        ("c.txt", b"incoming c".as_slice()),
+        ("Deep\\d.txt", b"incoming d".as_slice()),
+        ("Sub\\e.txt", b"incoming e".as_slice()),
+        ("Sub\\b.txt", b"source b".as_slice()),
+    ] {
+        assert_eq!(fs::read(target.join(name)).unwrap(), data, "{name}");
+    }
+    assert!(
+        !incoming.join("Sub").exists(),
+        "Emptied merged source folders are removed."
+    );
+    assert!(!incoming.join("Deep").exists());
+    assert!(!incoming.join("c.txt").exists());
+    assert_eq!(
+        fs::read(incoming.join("a.txt")).unwrap(),
+        b"incoming a",
+        "A merged source folder holding skipped items is kept."
+    );
+
+    fixture.directory("Later");
+    let later = fixture.directory("Later\\Docs");
+    fixture.file("Later\\Docs\\f.txt", b"later f");
+    let plan = plan_policy(
+        &scope,
+        4,
+        Operation::Move,
+        std::slice::from_ref(&later),
+        &destination,
+        ConflictPolicy::ReplaceAll,
+    )
+    .unwrap();
+    let outcome = files::execute(&scope, &plan, true, &AtomicBool::new(false));
+    fixture.own(&outcome.created);
+    assert!(outcome.error.is_none(), "{outcome:?}");
+    assert!(outcome.replaced.is_empty());
+    assert_eq!(fs::read(target.join("f.txt")).unwrap(), b"later f");
+    assert!(
+        !later.exists(),
+        "The emptied merged source folder is removed."
+    );
+    assert!(fixture.root.join("Later").is_dir());
+}
+
+#[test]
+fn validation_rejects_changed_conflict_state_before_any_effect() {
+    let mut fixture = Fixture::new("conflict-stale");
+    fixture.directory("Source");
+    let docs = fixture.directory("Source\\Docs");
+    fixture.file("Source\\Docs\\a.txt", b"source a");
+    fixture.file("Source\\Docs\\new.txt", b"source new");
+    let destination = fixture.directory("Destination");
+    fixture.directory("Destination\\Docs");
+    let existing = fixture.file("Destination\\Docs\\a.txt", b"existing a");
+    let scope = fixture.scope();
+    let sources = std::slice::from_ref(&docs);
+    let refused = |fixture: &Fixture, plan: &files::Plan| {
+        let before = hash_inventory(&fixture.root);
+        let outcome = files::execute(&scope, plan, true, &AtomicBool::new(false));
+        assert!(
+            outcome.created.is_empty()
+                && outcome.replaced.is_empty()
+                && outcome.completed.is_empty(),
+            "{outcome:?}"
+        );
+        assert_eq!(hash_inventory(&fixture.root), before);
+        outcome.error.unwrap()
+    };
+
+    let replace = plan_policy(
+        &scope,
+        1,
+        Operation::Copy,
+        sources,
+        &destination,
+        ConflictPolicy::ReplaceAll,
+    )
+    .unwrap();
+    assert_eq!(replace.conflicts().replace, 1);
+    fs::write(&existing, b"changed after review").unwrap();
+    let error = refused(&fixture, &replace);
+    assert!(
+        error.contains("Destination changed; create a new plan"),
+        "{error}"
+    );
+    assert_eq!(fs::read(&existing).unwrap(), b"changed after review");
+
+    let skip = plan_policy(
+        &scope,
+        2,
+        Operation::Copy,
+        sources,
+        &destination,
+        ConflictPolicy::Skip,
+    )
+    .unwrap();
+    fixture.file("Destination\\Docs\\new.txt", b"appeared after review");
+    let error = refused(&fixture, &skip);
+    assert!(error.contains("Destination changed"), "{error}");
+
+    let keep = plan_policy(
+        &scope,
+        3,
+        Operation::Copy,
+        sources,
+        &destination,
+        ConflictPolicy::KeepBoth,
+    )
+    .unwrap();
+    assert!(
+        keep.conflict_rows()
+            .iter()
+            .any(|row| row.ends_with("-> a (2).txt"))
+    );
+    fixture.file("Destination\\Docs\\a (2).txt", b"planned name taken");
+    let error = refused(&fixture, &keep);
+    assert!(error.contains("Destination changed"), "{error}");
+
+    let skip = plan_policy(
+        &scope,
+        4,
+        Operation::Move,
+        sources,
+        &destination,
+        ConflictPolicy::Skip,
+    )
+    .unwrap();
+    fs::remove_file(&existing).unwrap();
+    let error = refused(&fixture, &skip);
+    assert!(error.contains("Destination changed"), "{error}");
+    assert!(docs.join("a.txt").exists() && docs.join("new.txt").exists());
+}
+
+#[test]
+fn journal_receipts_record_conflict_policy_resolutions_and_counts() {
+    let mut fixture = Fixture::new("conflict-journal");
+    fixture.directory("Source");
+    let first = fixture.file("Source\\a.txt", b"source a");
+    let second = fixture.file("Source\\b.txt", b"source b");
+    let destination = fixture.directory("Destination");
+    fixture.file("Destination\\a.txt", b"existing a");
+    let journal_path = fixture.directory("Journal");
+    let journal = tomas_commander::journal::Journal::new(journal_path.clone());
+    let scope = fixture.scope();
+    let sources = vec![first, second];
+    let mut records = Vec::new();
+    for (id, policy, expected) in [
+        (
+            1,
+            ConflictPolicy::Skip,
+            [
+                "policy=skip\n",
+                "resolution=skip\n",
+                "resolution=create\n",
+                "\nskipped=",
+            ],
+        ),
+        (
+            2,
+            ConflictPolicy::KeepBoth,
+            [
+                "policy=keep-both\n",
+                "resolution=rename\n",
+                "conflict=",
+                "\ncreated=",
+            ],
+        ),
+    ] {
+        let plan =
+            plan_policy(&scope, id, Operation::Copy, &sources, &destination, policy).unwrap();
+        let outcome = journal.execute(&scope, &plan, true, &AtomicBool::new(false));
+        fixture.own(&outcome.created);
+        assert!(outcome.error.is_none(), "{outcome:?}");
+        let record = fs::read_dir(&journal_path)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.extension()
+                    .is_some_and(|extension| extension == "operation")
+                    && !records.contains(path)
+            })
+            .unwrap();
+        let text = fs::read_to_string(&record).unwrap();
+        for expected in expected {
+            assert!(text.contains(expected), "{expected:?} missing in {text}");
+        }
+        assert!(text.ends_with("finished\n"));
+        records.push(record);
+    }
+    records.push(journal_path.join("journal.lock"));
+    fixture.own(&records);
+    assert_eq!(fs::read(destination.join("a.txt")).unwrap(), b"existing a");
+    assert_eq!(
+        fs::read(destination.join("a (2).txt")).unwrap(),
+        b"source a"
+    );
+    assert_eq!(
+        fs::read(destination.join("b (2).txt")).unwrap(),
+        b"source b"
+    );
+}
+
+#[test]
+#[ignore = "Native Recycle Bin replacement with exact synthetic-item recovery; run explicitly"]
+fn replacement_recycles_only_the_owned_original_and_restores_it() {
+    let mut fixture = Fixture::new("conflict-replace");
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    fixture.directory("Source");
+    let destination = fixture.directory("Destination");
+    let scope = fixture.scope();
+    for (index, operation) in [Operation::Copy, Operation::Move].into_iter().enumerate() {
+        let stem = format!("tc-owned-replace-{nonce}-{index}");
+        let name = format!("{stem}.txt");
+        let source = fixture.file(&format!("Source\\{name}"), b"replacement bytes");
+        let target = fixture.file(&format!("Destination\\{name}"), b"original bytes");
+        set_modified(&target, 1_000_000_000);
+        set_modified(&source, 1_100_000_000);
+        let plan = plan_policy(
+            &scope,
+            index as u64 + 1,
+            operation,
+            std::slice::from_ref(&source),
+            &destination,
+            ConflictPolicy::ReplaceOlder,
+        )
+        .unwrap();
+        assert_eq!(plan.conflicts().replace, 1);
+        let outcome = files::execute(&scope, &plan, true, &AtomicBool::new(false));
+        assert!(outcome.error.is_none(), "{outcome:?}");
+        let canonical = target.canonicalize().unwrap();
+        assert_eq!(outcome.replaced, vec![canonical.clone()]);
+        assert_eq!(outcome.created, vec![canonical]);
+        assert_eq!(fs::read(&target).unwrap(), b"replacement bytes");
+        assert_eq!(
+            modified(&target),
+            UNIX_EPOCH + std::time::Duration::from_secs(1_100_000_000)
+        );
+        assert_eq!(source.exists(), operation == Operation::Copy);
+        assert!(
+            fs::read_dir(&destination).unwrap().all(|entry| !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".stage")),
+            "No staging file remains after publication."
+        );
+        let published = fixture.root.join(format!("Destination\\published-{name}"));
+        fs::rename(&target, &published).unwrap();
+        fixture.own(std::slice::from_ref(&published));
+        let parent = destination.display().to_string().replace('\'', "''");
+        let script = format!(
+            r#"
+$ErrorActionPreference='Stop'
+$shell=New-Object -ComObject Shell.Application
+$matches=@($shell.Namespace(10).Items() | Where-Object {{ $_.ExtendedProperty('System.Recycle.DeletedFrom') -eq '{parent}' -and $_.Name -like '{stem}*' }})
+if($matches.Count -ne 1) {{ throw "Expected exactly one owned replaced original; found $($matches.Count)." }}
+$matches[0].InvokeVerb('undelete')
+"#
+        );
+        let status = Command::new("powershell.exe")
+            .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+            .status()
+            .unwrap();
+        assert!(
+            status.success(),
+            "Exact replaced-original restoration failed; no other Recycle Bin item was touched."
+        );
+        for _ in 0..60 {
+            if target.exists() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        assert_eq!(fs::read(&target).unwrap(), b"original bytes");
+    }
+}
+
+#[test]
+fn same_item_is_skipped_or_kept_but_never_replaced_or_merged_into_itself() {
+    let mut fixture = Fixture::new("conflict-same");
+    let folder = fixture.directory("Work");
+    let file = fixture.file("Work\\note.txt", b"only copy");
+    let nested = fixture.directory("Work\\Nested");
+    fixture.file("Work\\Nested\\inner.txt", b"inner");
+    let scope = fixture.scope();
+    let sources = vec![file.clone(), nested.clone()];
+    for policy in [ConflictPolicy::ReplaceOlder, ConflictPolicy::ReplaceAll] {
+        for source in &sources {
+            for operation in [Operation::Copy, Operation::Move] {
+                let error = plan_policy(
+                    &scope,
+                    1,
+                    operation,
+                    std::slice::from_ref(source),
+                    &folder,
+                    policy,
+                )
+                .unwrap_err();
+                assert!(
+                    error.contains("Source and destination are the same"),
+                    "{error}"
+                );
+            }
+        }
+    }
+    let before = hash_inventory(&fixture.root);
+    let skip = plan_policy(
+        &scope,
+        2,
+        Operation::Move,
+        &sources,
+        &folder,
+        ConflictPolicy::Skip,
+    )
+    .unwrap();
+    assert_eq!(skip.conflicts().skip, 2);
+    let outcome = files::execute(&scope, &skip, true, &AtomicBool::new(false));
+    assert!(outcome.error.is_none(), "{outcome:?}");
+    assert_eq!(outcome.skipped.len(), 2);
+    assert!(outcome.created.is_empty() && outcome.incomplete.is_empty());
+    assert_eq!(hash_inventory(&fixture.root), before);
+    let keep = plan_policy(
+        &scope,
+        3,
+        Operation::Copy,
+        &sources,
+        &folder,
+        ConflictPolicy::KeepBoth,
+    )
+    .unwrap();
+    let outcome = files::execute(&scope, &keep, true, &AtomicBool::new(false));
+    fixture.own(&outcome.created);
+    assert!(outcome.error.is_none(), "{outcome:?}");
+    assert_eq!(fs::read(folder.join("note (2).txt")).unwrap(), b"only copy");
+    assert_eq!(
+        fs::read(folder.join("Nested (2)\\inner.txt")).unwrap(),
+        b"inner"
+    );
+    assert_eq!(fs::read(&file).unwrap(), b"only copy");
+    assert_eq!(fs::read(nested.join("inner.txt")).unwrap(), b"inner");
 }

@@ -297,6 +297,8 @@ impl Journal {
                     incomplete: plan.sources().to_vec(),
                     cancelled: false,
                     error: Some(error),
+                    operation: Some(plan.operation()),
+                    ..Default::default()
                 };
             }
         };
@@ -313,6 +315,15 @@ impl Journal {
         }
         for path in &outcome.incomplete {
             result.push_str(&format!("incomplete={}\n", encode_path(path)));
+        }
+        for (key, paths) in [
+            ("replaced", &outcome.replaced),
+            ("merged", &outcome.merged),
+            ("skipped", &outcome.skipped),
+        ] {
+            for path in paths {
+                result.push_str(&format!("{key}={}\n", encode_path(path)));
+            }
         }
         if let Some(error) = &outcome.error {
             result.push_str(&format!("error={error:?}\n"));
