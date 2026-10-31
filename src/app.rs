@@ -84,6 +84,8 @@ pub struct Ledger {
     recent_roots_edit: String,
     recent_config_pending: bool,
     operations_open: bool,
+    history: Option<FileResult<Vec<tomas_commander::undo::Entry>>>,
+    history_pending: bool,
     viewport_zoom: f32,
     preferences_writable: bool,
     save_pending: bool,

@@ -6,7 +6,7 @@ use std::{
     sync::atomic::AtomicBool,
 };
 
-const HEADER: &str = "TomasCommander operation journal v1\n";
+pub(crate) const HEADER: &str = "TomasCommander operation journal v1\n";
 const MAX_RECORD_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_RECORDS: usize = 10_000;
 const MAX_TOTAL_BYTES: u64 = 64 * 1024 * 1024;
@@ -132,7 +132,7 @@ impl Journal {
         Ok(())
     }
 
-    fn records(&self) -> FileResult<Vec<(PathBuf, String)>> {
+    pub(crate) fn records(&self) -> FileResult<Vec<(PathBuf, String)>> {
         if !self
             .root
             .try_exists()
@@ -236,9 +236,10 @@ impl Journal {
         let _lock = options
             .open(&lock_path)
             .map_err(|e| format!("Lock operation journal; no changes made: {e}"))?;
-        for (path, text) in self.records()? {
+        let records = self.records()?;
+        for (path, text) in &records {
             if !text.ends_with("finished\n") {
-                let recorded = recorded_paths(&text)?;
+                let recorded = recorded_paths(text)?;
                 if recorded.is_empty()
                     || recorded.iter().any(|old| {
                         affected
@@ -248,9 +249,37 @@ impl Journal {
                 {
                     return Err(format!(
                         "Unresolved operation overlaps this plan; read back and reconcile {}. No blind retry or automatic rollback.",
-                        files::display_path(&path)
+                        files::display_path(path)
                     ));
                 }
+            }
+        }
+        if let Some(original) = snapshot
+            .lines()
+            .find_map(|line| line.strip_prefix("undo_of="))
+        {
+            // Checked under the lock: one effective undo per operation, across instances.
+            let marker = format!("\nundo_of={original}\n");
+            let mut found = false;
+            for (path, text) in &records {
+                if path.file_stem().and_then(|stem| stem.to_str()) == Some(original) {
+                    found = text.ends_with("finished\n");
+                } else if text.contains(&marker) {
+                    if !text.ends_with("finished\n") {
+                        return Err(format!(
+                            "An undo of this operation was interrupted; reconcile {} first. No changes made.",
+                            files::display_path(path)
+                        ));
+                    }
+                    if crate::undo::undo_changed(text) {
+                        return Err("This operation was already undone; no changes made.".into());
+                    }
+                }
+            }
+            if !found {
+                return Err(
+                    "The undone operation record is missing or unfinished; no changes made.".into(),
+                );
             }
         }
         let path = self.root.join(format!("{key}.operation"));
@@ -264,7 +293,8 @@ impl Journal {
                     files::display_path(&path)
                 )
             })?;
-        let snapshot = format!("{HEADER}{snapshot}");
+        // The start time bounds Recycle Bin matches for a later undo.
+        let snapshot = format!("{HEADER}{snapshot}started={}\n", crate::undo::now());
         if snapshot.len() as u64 > MAX_RECORD_BYTES {
             return Err(
                 "Approved plan exceeds the durable journal limit; no mutation performed.".into(),
@@ -344,9 +374,22 @@ impl Journal {
                 result.push_str(&format!("{key}={}\n", encode_path(path)));
             }
         }
-        if let Some(error) = &outcome.error {
-            result.push_str(&format!("error={error:?}\n"));
-        }
+        let error = outcome
+            .error
+            .as_ref()
+            .map(|error| format!("error={error:?}\n"))
+            .unwrap_or_default();
+        // Undo data never pushes a record past the journal limit; it is dropped instead.
+        let used = record
+            .metadata()
+            .map_or(MAX_RECORD_BYTES, |metadata| metadata.len())
+            + (result.len() + error.len() + "finished\n".len()) as u64;
+        result.push_str(
+            &outcome
+                .effects
+                .journal_lines(MAX_RECORD_BYTES.saturating_sub(used + 256)),
+        );
+        result.push_str(&error);
         if let Err(error) = record
             .write_all(result.as_bytes())
             .and_then(|()| record.sync_all())
@@ -414,7 +457,7 @@ pub(crate) fn encode_path(path: &Path) -> String {
     }
 }
 
-fn decode_path(value: &str) -> FileResult<PathBuf> {
+pub(crate) fn decode_path(value: &str) -> FileResult<PathBuf> {
     #[cfg(windows)]
     {
         use std::os::windows::ffi::OsStringExt;

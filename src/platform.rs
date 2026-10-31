@@ -895,14 +895,294 @@ pub fn recycle(path: &Path) -> FileResult<()> {
     recycle_many(&[path.to_owned()])
 }
 
+/// Path text equality ignoring case, using the Windows ordinal casing table.
+pub fn equal_ignore_case(a: &str, b: &str) -> bool {
+    #[cfg(windows)]
+    {
+        use windows::Win32::Globalization::{CSTR_EQUAL, CompareStringOrdinal};
+        let a: Vec<u16> = a.encode_utf16().collect();
+        let b: Vec<u16> = b.encode_utf16().collect();
+        unsafe { CompareStringOrdinal(&a, &b, true) == CSTR_EQUAL }
+    }
+    #[cfg(not(windows))]
+    {
+        a.to_lowercase() == b.to_lowercase()
+    }
+}
+
+#[cfg(windows)]
+struct Apartment;
+
+#[cfg(windows)]
+impl Apartment {
+    fn new(action: &str) -> FileResult<Self> {
+        use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx};
+        unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }
+            .ok()
+            .map_err(|e| format!("Initialize {action}: {e}"))?;
+        Ok(Self)
+    }
+}
+
+#[cfg(windows)]
+impl Drop for Apartment {
+    fn drop(&mut self) {
+        unsafe { windows::Win32::System::Com::CoUninitialize() };
+    }
+}
+
+#[cfg(windows)]
+mod recycle_bin {
+    use super::{Apartment, equal_ignore_case, shell_path, wide};
+    use crate::{
+        files::{FileResult, display_path},
+        undo::BinItem,
+    };
+    use std::{
+        ffi::{OsStr, OsString},
+        os::windows::ffi::OsStringExt,
+        path::{Path, PathBuf},
+        sync::atomic::{AtomicBool, Ordering},
+        time::{Duration, SystemTime, UNIX_EPOCH},
+    };
+    use windows::{
+        Win32::{
+            Foundation::{FILETIME, PROPERTYKEY},
+            System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance, CoTaskMemFree},
+            UI::Shell::{
+                BHID_EnumItems, FOF_NOCONFIRMATION, FOF_NOCONFIRMMKDIR, FOF_NOERRORUI, FOF_SILENT,
+                FOFX_EARLYFAILURE, FOLDERID_RecycleBinFolder, FileOperation, IEnumShellItems,
+                IFileOperation, IFileOperationProgressSink, IShellItem, IShellItem2,
+                KF_FLAG_DEFAULT, SHCreateItemFromParsingName, SHGetKnownFolderItem,
+                SIGDN_FILESYSPATH,
+            },
+        },
+        core::{GUID, Interface, PCWSTR, PWSTR},
+    };
+
+    // PSGUID_DISPLACED: the Recycle Bin's original location and deletion time.
+    const DISPLACED: GUID = GUID::from_u128(0x9b174b33_40ff_11d2_a27e_00c04fc30871);
+    const DELETED_FROM: PROPERTYKEY = PROPERTYKEY {
+        fmtid: DISPLACED,
+        pid: 2,
+    };
+    const DATE_DELETED: PROPERTYKEY = PROPERTYKEY {
+        fmtid: DISPLACED,
+        pid: 3,
+    };
+    // System.FileName keeps the extension even when Explorer hides extensions.
+    const FILE_NAME: PROPERTYKEY = PROPERTYKEY {
+        fmtid: GUID::from_u128(0x41cf5ae0_f75a_4806_bd87_59c7d9248eb9),
+        pid: 100,
+    };
+
+    pub(super) fn take(value: windows_core::Result<PWSTR>) -> Option<OsString> {
+        let value = value.ok()?;
+        if value.is_null() {
+            return None;
+        }
+        let text = OsString::from_wide(unsafe { value.as_wide() });
+        unsafe { CoTaskMemFree(Some(value.0.cast())) };
+        Some(text)
+    }
+
+    fn system_time(time: FILETIME) -> SystemTime {
+        const UNIX: u64 = 116_444_736_000_000_000;
+        let ticks = (u64::from(time.dwHighDateTime) << 32) | u64::from(time.dwLowDateTime);
+        if ticks >= UNIX {
+            UNIX_EPOCH + Duration::from_nanos((ticks - UNIX).saturating_mul(100))
+        } else {
+            UNIX_EPOCH - Duration::from_nanos((UNIX - ticks).saturating_mul(100))
+        }
+    }
+
+    /// Visits every Recycle Bin item until `visit` returns true.
+    fn enumerate(
+        cancel: &AtomicBool,
+        mut visit: impl FnMut(IShellItem) -> FileResult<bool>,
+    ) -> FileResult<()> {
+        let bin: IShellItem =
+            unsafe { SHGetKnownFolderItem(&FOLDERID_RecycleBinFolder, KF_FLAG_DEFAULT, None) }
+                .map_err(|e| format!("Open the Recycle Bin: {e}"))?;
+        let list: IEnumShellItems = unsafe { bin.BindToHandler(None, &BHID_EnumItems) }
+            .map_err(|e| format!("List the Recycle Bin: {e}"))?;
+        loop {
+            if cancel.load(Ordering::Acquire) {
+                return Err("Recycle Bin search cancelled.".into());
+            }
+            let mut batch: [Option<IShellItem>; 1] = [None];
+            let mut fetched = 0u32;
+            unsafe { list.Next(&mut batch, Some(&mut fetched)) }
+                .map_err(|e| format!("Read the Recycle Bin: {e}"))?;
+            let [Some(item)] = batch else {
+                return Ok(());
+            };
+            if fetched == 0 || visit(item)? {
+                return Ok(());
+            }
+        }
+    }
+
+    /// Original location, deletion time and stored item of a bin entry from one of `parents`.
+    fn describe(item: &IShellItem, parents: &[String]) -> Option<BinItem> {
+        let properties: IShellItem2 = item.cast().ok()?;
+        let from = take(unsafe { properties.GetString(&DELETED_FROM) })?;
+        if !parents
+            .iter()
+            .any(|parent| equal_ignore_case(parent, &from.to_string_lossy()))
+        {
+            return None;
+        }
+        let name = take(unsafe { properties.GetString(&FILE_NAME) })?;
+        let deleted = system_time(unsafe { properties.GetFileTime(&DATE_DELETED) }.ok()?);
+        let stored = PathBuf::from(take(unsafe { item.GetDisplayName(SIGDN_FILESYSPATH) })?);
+        let metadata = std::fs::symlink_metadata(&stored).ok()?;
+        Some(BinItem {
+            id: stored.to_string_lossy().into_owned(),
+            original: PathBuf::from(from).join(name),
+            deleted,
+            directory: metadata.is_dir(),
+            size: (!metadata.is_dir()).then_some(metadata.len()),
+        })
+    }
+
+    pub fn items(originals: &[PathBuf], cancel: &AtomicBool) -> FileResult<Vec<BinItem>> {
+        if originals.is_empty() {
+            return Ok(Vec::new());
+        }
+        let _apartment = Apartment::new("Recycle Bin search")?;
+        let wanted: Vec<String> = originals.iter().map(|path| display_path(path)).collect();
+        let parents: Vec<String> = originals
+            .iter()
+            .filter_map(|path| path.parent())
+            .map(display_path)
+            .collect();
+        let mut found = Vec::new();
+        enumerate(cancel, |item| {
+            if let Some(entry) = describe(&item, &parents)
+                && wanted
+                    .iter()
+                    .any(|path| equal_ignore_case(path, &display_path(&entry.original)))
+            {
+                found.push(entry);
+            }
+            Ok(false)
+        })?;
+        Ok(found)
+    }
+
+    pub fn restore(entry: &BinItem, folder: &Path, name: &OsStr) -> FileResult<()> {
+        let _apartment = Apartment::new("Recycle Bin restore")?;
+        let parents: Vec<String> = entry
+            .original
+            .parent()
+            .map(display_path)
+            .into_iter()
+            .collect();
+        let mut source = None;
+        enumerate(&AtomicBool::new(false), |item| {
+            // The stored path is cheaper than the properties; compare it first.
+            let stored = take(unsafe { item.GetDisplayName(SIGDN_FILESYSPATH) });
+            if !stored.is_some_and(|stored| equal_ignore_case(&stored.to_string_lossy(), &entry.id))
+            {
+                return Ok(false);
+            }
+            let unchanged = describe(&item, &parents).is_some_and(|current| {
+                equal_ignore_case(
+                    &display_path(&current.original),
+                    &display_path(&entry.original),
+                ) && current.deleted == entry.deleted
+                    && current.directory == entry.directory
+            });
+            if !unchanged {
+                return Err(
+                    "The Recycle Bin item changed since review; it was not restored.".into(),
+                );
+            }
+            source = Some(item);
+            Ok(true)
+        })?;
+        let source = source.ok_or("Not in Recycle Bin (emptied or restored).")?;
+        let folder_name = wide(&shell_path(folder)?)?;
+        let new_name = wide(Path::new(name))?;
+        unsafe {
+            let destination: IShellItem =
+                SHCreateItemFromParsingName(PCWSTR(folder_name.as_ptr()), None)
+                    .map_err(|e| format!("Resolve restore staging folder: {e}"))?;
+            let operation: IFileOperation =
+                CoCreateInstance(&FileOperation, None, CLSCTX_INPROC_SERVER)
+                    .map_err(|e| format!("Create Windows restore operation: {e}"))?;
+            // The staging folder is new and empty, so no overwrite prompt can be answered.
+            operation
+                .SetOperationFlags(
+                    FOF_NOCONFIRMATION
+                        | FOF_NOERRORUI
+                        | FOF_SILENT
+                        | FOF_NOCONFIRMMKDIR
+                        | FOFX_EARLYFAILURE,
+                )
+                .map_err(|e| format!("Configure silent restore: {e}"))?;
+            let guard: IFileOperationProgressSink =
+                super::recycle_guard::Guard::restore(display_path(folder)).into();
+            operation
+                .MoveItem(&source, &destination, PCWSTR(new_name.as_ptr()), &guard)
+                .map_err(|e| format!("Queue restore: {e}"))?;
+            operation
+                .PerformOperations()
+                .map_err(|e| format!("Restore from the Recycle Bin: {e}"))?;
+            if operation
+                .GetAnyOperationsAborted()
+                .map_err(|e| format!("Read restore outcome: {e}"))?
+                .as_bool()
+            {
+                return Err(
+                    "Windows aborted the restore; the item stays in the Recycle Bin.".into(),
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Recycle Bin items whose original path is one of `originals`, with their deletion times.
+pub fn recycle_bin_items(
+    originals: &[std::path::PathBuf],
+    cancel: &std::sync::atomic::AtomicBool,
+) -> FileResult<Vec<crate::undo::BinItem>> {
+    #[cfg(windows)]
+    {
+        recycle_bin::items(originals, cancel)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (originals, cancel);
+        Err("Recycle Bin restore currently requires Windows.".into())
+    }
+}
+
+/// Moves exactly `item` out of the Recycle Bin into the new, empty `folder` as `name`, silently
+/// and without replacing anything.
+pub fn restore_recycled(
+    item: &crate::undo::BinItem,
+    folder: &Path,
+    name: &std::ffi::OsStr,
+) -> FileResult<()> {
+    #[cfg(windows)]
+    {
+        recycle_bin::restore(item, folder, name)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (item, folder, name);
+        Err("Recycle Bin restore currently requires Windows.".into())
+    }
+}
+
 /// Sends every item to the Recycle Bin in one Windows operation; never deletes permanently.
 #[cfg(windows)]
 pub fn recycle_many(paths: &[std::path::PathBuf]) -> FileResult<()> {
     use windows::{
-        Win32::System::Com::{
-            CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx,
-            CoUninitialize,
-        },
+        Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance},
         Win32::UI::Shell::{
             FOF_ALLOWUNDO, FOF_NO_CONNECTED_ELEMENTS, FOF_NOCONFIRMATION, FOF_NOERRORUI,
             FOF_SILENT, FOFX_EARLYFAILURE, FOFX_RECYCLEONDELETE, FileOperation, IFileOperation,
@@ -910,12 +1190,6 @@ pub fn recycle_many(paths: &[std::path::PathBuf]) -> FileResult<()> {
         },
         core::PCWSTR,
     };
-    struct Apartment;
-    impl Drop for Apartment {
-        fn drop(&mut self) {
-            unsafe { CoUninitialize() };
-        }
-    }
     let Some(first) = paths.first() else {
         return Ok(());
     };
@@ -932,11 +1206,8 @@ pub fn recycle_many(paths: &[std::path::PathBuf]) -> FileResult<()> {
             crate::files::display_path(first.parent().unwrap_or(first))
         )
     };
+    let _apartment = Apartment::new("Windows recycling")?;
     unsafe {
-        CoInitializeEx(None, COINIT_APARTMENTTHREADED)
-            .ok()
-            .map_err(|e| format!("Initialize Windows recycling: {e}"))?;
-        let _apartment = Apartment;
         let operation: IFileOperation =
             CoCreateInstance(&FileOperation, None, CLSCTX_INPROC_SERVER)
                 .map_err(|e| format!("Create Windows recycle operation: {e}"))?;
@@ -951,7 +1222,7 @@ pub fn recycle_many(paths: &[std::path::PathBuf]) -> FileResult<()> {
                     | FOFX_EARLYFAILURE,
             )
             .map_err(|e| format!("Configure recycle-only operation: {e}"))?;
-        let guard: IFileOperationProgressSink = recycle_guard::RecycleOnly.into();
+        let guard: IFileOperationProgressSink = recycle_guard::Guard::recycle().into();
         for (path, value) in paths.iter().zip(&names) {
             let item: IShellItem = SHCreateItemFromParsingName(PCWSTR(value.as_ptr()), None)
                 .map_err(|e| {
@@ -985,17 +1256,33 @@ mod recycle_guard {
             Foundation::E_ABORT,
             UI::Shell::{
                 IFileOperationProgressSink, IFileOperationProgressSink_Impl, IShellItem,
-                TSF_DELETE_RECYCLE_IF_POSSIBLE,
+                SIGDN_FILESYSPATH, TSF_DELETE_RECYCLE_IF_POSSIBLE,
             },
         },
         core::{HRESULT, PCWSTR, Ref, Result, implement},
     };
 
+    /// Aborts every Shell action except the one it was created for: recycling (never a
+    /// permanent delete) or moving a Recycle Bin item into one exact staging folder.
     #[implement(IFileOperationProgressSink)]
-    pub struct RecycleOnly;
+    pub struct Guard {
+        restore_into: Option<String>,
+    }
+
+    impl Guard {
+        pub fn recycle() -> Self {
+            Self { restore_into: None }
+        }
+
+        pub fn restore(folder: String) -> Self {
+            Self {
+                restore_into: Some(folder),
+            }
+        }
+    }
 
     #[allow(non_snake_case)]
-    impl IFileOperationProgressSink_Impl for RecycleOnly_Impl {
+    impl IFileOperationProgressSink_Impl for Guard_Impl {
         fn StartOperations(&self) -> Result<()> {
             Ok(())
         }
@@ -1019,10 +1306,19 @@ mod recycle_guard {
             &self,
             _flags: u32,
             _item: Ref<IShellItem>,
-            _destination: Ref<IShellItem>,
+            destination: Ref<IShellItem>,
             _name: &PCWSTR,
         ) -> Result<()> {
-            Err(E_ABORT.into())
+            let Some(folder) = &self.restore_into else {
+                return Err(E_ABORT.into());
+            };
+            let path = super::recycle_bin::take(unsafe {
+                destination.ok()?.GetDisplayName(SIGDN_FILESYSPATH)
+            });
+            match path {
+                Some(path) if super::equal_ignore_case(&path.to_string_lossy(), folder) => Ok(()),
+                _ => Err(E_ABORT.into()),
+            }
         }
         fn PostMoveItem(
             &self,
@@ -1056,7 +1352,7 @@ mod recycle_guard {
             result.ok()
         }
         fn PreDeleteItem(&self, flags: u32, _item: Ref<IShellItem>) -> Result<()> {
-            if flags & TSF_DELETE_RECYCLE_IF_POSSIBLE.0 as u32 == 0 {
+            if self.restore_into.is_some() || flags & TSF_DELETE_RECYCLE_IF_POSSIBLE.0 as u32 == 0 {
                 return Err(E_ABORT.into());
             }
             Ok(())
@@ -1109,7 +1405,7 @@ mod recycle_guard {
         use super::*;
         #[test]
         fn guard_refuses_permanent_deletion_flags() {
-            let guard: IFileOperationProgressSink = RecycleOnly.into();
+            let guard: IFileOperationProgressSink = Guard::recycle().into();
             unsafe {
                 assert!(guard.PreDeleteItem(0, None).is_err());
                 assert!(
@@ -1117,6 +1413,21 @@ mod recycle_guard {
                         .PreDeleteItem(TSF_DELETE_RECYCLE_IF_POSSIBLE.0 as u32, None)
                         .is_ok()
                 );
+                assert!(guard.PreMoveItem(0, None, None, PCWSTR::null()).is_err());
+            }
+        }
+
+        #[test]
+        fn restore_guard_refuses_deletion_and_moves_elsewhere() {
+            let guard: IFileOperationProgressSink =
+                Guard::restore(r"C:\owned\.tomas-commander-restore-1".into()).into();
+            unsafe {
+                for flags in [0, TSF_DELETE_RECYCLE_IF_POSSIBLE.0 as u32] {
+                    assert!(guard.PreDeleteItem(flags, None).is_err());
+                }
+                assert!(guard.PreMoveItem(0, None, None, PCWSTR::null()).is_err());
+                assert!(guard.PreCopyItem(0, None, None, PCWSTR::null()).is_err());
+                assert!(guard.PreRenameItem(0, None, PCWSTR::null()).is_err());
             }
         }
     }

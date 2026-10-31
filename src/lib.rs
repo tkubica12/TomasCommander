@@ -18,6 +18,7 @@ pub mod preferences;
 pub mod recent;
 pub mod search;
 pub mod text_preview;
+pub mod undo;
 pub mod viewer;
 
 #[cfg(windows)]

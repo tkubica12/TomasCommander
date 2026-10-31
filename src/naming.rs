@@ -160,6 +160,14 @@ impl Plan {
             incomplete: vec![self.source.clone().unwrap_or_else(|| self.target.clone())],
             error: None,
             cancelled: false,
+            effects: crate::undo::Effects {
+                kind: Some(if self.source.is_some() {
+                    crate::undo::Kind::Rename
+                } else {
+                    crate::undo::Kind::NewFolder
+                }),
+                ..Default::default()
+            },
             ..Default::default()
         };
         if !approved || cancel.load(Ordering::Acquire) {
@@ -236,6 +244,10 @@ impl Plan {
                         "Rename read-back is uncertain; inspect both paths before retrying.".into(),
                     );
                 }
+                outcome
+                    .effects
+                    .moved
+                    .push((source.clone(), self.target.clone()));
             } else {
                 fs::create_dir(&self.target)
                     .map_err(|e| format!("Create exact folder without merge: {e}"))?;
@@ -247,6 +259,7 @@ impl Plan {
                         "New folder read-back failed; inspect exact target before retrying.".into(),
                     );
                 }
+                outcome.effects.created.push(self.target.clone());
             }
             outcome.completed = outcome.incomplete.clone();
             outcome.incomplete.clear();

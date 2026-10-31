@@ -25,6 +25,7 @@ pub(super) enum Command {
     Copy,
     Move,
     Recycle,
+    Undo,
     Refresh,
     Favorites,
     Recent,
@@ -71,6 +72,7 @@ impl Command {
             Self::Copy => "/copy",
             Self::Move => "/move",
             Self::Recycle => "/delete",
+            Self::Undo => "/undo",
             Self::Refresh => "/refresh",
             Self::Favorites => "/favorites",
             Self::Recent => "/recent",
@@ -162,7 +164,7 @@ pub(super) fn palette_submission(
     }
 }
 
-pub(super) const COMMANDS: [(Command, &str, &str); 41] = [
+pub(super) const COMMANDS: [(Command, &str, &str); 42] = [
     (
         Command::Rename,
         "Rename focused file / folder",
@@ -225,6 +227,11 @@ pub(super) const COMMANDS: [(Command, &str, &str); 41] = [
     (Command::Copy, "Copy to opposite pane", "Ctrl Shift C"),
     (Command::Move, "Move to opposite pane", "Ctrl Shift M"),
     (Command::Recycle, "Delete selected items", "Ctrl Shift D"),
+    (
+        Command::Undo,
+        "Undo an operation / reviewed inverse plan",
+        "Ctrl Shift U",
+    ),
     (Command::Refresh, "Refresh folder", "Ctrl Shift R"),
     (Command::Favorites, "Show pinned locations", ""),
     (Command::Recent, "Toggle workspace / Recent", "Ctrl Shift H"),

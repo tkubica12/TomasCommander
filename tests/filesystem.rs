@@ -2927,6 +2927,10 @@ struct FakeBin {
     calls: std::cell::RefCell<Vec<Vec<PathBuf>>>,
     /// Fails the call with this index after moving its first item.
     fail_call: Option<usize>,
+    /// Stored path, original path and deletion time of each item still in the bin.
+    entries: std::cell::RefCell<Vec<(PathBuf, PathBuf, SystemTime)>>,
+    /// Simulates a drive without a Recycle Bin for undo planning.
+    refuses: std::cell::Cell<bool>,
 }
 
 impl FakeBin {
@@ -2935,6 +2939,8 @@ impl FakeBin {
             root,
             calls: Default::default(),
             fail_call: None,
+            entries: Default::default(),
+            refuses: Default::default(),
         }
     }
 
@@ -2948,12 +2954,68 @@ impl FakeBin {
             let name = item.file_name().unwrap().to_string_lossy();
             let target = self.root.join(format!("{call}-{index}-{name}"));
             fs::rename(item, &target).map_err(|e| format!("Fake recycle: {e}"))?;
+            self.entries
+                .borrow_mut()
+                .push((target, item.clone(), SystemTime::now()));
         }
         Ok(())
     }
 
     fn calls(&self) -> Vec<Vec<PathBuf>> {
         self.calls.borrow().clone()
+    }
+}
+
+impl tomas_commander::undo::RecycleBin for FakeBin {
+    fn items(
+        &self,
+        originals: &[PathBuf],
+        _cancel: &AtomicBool,
+    ) -> Result<Vec<tomas_commander::undo::BinItem>, String> {
+        Ok(self
+            .entries
+            .borrow()
+            .iter()
+            .filter(|(_, original, _)| {
+                originals
+                    .iter()
+                    .any(|path| tomas_commander::undo::same_path(path, original))
+            })
+            .map(
+                |(stored, original, deleted)| tomas_commander::undo::BinItem {
+                    id: stored.display().to_string(),
+                    original: original.clone(),
+                    deleted: *deleted,
+                    directory: stored.is_dir(),
+                    size: fs::metadata(stored)
+                        .ok()
+                        .filter(|metadata| metadata.is_file())
+                        .map(|metadata| metadata.len()),
+                },
+            )
+            .collect())
+    }
+
+    fn restore(
+        &self,
+        item: &tomas_commander::undo::BinItem,
+        folder: &std::path::Path,
+        name: &std::ffi::OsStr,
+    ) -> Result<(), String> {
+        let mut entries = self.entries.borrow_mut();
+        let index = entries
+            .iter()
+            .position(|(stored, ..)| stored.display().to_string() == item.id)
+            .ok_or("Not in the fake Recycle Bin.")?;
+        let target = folder.join(name);
+        assert_eq!(fs::read_dir(folder).unwrap().count(), 0, "Staging is new.");
+        fs::rename(&entries[index].0, &target).map_err(|e| format!("Fake restore: {e}"))?;
+        entries.remove(index);
+        Ok(())
+    }
+
+    fn accepts(&self, _path: &std::path::Path) -> bool {
+        !self.refuses.get()
     }
 }
 
@@ -3912,4 +3974,1360 @@ fn real_second_volume_move_is_planned_and_executed_across_drives() {
     assert!(outcome.error.is_none(), "{outcome:?}");
     assert_eq!(contents(&destination.join("Source")), expected);
     assert!(!source.exists());
+}
+
+// Reviewed undo: inverse plans from journaled outcomes, executed through the fake bin seam.
+
+fn records_in(path: &std::path::Path) -> Vec<PathBuf> {
+    fs::read_dir(path)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect()
+}
+
+fn record_texts(path: &std::path::Path) -> Vec<String> {
+    let mut records: Vec<PathBuf> = records_in(path)
+        .into_iter()
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "operation")
+        })
+        .collect();
+    records.sort();
+    records
+        .into_iter()
+        .map(|path| fs::read_to_string(path).unwrap())
+        .collect()
+}
+
+fn undo_rows(plan: &tomas_commander::undo::Plan, prefix: &str) -> usize {
+    plan.rows()
+        .iter()
+        .filter(|row| row.starts_with(prefix))
+        .count()
+}
+
+fn identity(path: &std::path::Path) -> (u32, u64) {
+    tomas_commander::platform::path_identity(path).unwrap()
+}
+
+fn canonical(path: &std::path::Path) -> PathBuf {
+    path.canonicalize().unwrap()
+}
+
+#[test]
+fn undo_rename_and_new_folder_are_reviewed_journaled_and_never_repeated() {
+    use tomas_commander::{journal::Journal, naming, undo};
+    let mut fixture = Fixture::new("undo-naming");
+    let folder = fixture.directory("Work");
+    let source = fixture.file("Work\\a.txt", b"original bytes");
+    let journal_root = fixture.directory("Journal");
+    let journal = Journal::new(journal_root.clone());
+    journal.initialize().unwrap();
+    let bin = FakeBin::new(fixture.directory("Bin"));
+    let scope = fixture.scope();
+    let cancel = AtomicBool::new(false);
+    let recycle = |items: &[PathBuf]| bin.recycle(items);
+    let hooks = undo::Hooks {
+        recycle: &recycle,
+        bin: &bin,
+    };
+
+    let rename = naming::Plan::prepare(&scope, 1, &folder, Some(&source), "b.txt").unwrap();
+    let outcome = rename.execute(&scope, &journal, true, &cancel);
+    assert!(outcome.error.is_none(), "{outcome:?}");
+    let renamed = rename.target().to_path_buf();
+    fixture.own(std::slice::from_ref(&renamed));
+    let before = identity(&renamed);
+
+    let plan = undo::prepare_with(&scope, &journal, 2, None, &cancel, &bin).unwrap();
+    assert_eq!(plan.label(), "Undo Rename");
+    assert_eq!(plan.heading(), "Undo Rename: b.txt back to a.txt");
+    assert!(
+        plan.rows()[0].starts_with("Move back: "),
+        "{:?}",
+        plan.rows()
+    );
+    assert!(
+        renamed.exists() && !source.exists(),
+        "Preparing an undo never changes files."
+    );
+    let refused = plan.execute_with(&scope, &journal, false, &cancel, &hooks);
+    assert!(refused.error.unwrap().contains("approval"));
+    assert!(renamed.exists() && !source.exists());
+    assert_eq!(
+        record_texts(&journal_root).len(),
+        1,
+        "An unapproved undo is not journaled."
+    );
+    let outcome = plan.execute_with(&scope, &journal, true, &cancel, &hooks);
+    assert!(outcome.error.is_none(), "{outcome:?}");
+    assert_eq!(fs::read(&source).unwrap(), b"original bytes");
+    assert!(!renamed.exists());
+    assert_eq!(identity(&source), before, "The same file moved back.");
+    let texts = record_texts(&journal_root);
+    let record = texts
+        .iter()
+        .find(|text| text.contains(&format!("\nundo_of={}\n", plan.undoes())))
+        .expect("The undo is journaled with undo_of.");
+    for expected in ["operation=Undo\n", "\nkind=undo\n", "\nstarted="] {
+        assert!(
+            record.contains(expected),
+            "{expected:?} missing in {record}"
+        );
+    }
+    assert!(record.ends_with("finished\n"));
+
+    let history = undo::history(&scope, &journal, 20, &cancel).unwrap();
+    assert_eq!(history[0].label, "Undo Rename");
+    assert_eq!(
+        history[0].status,
+        undo::Status::Refused("Undo cannot be undone (no redo)".into())
+    );
+    assert_eq!(history[1].label, "Rename: a.txt to b.txt");
+    assert_eq!(history[1].status, undo::Status::Undone);
+
+    // After a reload the operation is still undone and the approved plan never runs twice.
+    let reloaded = Journal::new(journal_root.clone());
+    let error = undo::prepare_with(&scope, &reloaded, 3, Some(plan.undoes()), &cancel, &bin)
+        .err()
+        .unwrap();
+    assert!(error.contains("Already undone"), "{error}");
+    let error = undo::prepare_with(&scope, &reloaded, 3, None, &cancel, &bin)
+        .err()
+        .unwrap();
+    assert!(
+        error.starts_with("Nothing to undo. Latest operation: Undo Rename / Undo cannot be undone"),
+        "{error}"
+    );
+    let again = plan.execute_with(&scope, &reloaded, true, &cancel, &hooks);
+    assert!(
+        again.error.is_some() && again.completed.is_empty(),
+        "{again:?}"
+    );
+    assert_eq!(fs::read(&source).unwrap(), b"original bytes");
+
+    // A new folder is recycled only while it is still empty and the same folder.
+    let new_folder = naming::Plan::prepare(&scope, 4, &folder, None, "Empty").unwrap();
+    let created = new_folder.target().to_path_buf();
+    let outcome = new_folder.execute(&scope, &reloaded, true, &cancel);
+    assert!(outcome.error.is_none(), "{outcome:?}");
+    let later = created.join("later.txt");
+    fs::write(&later, b"user data").unwrap();
+    let changed = format!("Changed since: {}", files::display_path(&created));
+    assert_eq!(
+        undo::history(&scope, &reloaded, 20, &cancel).unwrap()[0].status,
+        undo::Status::Undoable,
+        "Operations rows check only the folder itself; preparing checks its contents."
+    );
+    assert_eq!(
+        undo::prepare_with(&scope, &reloaded, 5, None, &cancel, &bin)
+            .err()
+            .unwrap(),
+        changed
+    );
+    let away = folder.join("Empty moved away");
+    fs::rename(&created, &away).unwrap();
+    fs::create_dir(&created).unwrap();
+    assert_eq!(
+        undo::history(&scope, &reloaded, 20, &cancel).unwrap()[0].status,
+        undo::Status::Refused(changed),
+        "A different folder at the path is a cheap refusal."
+    );
+    fs::remove_dir(&created).unwrap();
+    fs::rename(&away, &created).unwrap();
+    fs::remove_file(&later).unwrap();
+    let plan = undo::prepare_with(&scope, &reloaded, 6, None, &cancel, &bin).unwrap();
+    assert_eq!(
+        plan.heading(),
+        format!(
+            "Undo New folder: recycle 1 item in {}",
+            files::display_path(&canonical(&folder))
+        )
+    );
+    let outcome = plan.execute_with(&scope, &reloaded, true, &cancel, &hooks);
+    assert!(outcome.error.is_none(), "{outcome:?}");
+    assert!(!created.exists());
+    assert_eq!(bin.calls(), vec![vec![created.clone()]]);
+
+    // The original name must still be free.
+    let c = fixture.file("Work\\c.txt", b"c");
+    let original = canonical(&c);
+    let rename = naming::Plan::prepare(&scope, 7, &folder, Some(&c), "d.txt").unwrap();
+    assert!(
+        rename
+            .execute(&scope, &reloaded, true, &cancel)
+            .error
+            .is_none()
+    );
+    fixture.own(&[rename.target().to_path_buf()]);
+    fs::write(&c, b"newcomer").unwrap();
+    assert_eq!(
+        undo::prepare_with(&scope, &reloaded, 8, None, &cancel, &bin)
+            .err()
+            .unwrap(),
+        format!("Original path occupied: {}", files::display_path(&original))
+    );
+    assert_eq!(fs::read(rename.target()).unwrap(), b"c");
+    assert_eq!(fs::read(&c).unwrap(), b"newcomer");
+    fixture.own(&tree(&bin.root));
+    fixture.own(&records_in(&journal_root));
+}
+
+#[test]
+fn undo_copy_recycles_only_created_items_and_restores_replaced_originals() {
+    use tomas_commander::{journal::Journal, undo};
+    let mut fixture = Fixture::new("undo-copy");
+    fixture.directory("Source");
+    let docs = fixture.directory("Source\\Docs");
+    let newer = fixture.file("Source\\Docs\\a.txt", b"source a");
+    set_modified(&newer, 1_100_000_000);
+    fixture.file("Source\\Docs\\new.txt", b"source new");
+    fixture.directory("Source\\Docs\\Sub");
+    fixture.file("Source\\Docs\\Sub\\b.txt", b"source b");
+    let single = fixture.file("Source\\single.txt", b"single");
+    let destination = fixture.directory("Destination");
+    fixture.directory("Destination\\Docs");
+    let existing = fixture.file("Destination\\Docs\\a.txt", b"existing a");
+    set_modified(&existing, 1_000_000_000);
+    fixture.file("Destination\\Docs\\keep.txt", b"keep");
+    let journal_root = fixture.directory("Journal");
+    let journal = Journal::new(journal_root.clone());
+    let bin = FakeBin::new(fixture.directory("Bin"));
+    let scope = fixture.scope();
+    let cancel = AtomicBool::new(false);
+    let recycle = |items: &[PathBuf]| bin.recycle(items);
+    let file_hooks = files::Hooks {
+        recycle: &recycle,
+        copied: &no_copy_hook,
+    };
+    let hooks = undo::Hooks {
+        recycle: &recycle,
+        bin: &bin,
+    };
+    let source_before = hash_inventory(&fixture.root.join("Source"));
+    let destination_before = hash_inventory(&destination);
+
+    let plan = plan_policy(
+        &scope,
+        1,
+        Operation::Copy,
+        &[docs.clone(), single.clone()],
+        &destination,
+        ConflictPolicy::ReplaceAll,
+    )
+    .unwrap();
+    let outcome = journal.execute_with(&scope, &plan, true, &cancel, &file_hooks);
+    assert!(outcome.error.is_none(), "{outcome:?}");
+    assert_eq!(outcome.replaced.len(), 1);
+    let text = record_texts(&journal_root).pop().unwrap();
+    for expected in [
+        "\nundo_format=2\n",
+        "\nkind=copy\n",
+        "\nstarted=",
+        "\nended=",
+        "\nundo_created=",
+        "\nundo_replaced=",
+    ] {
+        assert!(text.contains(expected), "{expected:?} missing in {text}");
+    }
+
+    let plan = undo::prepare_with(&scope, &journal, 2, None, &cancel, &bin).unwrap();
+    assert_eq!(
+        undo_rows(&plan, "Recycle (unchanged"),
+        4,
+        "{:?}",
+        plan.rows()
+    );
+    assert_eq!(undo_rows(&plan, "Restore from Recycle Bin"), 1);
+    assert_eq!(
+        plan.heading(),
+        format!(
+            "Undo Copy: recycle 4 items in {}, restore 1 item from the Recycle Bin to {}",
+            files::display_path(&canonical(&destination)),
+            files::display_path(&canonical(&destination).join("Docs"))
+        )
+    );
+    assert!(
+        !plan
+            .rows()
+            .iter()
+            .any(|row| row.ends_with("keep.txt") || row.ends_with("Destination\\Docs")),
+        "Pre-existing merged content is never part of the undo: {:?}",
+        plan.rows()
+    );
+    let outcome = plan.execute_with(&scope, &journal, true, &cancel, &hooks);
+    assert!(outcome.error.is_none(), "{outcome:?}");
+    assert_eq!(hash_inventory(&destination), destination_before);
+    assert_eq!(hash_inventory(&fixture.root.join("Source")), source_before);
+    assert_eq!(
+        modified(&existing),
+        UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_000),
+        "The replaced original itself came back."
+    );
+
+    // Keep both: only the renamed copy and the new items are recycled.
+    let plan = plan_policy(
+        &scope,
+        3,
+        Operation::Copy,
+        std::slice::from_ref(&docs),
+        &destination,
+        ConflictPolicy::KeepBoth,
+    )
+    .unwrap();
+    let outcome = journal.execute_with(&scope, &plan, true, &cancel, &file_hooks);
+    assert!(outcome.error.is_none(), "{outcome:?}");
+    let kept = canonical(&destination).join("Docs\\a (2).txt");
+    assert_eq!(fs::read(&kept).unwrap(), b"source a");
+    let plan = undo::prepare_with(&scope, &journal, 4, None, &cancel, &bin).unwrap();
+    assert!(plan.rows().iter().any(|row| row.ends_with("a (2).txt")));
+    assert_eq!(
+        undo_rows(&plan, "Recycle (unchanged"),
+        3,
+        "{:?}",
+        plan.rows()
+    );
+    assert_eq!(undo_rows(&plan, "Restore"), 0);
+    let outcome = plan.execute_with(&scope, &journal, true, &cancel, &hooks);
+    assert!(outcome.error.is_none(), "{outcome:?}");
+    assert_eq!(hash_inventory(&destination), destination_before);
+    fixture.own(&tree(&bin.root));
+    fixture.own(&records_in(&journal_root));
+}
+
+#[test]
+fn undo_refuses_changed_results_and_missing_or_ambiguous_recycle_bin_matches() {
+    use tomas_commander::{journal::Journal, undo};
+    let mut fixture = Fixture::new("undo-refusals");
+    fixture.directory("Source");
+    let x = fixture.file("Source\\x.txt", b"x");
+    let y = fixture.file("Source\\y.txt", b"new y");
+    set_modified(&y, 1_100_000_000);
+    let destination = fixture.directory("Destination");
+    let old_y = fixture.file("Destination\\y.txt", b"old y");
+    set_modified(&old_y, 1_000_000_000);
+    let journal_root = fixture.directory("Journal");
+    let journal = Journal::new(journal_root.clone());
+    let bin = FakeBin::new(fixture.directory("Bin"));
+    let scope = fixture.scope();
+    let cancel = AtomicBool::new(false);
+    let recycle = |items: &[PathBuf]| bin.recycle(items);
+    let file_hooks = files::Hooks {
+        recycle: &recycle,
+        copied: &no_copy_hook,
+    };
+    let hooks = undo::Hooks {
+        recycle: &recycle,
+        bin: &bin,
+    };
+
+    let plan = plan_policy(
+        &scope,
+        1,
+        Operation::Copy,
+        std::slice::from_ref(&x),
+        &destination,
+        ConflictPolicy::Skip,
+    )
+    .unwrap();
+    assert!(
+        journal
+            .execute_with(&scope, &plan, true, &cancel, &file_hooks)
+            .error
+            .is_none()
+    );
+    let copy = canonical(&destination).join("x.txt");
+    fixture.own(std::slice::from_ref(&copy));
+    fs::write(&copy, b"x edited by the user").unwrap();
+    let changed = format!("Changed since: {}", files::display_path(&copy));
+    assert_eq!(
+        undo::prepare_with(&scope, &journal, 2, None, &cancel, &bin)
+            .err()
+            .unwrap(),
+        changed
+    );
+    assert_eq!(fs::read(&copy).unwrap(), b"x edited by the user");
+
+    let plan = plan_policy(
+        &scope,
+        3,
+        Operation::Copy,
+        std::slice::from_ref(&y),
+        &destination,
+        ConflictPolicy::ReplaceAll,
+    )
+    .unwrap();
+    assert!(
+        journal
+            .execute_with(&scope, &plan, true, &cancel, &file_hooks)
+            .error
+            .is_none()
+    );
+    let target = canonical(&destination).join("y.txt");
+    let missing = format!(
+        "Not in Recycle Bin (emptied or restored): {}",
+        files::display_path(&target)
+    );
+    let saved = bin.entries.take();
+    assert_eq!(saved.len(), 1);
+    assert_eq!(
+        undo::prepare_with(&scope, &journal, 4, None, &cancel, &bin)
+            .err()
+            .unwrap(),
+        missing,
+        "An emptied bin has no match."
+    );
+    bin.entries.replace(
+        saved
+            .iter()
+            .map(|(stored, original, _)| (stored.clone(), original.clone(), UNIX_EPOCH))
+            .collect(),
+    );
+    assert_eq!(
+        undo::prepare_with(&scope, &journal, 5, None, &cancel, &bin)
+            .err()
+            .unwrap(),
+        missing,
+        "Items deleted outside the operation window never match."
+    );
+    let mut twice = saved.clone();
+    twice.push((bin.root.join("other"), saved[0].1.clone(), saved[0].2));
+    bin.entries.replace(twice);
+    assert_eq!(
+        undo::prepare_with(&scope, &journal, 6, None, &cancel, &bin)
+            .err()
+            .unwrap(),
+        format!(
+            "Ambiguous Recycle Bin match (2 items): {}",
+            files::display_path(&target)
+        )
+    );
+    assert_eq!(fs::read(&target).unwrap(), b"new y");
+    bin.entries.replace(saved);
+    bin.refuses.set(true);
+    assert_eq!(
+        undo::prepare_with(&scope, &journal, 7, None, &cancel, &bin)
+            .err()
+            .unwrap(),
+        format!(
+            "No Recycle Bin on this drive; undo never deletes permanently: {}",
+            files::display_path(&target)
+        )
+    );
+    bin.refuses.set(false);
+    let plan = undo::prepare_with(&scope, &journal, 7, None, &cancel, &bin).unwrap();
+    let outcome = plan.execute_with(&scope, &journal, true, &cancel, &hooks);
+    assert!(outcome.error.is_none(), "{outcome:?}");
+    assert_eq!(fs::read(&target).unwrap(), b"old y");
+    let history = undo::history(&scope, &journal, 20, &cancel).unwrap();
+    assert_eq!(history[1].status, undo::Status::Undone);
+    assert_eq!(history[2].status, undo::Status::Refused(changed));
+    fixture.own(&tree(&bin.root));
+    fixture.own(&records_in(&journal_root));
+}
+
+#[test]
+fn undo_same_volume_move_moves_back_recreates_emptied_folders_and_restores_replaced() {
+    use tomas_commander::{journal::Journal, undo};
+    let mut fixture = Fixture::new("undo-move");
+    let destination = fixture.directory("Destination");
+    fixture.directory("Destination\\Docs");
+    fixture.file("Destination\\Docs\\a.txt", b"existing a");
+    fixture.file("Destination\\Docs\\keep.txt", b"keep");
+    fixture.directory("Destination\\Docs\\Sub");
+    fixture.file("Destination\\Docs\\Sub\\b.txt", b"destination b");
+    let old_r = fixture.file("Destination\\Docs\\r.txt", b"old r");
+    set_modified(&old_r, 1_000_000_000);
+    let incoming_root = fixture.directory("Incoming");
+    let incoming = fixture.directory("Incoming\\Docs");
+    let skipped = fixture.file("Incoming\\Docs\\a.txt", b"incoming a");
+    set_modified(&skipped, 900_000_000);
+    let c = fixture.file("Incoming\\Docs\\c.txt", b"incoming c");
+    fixture.directory("Incoming\\Docs\\Deep");
+    fixture.file("Incoming\\Docs\\Deep\\d.txt", b"incoming d");
+    fixture.directory("Incoming\\Docs\\Sub");
+    fixture.file("Incoming\\Docs\\Sub\\e.txt", b"incoming e");
+    let new_r = fixture.file("Incoming\\Docs\\r.txt", b"new r");
+    set_modified(&new_r, 1_100_000_000);
+    let later_root = fixture.directory("Later");
+    let later = fixture.directory("Later\\Docs");
+    fixture.file("Later\\Docs\\f.txt", b"later f");
+    let journal_root = fixture.directory("Journal");
+    let journal = Journal::new(journal_root.clone());
+    let bin = FakeBin::new(fixture.directory("Bin"));
+    let scope = fixture.scope();
+    let cancel = AtomicBool::new(false);
+    let recycle = |items: &[PathBuf]| bin.recycle(items);
+    let file_hooks = files::Hooks {
+        recycle: &recycle,
+        copied: &no_copy_hook,
+    };
+    let hooks = undo::Hooks {
+        recycle: &recycle,
+        bin: &bin,
+    };
+    let before = [
+        hash_inventory(&destination),
+        hash_inventory(&incoming_root),
+        hash_inventory(&later_root),
+    ];
+    let moved_identity = identity(&c);
+
+    let plan = plan_policy(
+        &scope,
+        1,
+        Operation::Move,
+        std::slice::from_ref(&incoming),
+        &destination,
+        ConflictPolicy::ReplaceOlder,
+    )
+    .unwrap();
+    assert_eq!(plan.move_strategy(), Some(files::MoveStrategy::SameVolume));
+    let outcome = journal.execute_with(&scope, &plan, true, &cancel, &file_hooks);
+    assert!(outcome.error.is_none(), "{outcome:?}");
+    assert_eq!((outcome.replaced.len(), outcome.skipped.len()), (1, 1));
+    assert!(!incoming.join("Sub").exists() && incoming.join("a.txt").exists());
+    let plan = plan_policy(
+        &scope,
+        2,
+        Operation::Move,
+        std::slice::from_ref(&later),
+        &destination,
+        ConflictPolicy::ReplaceAll,
+    )
+    .unwrap();
+    let outcome = journal.execute_with(&scope, &plan, true, &cancel, &file_hooks);
+    assert!(outcome.error.is_none(), "{outcome:?}");
+    assert!(
+        !later.exists(),
+        "The emptied merged source folder was removed."
+    );
+
+    let plan = undo::prepare_with(&scope, &journal, 3, None, &cancel, &bin).unwrap();
+    assert_eq!(
+        plan.heading(),
+        format!(
+            "Undo Move: 1 item back to {}",
+            files::display_path(&canonical(&later_root).join("Docs"))
+        )
+    );
+    assert_eq!(undo_rows(&plan, "Recreate emptied folder: "), 1);
+    let outcome = plan.execute_with(&scope, &journal, true, &cancel, &hooks);
+    assert!(outcome.error.is_none(), "{outcome:?}");
+    assert_eq!(hash_inventory(&later_root), before[2]);
+
+    // The older merging Move: emptied folders first, then each unit, then the replaced file.
+    let plan = undo::prepare_with(&scope, &journal, 4, None, &cancel, &bin).unwrap();
+    let rows = plan.rows();
+    assert!(
+        rows[0].starts_with("Recreate emptied folder: ")
+            && rows[0].ends_with("Incoming\\Docs\\Sub"),
+        "{rows:?}"
+    );
+    assert_eq!(undo_rows(&plan, "Move back: "), 4, "{rows:?}");
+    assert!(
+        rows[5].starts_with("Restore from Recycle Bin: "),
+        "{rows:?}"
+    );
+    assert!(!rows.iter().any(|row| row.contains("Skipped")), "{rows:?}");
+    assert_eq!(
+        plan.heading(),
+        format!(
+            "Undo Move: 4 items back to {}, restore 1 item from the Recycle Bin to {}",
+            files::display_path(&canonical(&incoming)),
+            files::display_path(&canonical(&destination).join("Docs"))
+        )
+    );
+    let outcome = plan.execute_with(&scope, &journal, true, &cancel, &hooks);
+    assert!(outcome.error.is_none(), "{outcome:?}");
+    assert_eq!(hash_inventory(&destination), before[0]);
+    assert_eq!(hash_inventory(&incoming_root), before[1]);
+    assert_eq!(identity(&c), moved_identity);
+    assert_eq!(
+        modified(&old_r),
+        UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_000)
+    );
+    fixture.own(&tree(&bin.root));
+    fixture.own(&records_in(&journal_root));
+}
+
+#[test]
+fn undo_cross_volume_move_restores_originals_then_recycles_verified_copies() {
+    use tomas_commander::{journal::Journal, undo};
+    let mut fixture = Fixture::new("undo-across");
+    let source_root = fixture.directory("Source");
+    let folder = fixture.directory("Source\\Tree");
+    fixture.file("Source\\Tree\\a.txt", "Dovolená a".as_bytes());
+    fixture.directory("Source\\Tree\\Nested");
+    fixture.file("Source\\Tree\\Nested\\b.bin", &[7u8; 70_000]);
+    let single = fixture.file("Source\\single.txt", b"single file");
+    let destination = fixture.directory("Destination");
+    let journal_root = fixture.directory("Journal");
+    let journal = Journal::new(journal_root.clone());
+    let bin = FakeBin::new(fixture.directory("Bin"));
+    let scope = fixture.scope();
+    let cancel = AtomicBool::new(false);
+    let recycle = |items: &[PathBuf]| bin.recycle(items);
+    let file_hooks = files::Hooks {
+        recycle: &recycle,
+        copied: &no_copy_hook,
+    };
+    let hooks = undo::Hooks {
+        recycle: &recycle,
+        bin: &bin,
+    };
+    let source_before = hash_inventory(&source_root);
+
+    let plan = plan_across(
+        &scope,
+        1,
+        &[folder.clone(), single.clone()],
+        &destination,
+        ConflictPolicy::Skip,
+        true,
+    )
+    .unwrap();
+    let outcome = journal.execute_with(&scope, &plan, true, &cancel, &file_hooks);
+    assert!(outcome.error.is_none(), "{outcome:?}");
+    assert_eq!(outcome.recycled.len(), 2);
+    let plan = undo::prepare_with(&scope, &journal, 2, None, &cancel, &bin).unwrap();
+    let rows = plan.rows();
+    let restored = rows
+        .iter()
+        .rposition(|row| row.starts_with("Restore"))
+        .unwrap();
+    let recycled = rows
+        .iter()
+        .position(|row| row.starts_with("Recycle"))
+        .unwrap();
+    assert!(restored < recycled, "Originals return first: {rows:?}");
+    assert_eq!(
+        plan.heading(),
+        format!(
+            "Undo Move: restore 2 items from the Recycle Bin to {}, recycle 2 items in {}",
+            files::display_path(&canonical(&source_root)),
+            files::display_path(&canonical(&destination))
+        )
+    );
+    let outcome = plan.execute_with(&scope, &journal, true, &cancel, &hooks);
+    assert!(outcome.error.is_none(), "{outcome:?}");
+    assert_eq!(hash_inventory(&source_root), source_before);
+    assert_eq!(fs::read_dir(&destination).unwrap().count(), 0);
+
+    // Originals kept (no Recycle Bin): only the unchanged verified copy is recycled.
+    let kept = fixture.file("Source\\kept.txt", b"kept original");
+    let plan = plan_across(
+        &scope,
+        3,
+        std::slice::from_ref(&kept),
+        &destination,
+        ConflictPolicy::Skip,
+        false,
+    )
+    .unwrap();
+    let outcome = journal.execute_with(&scope, &plan, true, &cancel, &file_hooks);
+    assert!(outcome.error.is_none(), "{outcome:?}");
+    assert_eq!(outcome.kept.len(), 1);
+    let plan = undo::prepare_with(&scope, &journal, 4, None, &cancel, &bin).unwrap();
+    assert_eq!(plan.rows().len(), 1, "{:?}", plan.rows());
+    assert!(plan.rows()[0].starts_with("Recycle (unchanged"));
+    let outcome = plan.execute_with(&scope, &journal, true, &cancel, &hooks);
+    assert!(outcome.error.is_none(), "{outcome:?}");
+    assert_eq!(fs::read(&kept).unwrap(), b"kept original");
+    assert_eq!(fs::read_dir(&destination).unwrap().count(), 0);
+
+    // A cancelled Move undoes only the verified, recycled first item.
+    let first = fixture.file("Source\\first.txt", b"first source");
+    let second = fixture.file("Source\\second.txt", &vec![0x5a; 300_000]);
+    let plan = plan_across(
+        &scope,
+        5,
+        &[first.clone(), second.clone()],
+        &destination,
+        ConflictPolicy::Skip,
+        true,
+    )
+    .unwrap();
+    let cancelled = AtomicBool::new(false);
+    let stop = |source: &std::path::Path, _: &std::path::Path| {
+        if source.ends_with("second.txt") {
+            cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    };
+    let outcome = journal.execute_with(
+        &scope,
+        &plan,
+        true,
+        &cancelled,
+        &files::Hooks {
+            recycle: &recycle,
+            copied: &stop,
+        },
+    );
+    assert!(outcome.cancelled, "{outcome:?}");
+    let partial = canonical(&destination).join("second.txt");
+    fixture.own(std::slice::from_ref(&partial));
+    let history = undo::history(&scope, &journal, 20, &cancel).unwrap();
+    assert!(history[0].label.ends_with("(partial)"), "{history:?}");
+    assert_eq!(history[0].status, undo::Status::Undoable);
+    let plan = undo::prepare_with(&scope, &journal, 6, None, &cancel, &bin).unwrap();
+    assert!(plan.partial());
+    assert!(
+        plan.effect_lines()
+            .contains(&"Partial operation: only completed items are undone.".to_owned())
+    );
+    let rows = plan.rows();
+    assert!(
+        rows.contains(&format!(
+            "Not undone (incomplete): {}",
+            files::display_path(&partial)
+        )),
+        "{rows:?}"
+    );
+    assert_eq!(undo_rows(&plan, "Restore") + undo_rows(&plan, "Recycle"), 2);
+    let outcome = plan.execute_with(&scope, &journal, true, &cancel, &hooks);
+    assert!(outcome.error.is_none(), "{outcome:?}");
+    assert_eq!(fs::read(&first).unwrap(), b"first source");
+    assert_eq!(fs::read(&second).unwrap(), vec![0x5a; 300_000]);
+    assert!(partial.exists(), "Incomplete results stay for inspection.");
+    assert!(!destination.join("first.txt").exists());
+    fixture.own(&tree(&bin.root));
+    fixture.own(&records_in(&journal_root));
+}
+
+#[test]
+fn undo_cross_volume_move_recycles_copies_only_while_kept_originals_remain() {
+    use tomas_commander::{journal::Journal, undo};
+    let mut fixture = Fixture::new("undo-kept");
+    let source_root = fixture.directory("Source");
+    let photos = fixture.directory("Source\\Photos");
+    fixture.file("Source\\Photos\\a.jpg", b"photo a");
+    fixture.directory("Source\\Photos\\Nested");
+    let nested = fixture.file("Source\\Photos\\Nested\\b.jpg", &[9u8; 40_000]);
+    let destination = fixture.directory("Destination");
+    let journal_root = fixture.directory("Journal");
+    let journal = Journal::new(journal_root.clone());
+    let bin = FakeBin::new(fixture.directory("Bin"));
+    let scope = fixture.scope();
+    let cancel = AtomicBool::new(false);
+    let recycle = |items: &[PathBuf]| bin.recycle(items);
+    let file_hooks = files::Hooks {
+        recycle: &recycle,
+        copied: &no_copy_hook,
+    };
+    let hooks = undo::Hooks {
+        recycle: &recycle,
+        bin: &bin,
+    };
+
+    // A drive without a Recycle Bin keeps the originals beside their verified copies.
+    let plan = plan_across(
+        &scope,
+        1,
+        std::slice::from_ref(&photos),
+        &destination,
+        ConflictPolicy::Skip,
+        false,
+    )
+    .unwrap();
+    let outcome = journal.execute_with(&scope, &plan, true, &cancel, &file_hooks);
+    assert!(outcome.error.is_none(), "{outcome:?}");
+    let copy = canonical(&destination).join("Photos");
+    fixture.own(&tree(&copy));
+    let original = canonical(&photos);
+    assert_eq!(outcome.kept, vec![original.clone()]);
+    let source_before = hash_inventory(&source_root);
+    let copy_before = hash_inventory(&copy);
+    let text = record_texts(&journal_root).pop().unwrap();
+    for expected in [
+        "\nundo_format=2\n",
+        "\nkind=move-across-kept\n",
+        "\nundo_kept=",
+    ] {
+        assert!(text.contains(expected), "{expected:?} missing in {text}");
+    }
+    let key = undo::history(&scope, &journal, 20, &cancel).unwrap()[0]
+        .key
+        .clone();
+    let status = || {
+        undo::history(&scope, &journal, 20, &cancel)
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.key == key)
+            .unwrap()
+            .status
+    };
+    assert_eq!(status(), undo::Status::Undoable);
+
+    // The user deleted the originals: the copy is the only live data and is never recycled.
+    let deleted = source_root.join("Photos deleted");
+    fs::rename(&photos, &deleted).unwrap();
+    let gone = format!(
+        "Original no longer present: {}; the copy is kept.",
+        files::display_path(&original)
+    );
+    assert_eq!(status(), undo::Status::Refused(gone.clone()));
+    assert_eq!(
+        undo::prepare_with(&scope, &journal, 2, None, &cancel, &bin)
+            .err()
+            .unwrap(),
+        gone
+    );
+    fs::rename(&deleted, &photos).unwrap();
+
+    // A change deep inside the original is found when preparing.
+    let moved = nested.with_extension("moved");
+    fs::rename(&nested, &moved).unwrap();
+    assert_eq!(
+        status(),
+        undo::Status::Undoable,
+        "Operations rows check only the original itself."
+    );
+    assert_eq!(
+        undo::prepare_with(&scope, &journal, 3, None, &cancel, &bin)
+            .err()
+            .unwrap(),
+        format!(
+            "Original changed since: {}; the copy is kept.",
+            files::display_path(&original)
+        )
+    );
+    fs::rename(&moved, &nested).unwrap();
+
+    // Deleted between review and approval: execution refuses before recycling the copy.
+    let plan = undo::prepare_with(&scope, &journal, 4, None, &cancel, &bin).unwrap();
+    assert_eq!(
+        plan.rows(),
+        vec![format!(
+            "Recycle (unchanged since the operation): {}; original present: {}",
+            files::display_path(&copy),
+            files::display_path(&original)
+        )]
+    );
+    assert!(
+        plan.effect_lines()
+            .contains(&"A copy is recycled only while its kept original is unchanged.".to_owned())
+    );
+    fs::rename(&photos, &deleted).unwrap();
+    let outcome = plan.execute_with(&scope, &journal, true, &cancel, &hooks);
+    assert_eq!(outcome.error.as_deref(), Some(gone.as_str()), "{outcome:?}");
+    assert!(outcome.completed.is_empty());
+    assert!(bin.calls().is_empty(), "Nothing was recycled.");
+    assert_eq!(hash_inventory(&copy), copy_before);
+    fs::rename(&deleted, &photos).unwrap();
+    assert_eq!(
+        status(),
+        undo::Status::Undoable,
+        "An undo refused before any effect changed nothing."
+    );
+
+    // With the original present and unchanged, only the verified copy is recycled.
+    let plan = undo::prepare_with(&scope, &journal, 5, None, &cancel, &bin).unwrap();
+    let outcome = plan.execute_with(&scope, &journal, true, &cancel, &hooks);
+    assert!(outcome.error.is_none(), "{outcome:?}");
+    assert_eq!(bin.calls(), vec![vec![copy.clone()]]);
+    assert!(!copy.exists());
+    assert_eq!(hash_inventory(&source_root), source_before);
+    assert_eq!(status(), undo::Status::Undone);
+
+    // A record without journaled kept originals (an earlier build) never recycles its copies.
+    let legacy = fixture.file("Source\\legacy.txt", b"legacy original");
+    let plan = plan_across(
+        &scope,
+        6,
+        std::slice::from_ref(&legacy),
+        &destination,
+        ConflictPolicy::Skip,
+        false,
+    )
+    .unwrap();
+    let outcome = journal.execute_with(&scope, &plan, true, &cancel, &file_hooks);
+    assert!(outcome.error.is_none(), "{outcome:?}");
+    let legacy_copy = canonical(&destination).join("legacy.txt");
+    fixture.own(std::slice::from_ref(&legacy_copy));
+    let entry = undo::history(&scope, &journal, 20, &cancel)
+        .unwrap()
+        .remove(0);
+    let record = journal_root.join(format!("{}.operation", entry.key));
+    let text = fs::read_to_string(&record).unwrap();
+    assert!(text.contains("\nundo_kept="), "{text}");
+    let earlier = text
+        .lines()
+        .filter(|line| !line.starts_with("undo_kept="))
+        .map(|line| format!("{line}\n"))
+        .collect::<String>()
+        .replace("\nundo_format=2\n", "\nundo_format=1\n");
+    fs::write(&record, earlier).unwrap();
+    let refused = "Not undoable: kept originals not recorded";
+    assert_eq!(
+        undo::history(&scope, &journal, 20, &cancel).unwrap()[0].status,
+        undo::Status::Refused(refused.into())
+    );
+    assert_eq!(
+        undo::prepare_with(&scope, &journal, 7, Some(&entry.key), &cancel, &bin)
+            .err()
+            .unwrap(),
+        refused
+    );
+    let error = undo::prepare_with(&scope, &journal, 8, None, &cancel, &bin)
+        .err()
+        .unwrap();
+    assert!(error.ends_with(refused), "{error}");
+    assert_eq!(fs::read(&legacy_copy).unwrap(), b"legacy original");
+    assert_eq!(fs::read(&legacy).unwrap(), b"legacy original");
+    fixture.own(&tree(&bin.root));
+    fixture.own(&records_in(&journal_root));
+}
+
+#[test]
+fn undo_partly_recycled_cross_volume_move_restores_recycled_and_checks_kept_originals() {
+    use tomas_commander::{journal::Journal, undo};
+    let mut fixture = Fixture::new("undo-across-partial");
+    let source_root = fixture.directory("Source");
+    let docs = fixture.directory("Source\\Docs");
+    fixture.file("Source\\Docs\\keep.txt", b"skipped source");
+    fixture.file("Source\\Docs\\x.txt", b"x");
+    fixture.file("Source\\Docs\\y.txt", b"y");
+    let destination = fixture.directory("Destination");
+    fixture.directory("Destination\\Docs");
+    fixture.file("Destination\\Docs\\keep.txt", b"existing keep");
+    let journal_root = fixture.directory("Journal");
+    let journal = Journal::new(journal_root.clone());
+    let mut bin = FakeBin::new(fixture.directory("Bin"));
+    bin.fail_call = Some(0);
+    let scope = fixture.scope();
+    let cancel = AtomicBool::new(false);
+    let source_before = hash_inventory(&source_root);
+    let destination_before = hash_inventory(&destination);
+    let recycle = |items: &[PathBuf]| bin.recycle(items);
+    let file_hooks = files::Hooks {
+        recycle: &recycle,
+        copied: &no_copy_hook,
+    };
+    let hooks = undo::Hooks {
+        recycle: &recycle,
+        bin: &bin,
+    };
+
+    // Recycling stops after x: x is in the Recycle Bin, y stays beside its copy.
+    let plan = plan_across(
+        &scope,
+        1,
+        std::slice::from_ref(&docs),
+        &destination,
+        ConflictPolicy::Skip,
+        true,
+    )
+    .unwrap();
+    let outcome = journal.execute_with(&scope, &plan, true, &cancel, &file_hooks);
+    fixture.own(&outcome.created);
+    assert!(outcome.error.is_some(), "{outcome:?}");
+    let source = canonical(&docs);
+    let target = canonical(&destination).join("Docs");
+    assert_eq!(outcome.recycled, vec![source.join("x.txt")]);
+    assert_eq!(outcome.kept, vec![source.join("y.txt")]);
+    let text = record_texts(&journal_root).pop().unwrap();
+    assert_eq!(text.matches("\nundo_kept=").count(), 1, "{text}");
+
+    let plan = undo::prepare_with(&scope, &journal, 2, None, &cancel, &bin).unwrap();
+    let rows = plan.rows();
+    assert_eq!(rows.len(), 3, "{rows:?}");
+    assert!(
+        rows[0].starts_with(&format!(
+            "Restore from Recycle Bin: {}",
+            files::display_path(&source.join("x.txt"))
+        )),
+        "{rows:?}"
+    );
+    for row in [
+        format!(
+            "Recycle (unchanged since the operation): {}",
+            files::display_path(&target.join("x.txt"))
+        ),
+        format!(
+            "Recycle (unchanged since the operation): {}; original present: {}",
+            files::display_path(&target.join("y.txt")),
+            files::display_path(&source.join("y.txt"))
+        ),
+    ] {
+        assert!(rows.contains(&row), "{row:?} missing in {rows:?}");
+    }
+    let outcome = plan.execute_with(&scope, &journal, true, &cancel, &hooks);
+    assert!(outcome.error.is_none(), "{outcome:?}");
+    assert_eq!(hash_inventory(&source_root), source_before);
+    assert_eq!(hash_inventory(&destination), destination_before);
+    fixture.own(&tree(&bin.root));
+    fixture.own(&records_in(&journal_root));
+}
+
+#[test]
+fn undo_delete_restores_from_the_bin_and_keeps_items_whose_original_is_occupied() {
+    use tomas_commander::{journal::Journal, undo};
+    let mut fixture = Fixture::new("undo-delete");
+    let work = fixture.directory("Work");
+    let one = fixture.file("Work\\one.txt", b"one");
+    let folder = fixture.directory("Work\\Folder");
+    fixture.file("Work\\Folder\\inner.txt", b"inner");
+    let journal_root = fixture.directory("Journal");
+    let journal = Journal::new(journal_root.clone());
+    let bin = FakeBin::new(fixture.directory("Bin"));
+    let scope = fixture.scope();
+    let cancel = AtomicBool::new(false);
+    let recycle = |items: &[PathBuf]| bin.recycle(items);
+    let file_hooks = files::Hooks {
+        recycle: &recycle,
+        copied: &no_copy_hook,
+    };
+    let hooks = undo::Hooks {
+        recycle: &recycle,
+        bin: &bin,
+    };
+    let before = hash_inventory(&work);
+    let plan = files::plan(
+        &scope,
+        1,
+        Operation::Recycle,
+        &[one.clone(), folder.clone()],
+        None,
+    )
+    .unwrap();
+    let originals = plan.sources().to_vec();
+    let outcome = journal.execute_with(&scope, &plan, true, &cancel, &file_hooks);
+    assert!(outcome.error.is_none(), "{outcome:?}");
+    assert!(!one.exists() && !folder.exists());
+
+    fs::write(&one, b"newcomer").unwrap();
+    assert_eq!(
+        undo::prepare_with(&scope, &journal, 2, None, &cancel, &bin)
+            .err()
+            .unwrap(),
+        format!(
+            "Original path occupied: {}",
+            files::display_path(&originals[0])
+        )
+    );
+    fs::remove_file(&one).unwrap();
+    let plan = undo::prepare_with(&scope, &journal, 3, None, &cancel, &bin).unwrap();
+    assert_eq!(
+        plan.heading(),
+        format!(
+            "Undo Delete: restore 2 items from the Recycle Bin to {}",
+            files::display_path(&canonical(&work))
+        )
+    );
+    // Occupied after review: that item stays in the bin and the undo stops.
+    fs::create_dir(&folder).unwrap();
+    let outcome = plan.execute_with(&scope, &journal, true, &cancel, &hooks);
+    let error = outcome.error.clone().unwrap();
+    assert!(
+        error.contains("Original path occupied") && error.contains("stays in the Recycle Bin"),
+        "{error}"
+    );
+    assert_eq!(outcome.completed, vec![originals[0].clone()]);
+    assert_eq!(outcome.incomplete, vec![originals[1].clone()]);
+    assert_eq!(fs::read(&one).unwrap(), b"one");
+    assert_eq!(fs::read_dir(&folder).unwrap().count(), 0);
+    assert_eq!(bin.entries.borrow().len(), 1);
+    let mut names: Vec<String> = fs::read_dir(&work)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    assert_eq!(names, ["Folder", "one.txt"], "No staging folder is left.");
+    let history = undo::history(&scope, &journal, 20, &cancel).unwrap();
+    assert_eq!(
+        history[1].status,
+        undo::Status::Refused("Partly undone; inspect Operations".into())
+    );
+    assert!(undo::prepare_with(&scope, &journal, 4, None, &cancel, &bin).is_err());
+
+    // Manual reconciliation brings back the rest for this check.
+    fs::remove_dir(&folder).unwrap();
+    let (stored, ..) = bin.entries.borrow()[0].clone();
+    fs::rename(&stored, &folder).unwrap();
+    assert_eq!(hash_inventory(&work), before);
+    fixture.own(&tree(&bin.root));
+    fixture.own(&records_in(&journal_root));
+}
+
+#[test]
+fn undo_zip_create_and_extraction_recycle_unchanged_outputs_and_refuse_rewrites() {
+    use tomas_commander::{
+        archive_changes::{self, Request},
+        journal::Journal,
+        undo,
+    };
+    let mut fixture = Fixture::new("undo-zip");
+    let pack = fixture.directory("Pack");
+    fixture.file("Pack\\one.txt", b"one");
+    fixture.directory("Pack\\Sub");
+    fixture.file("Pack\\Sub\\two.txt", b"two");
+    let out = fixture.directory("Out");
+    let extracted = fixture.directory("Extracted");
+    let extra = fixture.file("extra.txt", b"extra");
+    let journal_root = fixture.directory("Journal");
+    let journal = Journal::new(journal_root.clone());
+    journal.initialize().unwrap();
+    let bin = FakeBin::new(fixture.directory("Bin"));
+    let scope = fixture.scope();
+    let cancel = AtomicBool::new(false);
+    let recycle = |items: &[PathBuf]| bin.recycle(items);
+    let hooks = undo::Hooks {
+        recycle: &recycle,
+        bin: &bin,
+    };
+    let create = |id: u64, name: &str| {
+        let plan = archive_changes::prepare(
+            &scope,
+            id,
+            Request::Create {
+                sources: vec![pack.clone()],
+                target: out.join(name),
+            },
+            &cancel,
+        )
+        .unwrap();
+        let outcome = plan.execute(&scope, &journal, true, &cancel);
+        assert!(outcome.error.is_none(), "{outcome:?}");
+        canonical(&out).join(name)
+    };
+    let archive = create(1, "pack.zip");
+    fixture.own(std::slice::from_ref(&archive));
+
+    let plan = archive_changes::prepare(
+        &scope,
+        2,
+        Request::Extract {
+            archive: archive.clone(),
+            prefix: String::new(),
+            selected: vec!["Pack".into()],
+            destination: extracted.clone(),
+            move_entries: false,
+        },
+        &cancel,
+    )
+    .unwrap();
+    let outcome = plan.execute(&scope, &journal, true, &cancel);
+    assert!(outcome.error.is_none(), "{outcome:?}");
+    assert_eq!(
+        fs::read(extracted.join("Pack\\Sub\\two.txt")).unwrap(),
+        b"two"
+    );
+    let plan = undo::prepare_with(&scope, &journal, 3, None, &cancel, &bin).unwrap();
+    assert_eq!(
+        plan.heading(),
+        format!(
+            "Undo Extract ZIP: recycle 1 item in {}",
+            files::display_path(&canonical(&extracted))
+        )
+    );
+    let outcome = plan.execute_with(&scope, &journal, true, &cancel, &hooks);
+    assert!(outcome.error.is_none(), "{outcome:?}");
+    assert_eq!(fs::read_dir(&extracted).unwrap().count(), 0);
+
+    // Inserting rewrites the archive: not undoable, and the created ZIP has changed since.
+    let plan = archive_changes::prepare(
+        &scope,
+        4,
+        Request::Insert {
+            archive: archive.clone(),
+            prefix: String::new(),
+            sources: vec![extra.clone()],
+            move_sources: false,
+        },
+        &cancel,
+    )
+    .unwrap();
+    let outcome = plan.execute(&scope, &journal, true, &cancel);
+    assert!(outcome.error.is_none(), "{outcome:?}");
+    let history = undo::history(&scope, &journal, 20, &cancel).unwrap();
+    assert_eq!(
+        history[0].status,
+        undo::Status::Refused("Not undoable: ZIP insert".into())
+    );
+    assert_eq!(
+        undo::prepare_with(&scope, &journal, 5, Some(&history[0].key), &cancel, &bin)
+            .err()
+            .unwrap(),
+        "Not undoable: ZIP insert"
+    );
+    let changed = format!("Changed since: {}", files::display_path(&archive));
+    let created = history
+        .iter()
+        .find(|entry| entry.label.starts_with("Create ZIP"))
+        .unwrap();
+    assert_eq!(created.status, undo::Status::Refused(changed.clone()));
+    assert_eq!(
+        undo::prepare_with(&scope, &journal, 6, None, &cancel, &bin)
+            .err()
+            .unwrap(),
+        changed
+    );
+
+    let second = create(7, "second.zip");
+    let plan = undo::prepare_with(&scope, &journal, 8, None, &cancel, &bin).unwrap();
+    assert_eq!(
+        plan.heading(),
+        format!(
+            "Undo Create ZIP: recycle 1 item in {}",
+            files::display_path(&canonical(&out))
+        )
+    );
+    let outcome = plan.execute_with(&scope, &journal, true, &cancel, &hooks);
+    assert!(outcome.error.is_none(), "{outcome:?}");
+    assert!(!second.exists());
+    fixture.own(&tree(&bin.root));
+    fixture.own(&records_in(&journal_root));
+}
+
+#[test]
+fn undo_refuses_records_from_older_versions_and_interrupted_records() {
+    use std::os::windows::ffi::OsStrExt;
+    use tomas_commander::{journal::Journal, undo};
+    let mut fixture = Fixture::new("undo-legacy");
+    let file = fixture.file("old.txt", b"old");
+    let journal_root = fixture.directory("Journal");
+    let header = "TomasCommander operation journal v1\n";
+    let encoded: String = file
+        .as_os_str()
+        .encode_wide()
+        .map(|unit| format!("{unit:04x}"))
+        .collect();
+    let legacy = journal_root.join("100-1-0.operation");
+    fs::write(
+        &legacy,
+        format!(
+            "{header}operation=Copy\nid=1\npolicy=fail\nsource={encoded}\n\ncancelled=false\ncompleted={encoded}\ncreated={encoded}\nfinished\n"
+        ),
+    )
+    .unwrap();
+    fixture.own(std::slice::from_ref(&legacy));
+    let journal = Journal::new(journal_root.clone());
+    let scope = fixture.scope();
+    let cancel = AtomicBool::new(false);
+    let bin = FakeBin::new(fixture.directory("Bin"));
+    let history = undo::history(&scope, &journal, 20, &cancel).unwrap();
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].label, "Copy");
+    assert_eq!(
+        history[0].status,
+        undo::Status::Refused("Not undoable (recorded by an older version)".into())
+    );
+    assert_eq!(
+        undo::prepare_with(&scope, &journal, 1, None, &cancel, &bin)
+            .err()
+            .unwrap(),
+        "Nothing to undo. Latest operation: Copy / Not undoable (recorded by an older version)"
+    );
+    let interrupted = journal_root.join("200-1-0.operation");
+    fs::write(
+        &interrupted,
+        format!(
+            "{header}operation=Move\nid=2\nsource={encoded}\nstarted=200\n\ncancelled=false\nundo_format=1\nkind=move\n"
+        ),
+    )
+    .unwrap();
+    fixture.own(std::slice::from_ref(&interrupted));
+    let history = undo::history(&scope, &journal, 20, &cancel).unwrap();
+    assert_eq!(
+        history[0].status,
+        undo::Status::Refused("Interrupted; reconcile first".into())
+    );
+    assert_eq!(fs::read(&file).unwrap(), b"old");
+}
+
+#[test]
+#[ignore = "Native Recycle Bin restore of owned synthetic items; run explicitly"]
+fn real_undo_restores_only_the_owned_recycled_items() {
+    use tomas_commander::{journal::Journal, undo};
+    let mut fixture = Fixture::new("undo-real-bin");
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let work = fixture.directory("Work");
+    let file = fixture.file(&format!("Work\\tc-undo-{nonce}.txt"), b"restore this file");
+    let folder = fixture.directory(&format!("Work\\tc-undo-folder-{nonce}"));
+    fixture.file(
+        &format!("Work\\tc-undo-folder-{nonce}\\inner.txt"),
+        b"restore this folder",
+    );
+    let incoming = fixture.directory("Incoming");
+    let name = format!("tc-undo-copy-{nonce}.txt");
+    let source = fixture.file(&format!("Incoming\\{name}"), b"replacement");
+    set_modified(&source, 1_100_000_000);
+    let journal_root = fixture.directory("Journal");
+    let journal = Journal::new(journal_root.clone());
+    let scope = fixture.scope();
+    let cancel = AtomicBool::new(false);
+    let before = hash_inventory(&work);
+
+    // Delete, then undo: both items return from the real Recycle Bin through staging.
+    let plan = files::plan(
+        &scope,
+        1,
+        Operation::Recycle,
+        &[file.clone(), folder.clone()],
+        None,
+    )
+    .unwrap();
+    let outcome = journal.execute(&scope, &plan, true, &cancel);
+    assert!(outcome.error.is_none(), "{outcome:?}");
+    assert!(!file.exists() && !folder.exists());
+    let plan = undo::prepare(&scope, &journal, 2, None, &cancel).unwrap();
+    println!("{}\n{:#?}", plan.heading(), plan.rows());
+    assert_eq!(undo_rows(&plan, "Restore from Recycle Bin: "), 2);
+    let outcome = plan.execute(&scope, &journal, true, &cancel);
+    assert!(outcome.error.is_none(), "{outcome:?}");
+    assert_eq!(
+        hash_inventory(&work),
+        before,
+        "Restored exactly, without staging."
+    );
+
+    // Copy + Replace, then undo: the copy is recycled and the replaced original returns.
+    let target = fixture.file(&format!("Work\\{name}"), b"original to replace");
+    set_modified(&target, 1_000_000_000);
+    let plan = plan_policy(
+        &scope,
+        3,
+        Operation::Copy,
+        std::slice::from_ref(&source),
+        &work,
+        ConflictPolicy::ReplaceAll,
+    )
+    .unwrap();
+    let outcome = journal.execute(&scope, &plan, true, &cancel);
+    assert!(outcome.error.is_none(), "{outcome:?}");
+    assert_eq!(fs::read(&target).unwrap(), b"replacement");
+    let plan = undo::prepare(&scope, &journal, 4, None, &cancel).unwrap();
+    println!("{}\n{:#?}", plan.heading(), plan.rows());
+    let outcome = plan.execute(&scope, &journal, true, &cancel);
+    assert!(outcome.error.is_none(), "{outcome:?}");
+    assert_eq!(fs::read(&target).unwrap(), b"original to replace");
+
+    // Recover the owned recycled copy so nothing of this test stays in the bin.
+    let recycled = tomas_commander::platform::recycle_bin_items(
+        std::slice::from_ref(&canonical(&target)),
+        &cancel,
+    )
+    .unwrap();
+    assert_eq!(
+        recycled.len(),
+        1,
+        "Only the recycled copy remains: {recycled:?}"
+    );
+    let recovery = fixture.directory("Recovered");
+    tomas_commander::platform::restore_recycled(
+        &recycled[0],
+        &canonical(&recovery),
+        std::ffi::OsStr::new(&name),
+    )
+    .unwrap();
+    let recovered = recovery.join(&name);
+    fixture.own(std::slice::from_ref(&recovered));
+    assert_eq!(fs::read(&recovered).unwrap(), b"replacement");
+    assert_eq!(fs::read_dir(&incoming).unwrap().count(), 1);
+    fixture.own(&records_in(&journal_root));
 }

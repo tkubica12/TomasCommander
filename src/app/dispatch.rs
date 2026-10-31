@@ -71,6 +71,30 @@ impl Ledger {
         }
     }
 
+    /// Queues an inverse plan for review; `None` picks the most recent undoable operation.
+    pub(super) fn prepare_undo(&mut self, key: Option<String>) {
+        if self.operation_busy || self.plan.is_some() || self.change_plan.is_some() {
+            self.fail("Finish or cancel the current operation first.");
+            return;
+        }
+        if self.panes.iter().any(|pane| pane.busy) {
+            self.fail("Wait for folder loading before planning an operation.");
+            return;
+        }
+        self.cancellation.store(false, Ordering::Release);
+        match self.work.try_send(Work::PrepareUndo {
+            id: self.next_id,
+            key,
+        }) {
+            Ok(()) => {
+                self.next_id += 1;
+                self.operation_busy = true;
+                self.log("Preparing undo / no effects before approval.");
+            }
+            Err(error) => self.fail(format!("Undo was not queued: {error}")),
+        }
+    }
+
     pub(super) fn dispatch(&mut self, command: Command) {
         self.inline_pending = None;
         self.palette = false;
@@ -394,6 +418,14 @@ impl Ledger {
                     Err(error) => self.fail(format!("Could not queue operation: {error}")),
                 }
             }
+            Command::Undo => {
+                if self.reader.dirty() {
+                    self.fail("Save or explicitly discard edits before planning a file mutation.");
+                    return;
+                }
+                self.reader.close();
+                self.prepare_undo(None);
+            }
             Command::Refresh => {
                 if let Err(error) = self.aggregate_cache.clear() {
                     self.fail(error);
@@ -412,6 +444,7 @@ impl Ledger {
             }
             Command::Activity => {
                 self.operations_open = true;
+                self.request_history();
             }
             Command::Theme => {
                 self.preferences.dark = !self.preferences.dark;

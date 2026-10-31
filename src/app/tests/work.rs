@@ -190,3 +190,123 @@ fn submitted_folder_name_creates_once_but_rename_still_requires_review() {
     fs::remove_dir(journal_root).unwrap();
     fs::remove_dir(root).unwrap();
 }
+
+#[test]
+fn undo_request_prepares_a_review_and_never_executes() {
+    use std::fs;
+    let root = std::env::temp_dir().join(format!(
+        "tc-undo-review-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    fs::create_dir(&root).unwrap();
+    let scope = Scope::fixture(&root).unwrap();
+    let root = scope.resolve(&root).unwrap();
+    let journal_root = root.join("operations");
+    let journal = tomas_commander::journal::Journal::new(journal_root.clone());
+    let cancel = AtomicBool::new(false);
+    let source = root.join("a.txt");
+    fs::write(&source, b"unchanged").unwrap();
+    let rename =
+        match prepare_name_work(&scope, &journal, 1, &root, Some(&source), "b.txt", &cancel) {
+            WorkResult::NamePrepared(Ok(plan)) => plan,
+            _ => panic!("Rename must return a review plan."),
+        };
+    assert!(
+        rename
+            .execute(&scope, &journal, true, &cancel)
+            .error
+            .is_none()
+    );
+    let renamed = root.join("b.txt");
+    match prepare_undo_work(&scope, &journal, 2, None, &cancel) {
+        WorkResult::UndoPrepared(Ok(plan)) => {
+            assert!(
+                renamed.exists() && !source.exists(),
+                "Preparing is not executing."
+            );
+            let change = Change::Undo(plan);
+            assert_eq!(change.confirm_label(), "Undo");
+            assert_eq!(change.label(), "Undo Rename");
+            assert_eq!(change.heading(), "Undo Rename: b.txt back to a.txt");
+            let ctx = egui::Context::default();
+            let mut height = 0.0;
+            let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+                ui.set_width(520.0);
+                change.show_summary(ui);
+                height = ui.min_rect().height();
+            });
+            let text: String = output
+                .shapes
+                .iter()
+                .filter_map(|shape| {
+                    if let egui::Shape::Text(text) = &shape.shape {
+                        Some(text.galley.job.text.as_str())
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            for expected in ["Details", "This undo cannot be undone (no redo)."] {
+                assert!(text.contains(expected), "{expected:?} missing in {text}");
+            }
+            assert!(height <= 220.0, "Compact summary exceeded 220 px: {height}");
+            output.textures_delta.clear();
+        }
+        _ => panic!("Undo must return a review plan, not an outcome."),
+    }
+    // A cancel already set targeted earlier work; the Operations read still completes.
+    match history_work(&scope, &journal, &AtomicBool::new(true)) {
+        WorkResult::History(Ok(entries)) => {
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0].status, tomas_commander::undo::Status::Undoable);
+        }
+        _ => panic!("The Operations read must complete."),
+    }
+    assert_eq!(fs::read(&renamed).unwrap(), b"unchanged");
+    let records: Vec<_> = fs::read_dir(&journal_root)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    assert_eq!(
+        records.len(),
+        2,
+        "Only the rename and the journal lock exist."
+    );
+    for path in records {
+        fs::remove_file(path).unwrap();
+    }
+    fs::remove_file(renamed).unwrap();
+    fs::remove_dir(journal_root).unwrap();
+    fs::remove_dir(root).unwrap();
+}
+
+#[test]
+fn history_reads_coalesce_and_never_fill_the_work_queue() {
+    let (work, jobs) = mpsc::sync_channel(4);
+    let mut pending = false;
+    for _ in 0..3 {
+        queue_history(&work, &mut pending).unwrap();
+    }
+    assert!(pending);
+    assert!(matches!(jobs.try_recv().unwrap(), Work::History));
+    assert!(jobs.try_recv().is_err(), "One pending read at a time.");
+    pending = false;
+    queue_history(&work, &mut pending).unwrap();
+    assert!(matches!(jobs.try_recv().unwrap(), Work::History));
+
+    let (work, jobs) = mpsc::sync_channel(1);
+    work.try_send(Work::History).unwrap();
+    let mut pending = false;
+    assert!(
+        queue_history(&work, &mut pending)
+            .unwrap_err()
+            .contains("Operation history was not queued")
+    );
+    assert!(!pending, "A refused request can be retried.");
+    drop(jobs);
+}

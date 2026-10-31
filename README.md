@@ -41,6 +41,10 @@ The binary is unsigned; this project does not provide code-signing or support.
   offer Skip, Replace older, Replace all (originals to the Recycle Bin) or Keep
   both, and same-name folders are merged. Moves across drives copy, verify
   (CRC-32) and then send originals to the Recycle Bin.
+- Reviewed Undo (Ctrl+Shift+U, `/undo` or Operations): the inverse of a recent
+  operation is shown as an exact plan before anything changes. It moves items
+  back, recycles unchanged results and restores originals from the Recycle Bin
+  without overwriting; nothing is undone automatically.
 - Saved locations with editable names and removal, unified Recent activity, compact
   clickable breadcrumbs and inline filename editing.
 - Recent document and ZIP-file changes in configurable folders (D: and both detected OneDrive
@@ -80,6 +84,7 @@ The binary is unsigned; this project does not provide code-signing or support.
 | Ctrl+F / Ctrl+Shift+F | Filter / recursive filename search |
 | Ctrl+Shift+S | Cycle sorting: name A-Z / newest first / largest first |
 | Ctrl+Shift+C / Ctrl+Shift+M / Ctrl+Shift+D | Copy / move / Recycle Bin |
+| Ctrl+Shift+U | Undo: review the inverse of the latest undoable operation |
 | Ctrl+Shift+N / Ctrl+Shift+E / Ctrl+Shift+R | New folder / rename / refresh |
 | Ctrl+Shift+P | Create ZIP / extract ZIP by context |
 | Ctrl+plus / Ctrl+minus / Ctrl+wheel | Global UI zoom |
@@ -129,7 +134,10 @@ Copy and moves across drives preserve modification times but not creation
 times, all Windows metadata, ACLs or alternate streams. Moves between drives are
 a verified copy followed by sending the originals to the Recycle Bin; from
 removable or network drives, which have no Recycle Bin, originals are kept and
-never deleted permanently.
+never deleted permanently. Undo covers Copy, Move, Delete, Rename, New folder
+and ZIP create/extract, but not ZIP insertion, moving out of a ZIP or source
+Save; it refuses when results changed, originals are no longer in the Recycle
+Bin or kept originals are gone, and it cannot itself be undone.
 
 HTML previews are semantic, not full CSS/browser rendering; scripts and external
 assets are not loaded. ZIP support is limited to Store/Deflate and excludes

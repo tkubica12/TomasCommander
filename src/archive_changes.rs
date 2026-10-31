@@ -590,6 +590,10 @@ impl Plan {
                 .collect(),
             cancelled: false,
             error: None,
+            effects: crate::undo::Effects {
+                kind: Some(crate::undo::Kind::archive(self.label)),
+                ..Default::default()
+            },
             ..Default::default()
         };
         if !approved || cancel.load(Ordering::Acquire) {
@@ -748,7 +752,56 @@ impl Plan {
             outcome.error = Some(error);
         }
         outcome.cancelled = cancel.load(Ordering::Acquire) && outcome.error.is_some();
+        self.record_effects(&mut outcome);
         Journal::finish(record, outcome)
+    }
+
+    /// Created ZIPs and complete top-level extraction outputs are undoable; rewritten archives
+    /// are not.
+    fn record_effects(&self, outcome: &mut Outcome) {
+        use crate::undo::Kind;
+        let completed: BTreeSet<&PathBuf> = outcome.completed.iter().collect();
+        let created: BTreeSet<&PathBuf> = outcome.created.iter().collect();
+        let mut units = Vec::new();
+        match outcome.effects.kind {
+            Some(Kind::ZipCreate) => units.extend(
+                self.target
+                    .iter()
+                    .filter(|target| completed.contains(target) && created.contains(target))
+                    .cloned(),
+            ),
+            Some(Kind::ZipExtract) => {
+                for (top, _) in &self.outputs {
+                    if top.parent() != Some(self.parent.as_path()) {
+                        continue;
+                    }
+                    let done = self
+                        .outputs
+                        .iter()
+                        .filter(|(path, _)| path.starts_with(top))
+                        .all(|(path, data)| {
+                            if data.is_some() {
+                                completed.contains(path)
+                            } else {
+                                created.contains(path)
+                            }
+                        });
+                    if done {
+                        units.push(top.clone());
+                    }
+                }
+            }
+            _ => return,
+        }
+        outcome.effects.partial = crate::undo::outermost(
+            outcome
+                .created
+                .iter()
+                .filter(|path| !units.iter().any(|unit| path.starts_with(unit)))
+                .cloned()
+                .collect(),
+        );
+        outcome.effects.created = units;
     }
 }
 

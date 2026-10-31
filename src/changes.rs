@@ -268,6 +268,10 @@ impl Plan {
             incomplete: vec![self.original.path.clone()],
             error: None,
             cancelled: false,
+            effects: crate::undo::Effects {
+                kind: Some(crate::undo::Kind::Save),
+                ..Default::default()
+            },
             ..Default::default()
         };
         if !approved || cancelled.load(Ordering::Acquire) {

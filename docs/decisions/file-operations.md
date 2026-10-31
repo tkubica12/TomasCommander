@@ -31,7 +31,8 @@ replay a claimed plan, even if an output later disappears.
 Results and completion markers are durable. Missing completion means unknown
 outcome, not permission to retry. Overlapping new plans fail until actual state
 is reconciled. Malformed/reparse/oversized records and journal failures stop
-effects explicitly. There is no automatic rollback/recovery/replay.
+effects explicitly. Nothing is rolled back, recovered or replayed automatically;
+undo is a separate, explicitly approved plan (see Undo below).
 Journal limits: 10,000 records, 16 MiB per record, 64 MiB total.
 Archive only reviewed/reconciled records deliberately.
 
@@ -128,6 +129,96 @@ effects. A blocking OS call is not interruptible. Execution stops on error and
 does not silently roll back completed work. Partial/staging paths and errors are
 reported in Operations and retained in receipts. Inspect actual state before retry.
 
+## Undo
+
+Undo never runs automatically. Ctrl+Shift+U, `/undo` or an Operations row
+prepares an inverse plan from a finished journal record, validates it against
+the current state and shows it in the standard review (Enter confirms, Escape
+cancels, the held-Enter and focus protections apply). The approved plan is
+claimed and journaled like any plan, with `undo_of=<original key>`.
+
+**Recorded data.** Claiming a plan appends `started=<ns since 1970>` to its
+snapshot. The outcome adds `undo_format=2`, `kind=` (copy, move, move-across,
+move-across-kept, delete, rename, new-folder, zip-create, zip-extract,
+zip-extract-move, zip-insert, zip-insert-move, save, undo) and `ended=`, then
+what the outcome proves:
+
+| Line | Meaning | Inverse |
+|---|---|---|
+| `undo_created=<path> <mark>` | Complete item the operation created (top-level item, a direct child of a merged folder, Keep both name, created ZIP or top-level extraction output) | Recycle if the mark still matches |
+| `undo_kept=<original> <copy> <mark>` | Cross-volume Move original that was not recycled (no Recycle Bin, stopped or cancelled Move), with the copy made from it | Recycle the copy only while the original still matches its mark |
+| `undo_moved=<original> <result> <mark>` | Same-volume Move unit or Rename | Move back without replacement if the result is the same item |
+| `undo_recycled=<path>` | Deleted item or cross-volume original in the Recycle Bin | Restore |
+| `undo_replaced=<path>` | Destination file replaced into the Recycle Bin | Restore after the replacing item is gone |
+| `undo_removed=<path>` | Emptied merged source folder removed by a Move | Recreate empty folder |
+| `undo_partial=<path>` | Created but incomplete output | Never undone; listed in the review |
+
+A file mark is its Windows file identity, size and modification time. A folder
+mark is its identity plus a hash of every descendant's name, type, identity,
+size and modification time (folder times are excluded, so an added and removed
+temporary file is not a change). Moved items are checked by identity only:
+moving the same item back is lossless. Records without `undo_format` come from
+an older version and are not undoable. Format 1 (no `undo_kept`) stays readable,
+but a cross-volume Move record with kept originals and no `undo_kept` lines, or
+a stopped format-1 cross-volume Move, is not undoable: its copies may be the
+only remaining data. If undo data would push a record past the
+16 MiB limit, `undo_unavailable=record size` is written instead.
+
+**Order.** Recreate emptied folders (outermost first), restore recycled
+originals, move items back, recycle created items, restore replaced files. A
+cross-volume Move therefore returns its originals before recycling the verified
+copies; a stopped undo never leaves an item without either copy.
+
+**Validation.** Preparing refuses the whole undo with the exact path when a
+result changed or vanished (`Changed since: <path>`), an original path is
+occupied, a parent folder is missing, a Recycle Bin item is missing or ambiguous,
+a kept cross-volume original is gone or changed (`Original no longer present:
+<path>; the copy is kept.`), or a result lies on a drive without a Recycle Bin
+(undo never deletes permanently). Execution rechecks each step immediately
+before its effect, including the kept original just before its copy is
+recycled, and stops at the first problem; cancellation is checked between
+steps. Partly completed, cancelled or failed operations undo only what their
+outcome proves.
+
+**Operations rows.** Rows are read on the file worker with cheap checks only:
+the record, its undo state, and the existence and top-level identity of results
+and kept originals. Folder contents and Recycle Bin items are verified only when
+preparing, so a row may offer Undo that preparing then refuses with the exact
+path. Reads honor the shared cancellation and coalesce: a new read is queued
+only when none is pending.
+
+**Recycle Bin restore.** The Shell enumerates `FOLDERID_RecycleBinFolder`
+(`IEnumShellItems`, `IShellItem2`). An item's original path is
+`System.Recycle.DeletedFrom` joined with `System.FileName` (which keeps the
+extension even when Explorer hides it); its deletion time is
+`System.Recycle.DateDeleted`. A recorded path matches only an exact
+case-insensitive ordinal path comparison with a deletion time between the
+claim time minus 2 s and the completion time plus 2 s. No match refuses as
+"Not in Recycle Bin (emptied or restored)"; several matches refuse as ambiguous.
+The review binds the exact stored item, which is re-identified and rechecked
+before the restore. IFileOperation moves it into a new, uniquely named
+`.tomas-commander-restore-<key>-<n>` folder created beside the original, so no
+existing item can collide and `FOF_NOCONFIRMATION` can never answer an
+overwrite prompt. `FOF_NOERRORUI`, `FOF_SILENT` and `FOF_NOCONFIRMMKDIR`
+suppress Windows UI, and a progress sink aborts every action except moving
+that item into that folder. The staged item is verified (type, file size) and
+published with the no-replace handle rename to the exact original path; the
+empty staging folder is then removed. An original path occupied at execution
+keeps the item in the Recycle Bin, or in staging if it became occupied after
+the move; Operations reports staging leftovers.
+
+**Not undoable.** ZIP insertion and rewrite, moving members out of a ZIP, source
+Save, interrupted records (reconcile them first) and undo itself: there is no
+redo. Under the journal lock a second undo of the same operation is refused
+once an earlier undo changed anything or was interrupted; an undo refused
+before any effect does not block a new reviewed plan. Operations shows
+*Undone*, *Partly undone* or the reason per record, also after a restart.
+
+Limitations: changes that keep the same identity, size and modification time
+are not detected; recreated folders get new identities and times; a moved
+folder is moved back with any later changes inside it; restoring rechecks the
+Recycle Bin per item, so very large bins make restores slower.
+
 ## Safe testing
 
 `--fixture-root` canonicalizes an owned boundary. Mutating tests use uniquely
@@ -143,4 +234,7 @@ Cross-volume tests force the strategy on one volume and inject a recycler that
 moves items into a fixture folder, plus a post-copy hook for corruption,
 source-change and cancellation cases (`#[doc(hidden)]` seams). The real
 Recycle Bin and real second-volume (`TC_SECOND_VOLUME_ROOT`) tests are ignored by
-default.
+default. Undo tests inject a fake Recycle Bin (`undo::RecycleBin`) that records
+deletion times and restores from its fixture folder; the real restore test
+deletes, restores and recovers only its own uniquely named items and is ignored
+by default.

@@ -1209,6 +1209,8 @@ pub struct Outcome {
     pub kept: Vec<PathBuf>,
     pub operation: Option<Operation>,
     pub strategy: Option<MoveStrategy>,
+    /// What the operation proves it did, journaled for a later reviewed undo.
+    pub effects: crate::undo::Effects,
 }
 
 impl Outcome {
@@ -1878,6 +1880,7 @@ fn move_across(
                     display_path(&node.source)
                 )
             })?;
+            outcome.effects.removed.push(node.source.clone());
         }
     }
     Ok(())
@@ -2070,6 +2073,7 @@ pub fn execute_with(
                                     display_path(&node.source)
                                 )
                             })?;
+                            outcome.effects.removed.push(node.source.clone());
                         }
                         outcome.merged.push(target.clone());
                         outcome.completed.push(node.source.clone());
@@ -2128,7 +2132,101 @@ pub fn execute_with(
     outcome
         .incomplete
         .retain(|source| !completed.contains(source));
+    let removed = std::mem::take(&mut outcome.effects.removed);
+    outcome.effects = effects(plan, &outcome);
+    outcome.effects.removed = removed;
     outcome
+}
+
+/// What a finished plan proves it did: complete created units, moved units, replaced and
+/// recycled originals, and cross-volume originals left in place. Partial units are reported but
+/// never undone.
+fn effects(plan: &Plan, outcome: &Outcome) -> crate::undo::Effects {
+    use crate::undo::{Effects, Kind};
+    let kind = match (plan.operation, plan.strategy) {
+        (Operation::Copy, _) => Kind::Copy,
+        (Operation::Recycle, _) => Kind::Recycle,
+        (
+            Operation::Move,
+            Some(MoveStrategy::CrossVolume {
+                recycle_originals: true,
+            }),
+        ) => Kind::MoveAcross,
+        (Operation::Move, Some(MoveStrategy::CrossVolume { .. })) => Kind::MoveAcrossKept,
+        (Operation::Move, _) => Kind::Move,
+    };
+    let mut effects = Effects {
+        kind: Some(kind),
+        replaced: outcome.replaced.clone(),
+        ..Default::default()
+    };
+    if kind == Kind::Recycle {
+        effects.recycled = outcome.completed.clone();
+        return effects;
+    }
+    let completed: BTreeSet<&Path> = outcome.completed.iter().map(PathBuf::as_path).collect();
+    let resolutions: std::collections::BTreeMap<&Path, Resolution> = plan
+        .nodes
+        .iter()
+        .map(|node| (node.source.as_path(), node.resolution))
+        .collect();
+    // A unit is a top-level item or a direct child of a merged folder that the plan writes.
+    let units = plan.nodes.iter().filter(|node| {
+        matches!(
+            node.resolution,
+            Resolution::Create | Resolution::Rename | Resolution::Replace
+        ) && (plan.sources.contains(&node.source)
+            || node
+                .source
+                .parent()
+                .and_then(|parent| resolutions.get(parent))
+                == Some(&Resolution::Merge))
+    });
+    if kind == Kind::Move {
+        for unit in units {
+            if let Some(target) = &unit.target
+                && completed.contains(unit.source.as_path())
+            {
+                effects.moved.push((unit.source.clone(), target.clone()));
+            }
+        }
+        return effects;
+    }
+    let mut covered = Vec::new();
+    let recycled: BTreeSet<&Path> = outcome.recycled.iter().map(PathBuf::as_path).collect();
+    for unit in units {
+        let Some(target) = &unit.target else {
+            continue;
+        };
+        let done = plan
+            .nodes
+            .iter()
+            .filter(|node| node.source.starts_with(&unit.source))
+            .all(|node| completed.contains(node.source.as_path()));
+        if done && outcome.created.contains(target) {
+            effects.created.push(target.clone());
+            covered.push(target.as_path());
+            // Any original not in the Recycle Bin is still in place, kept or not.
+            if kind != Kind::Copy
+                && !unit
+                    .source
+                    .ancestors()
+                    .any(|original| recycled.contains(original))
+            {
+                effects.kept.push((unit.source.clone(), target.clone()));
+            }
+        }
+    }
+    effects.partial = crate::undo::outermost(
+        outcome
+            .created
+            .iter()
+            .filter(|path| !covered.iter().any(|unit| path.starts_with(unit)))
+            .cloned()
+            .collect(),
+    );
+    effects.recycled = outcome.recycled.clone();
+    effects
 }
 
 #[cfg(windows)]

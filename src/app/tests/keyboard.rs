@@ -524,3 +524,64 @@ fn empty_filter_does_not_consume_escape_for_selection_or_dialogs() {
     .textures_delta
     .clear();
 }
+
+#[test]
+fn undo_shortcut_is_ctrl_shift_u_and_reuses_no_other_chord() {
+    let chord = Modifiers {
+        ctrl: true,
+        shift: true,
+        ..Modifiers::NONE
+    };
+    assert!(
+        COMMANDS
+            .iter()
+            .any(|(command, _, key)| *command == Command::Undo && *key == "Ctrl Shift U")
+    );
+    for modifiers in [
+        chord,
+        Modifiers::CTRL,
+        Modifiers::SHIFT,
+        Modifiers::NONE,
+        Modifiers { alt: true, ..chord },
+    ] {
+        let ctx = egui::Context::default();
+        let expected = (modifiers == chord).then_some(Command::Undo);
+        ctx.run_ui(
+            egui::RawInput {
+                events: vec![egui::Event::Key {
+                    key: Key::U,
+                    physical_key: Some(Key::U),
+                    pressed: true,
+                    repeat: false,
+                    modifiers,
+                }],
+                ..Default::default()
+            },
+            |_| assert_eq!(consume_file_action(&ctx), expected),
+        )
+        .textures_delta
+        .clear();
+    }
+    let keys: Vec<&str> = FILE_ACTION_CHORDS
+        .iter()
+        .chain(&FILE_PANE_CHORDS)
+        .map(|(key, _)| key.name())
+        .chain(["H"])
+        .collect();
+    assert_eq!(
+        keys.iter().collect::<BTreeSet<_>>().len(),
+        keys.len(),
+        "{keys:?}"
+    );
+    assert!(!keys.contains(&"Z") && !keys.contains(&"Y"), "{keys:?}");
+    let labels: Vec<&str> = COMMANDS
+        .iter()
+        .map(|(_, _, key)| *key)
+        .filter(|key| !key.is_empty())
+        .collect();
+    assert_eq!(
+        labels.iter().collect::<BTreeSet<_>>().len(),
+        labels.len(),
+        "{labels:?}"
+    );
+}

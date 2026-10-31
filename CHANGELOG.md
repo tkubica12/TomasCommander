@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+- Reviewed Undo: Ctrl+Shift+U or `/undo` prepares the inverse of the latest
+  undoable operation as an exact plan ("Undo Move: 3 items back to D:\x") with
+  every path and Recycle Bin restore under Details; Enter confirms, Escape
+  cancels. Operations lists recent operations with Undo or a short reason
+  (Undone, Not undoable: ZIP insert, Changed since: path), so older operations
+  can be undone too. Rename and same-drive Move move items back; Copy, New
+  folder and ZIP create/extract recycle unchanged results; Delete, replaced
+  files and cross-drive Move originals are restored from the Recycle Bin into a
+  new staging folder and renamed into place without overwriting. A cross-drive
+  copy whose original was kept is recycled only while that original is still
+  present and unchanged. Partial operations undo only what completed. Undo is
+  journaled with `undo_of`, cannot run twice (also after a restart) and cannot
+  itself be undone. ZIP insertion, moving out of a ZIP and source Save are not
+  undoable; records from older versions are shown as not undoable. Operations
+  rows use quick checks only; folder contents are verified when preparing.
+- Journal records now add claim/completion times, an operation kind and
+  fingerprints of created and moved results and of kept cross-drive originals
+  (`undo_*` lines); older records stay readable.
 - Copy/Move conflict handling: the review shows new items, merged folders and
   file conflicts (source newer / older or same) with examples, and offers Skip
   (default), Replace older, Replace all or Keep both. Changing the choice

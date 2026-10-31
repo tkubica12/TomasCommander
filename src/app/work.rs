@@ -26,6 +26,7 @@ pub(super) enum Change {
     Save(tomas_commander::changes::Plan),
     Archive(tomas_commander::archive_changes::Plan),
     Name(tomas_commander::naming::Plan),
+    Undo(tomas_commander::undo::Plan),
 }
 impl Change {
     pub(super) fn id(&self) -> u64 {
@@ -33,6 +34,7 @@ impl Change {
             Self::Save(plan) => plan.id,
             Self::Archive(plan) => plan.id,
             Self::Name(plan) => plan.id,
+            Self::Undo(plan) => plan.id,
         }
     }
     pub(super) fn label(&self) -> &'static str {
@@ -40,6 +42,14 @@ impl Change {
             Self::Save(plan) => plan.label,
             Self::Archive(plan) => plan.label,
             Self::Name(plan) => plan.label(),
+            Self::Undo(plan) => plan.label(),
+        }
+    }
+    /// Review heading, e.g. "Undo Move: 3 items back to D:\x".
+    pub(super) fn heading(&self) -> String {
+        match self {
+            Self::Undo(plan) => plan.heading(),
+            _ => self.label().to_owned(),
         }
     }
     fn summary(&self) -> String {
@@ -47,6 +57,11 @@ impl Change {
             Self::Save(plan) => plan.summary(),
             Self::Archive(plan) => plan.summary(),
             Self::Name(plan) => plan.summary(),
+            Self::Undo(plan) => format!(
+                "{}\nUndoes recorded operation {}. Each step rechecks the current state; execution stops at the first change, leaving later steps undone.",
+                plan.heading(),
+                plan.undoes()
+            ),
         }
     }
     pub(super) fn confirm_label(&self) -> &'static str {
@@ -54,6 +69,7 @@ impl Change {
             Self::Save(_) => "Save",
             Self::Archive(_) => "Confirm",
             Self::Name(_) => "Rename",
+            Self::Undo(_) => "Undo",
         }
     }
 
@@ -69,6 +85,11 @@ impl Change {
                 }
                 confirmation_path(ui, "To", plan.target());
                 ui.label("No overwrite.");
+            }
+            Self::Undo(plan) => {
+                for line in plan.effect_lines() {
+                    ui.add(egui::Label::new(line).wrap());
+                }
             }
             Self::Archive(plan) => {
                 confirmation_path(ui, "To", plan.destination());
@@ -99,12 +120,31 @@ impl Change {
                         }
                     });
             }
+            if let Self::Undo(plan) = self {
+                let rows = plan.rows();
+                egui::ScrollArea::both()
+                    .id_salt("undo-exact-plan-rows")
+                    .max_height(180.0)
+                    .show_rows(ui, ROW_HEIGHT, rows.len(), |ui, range| {
+                        for row in &rows[range] {
+                            ui.add(
+                                egui::Label::new(row.as_str())
+                                    .wrap_mode(egui::TextWrapMode::Extend),
+                            );
+                        }
+                    });
+            }
         });
     }
 }
 
 pub(super) enum Work {
     Change(Change),
+    PrepareUndo {
+        id: u64,
+        key: Option<String>,
+    },
+    History,
     PrepareName {
         id: u64,
         folder: PathBuf,
@@ -188,6 +228,8 @@ pub(super) enum Work {
 
 pub(super) enum WorkResult {
     NamePrepared(FileResult<tomas_commander::naming::Plan>),
+    UndoPrepared(FileResult<tomas_commander::undo::Plan>),
+    History(FileResult<Vec<tomas_commander::undo::Entry>>),
     Changed {
         outcome: Outcome,
         editor: bool,
@@ -248,9 +290,64 @@ pub(super) fn prepare_name_work(
     }
 }
 
+/// Prepares (never executes) an inverse plan for review.
+pub(super) fn prepare_undo_work(
+    scope: &Scope,
+    journal: &tomas_commander::journal::Journal,
+    id: u64,
+    key: Option<&str>,
+    cancel: &AtomicBool,
+) -> WorkResult {
+    WorkResult::UndoPrepared(
+        journal
+            .initialize()
+            .and_then(|()| tomas_commander::undo::prepare(scope, journal, id, key, cancel)),
+    )
+}
+
+/// Reads Operations rows. A cancel already set when the read starts targeted earlier work, so
+/// only a cancel raised during the read stops it.
+pub(super) fn history_work(
+    scope: &Scope,
+    journal: &tomas_commander::journal::Journal,
+    cancel: &AtomicBool,
+) -> WorkResult {
+    let idle = AtomicBool::new(false);
+    let cancel = if cancel.load(Ordering::Acquire) {
+        &idle
+    } else {
+        cancel
+    };
+    WorkResult::History(tomas_commander::undo::history(
+        scope,
+        journal,
+        tomas_commander::undo::HISTORY_LIMIT,
+        cancel,
+    ))
+}
+
+/// Queues one history read; requests coalesce while one is pending, so history reads never pile
+/// up ahead of user work on the serial file worker.
+pub(super) fn queue_history(work: &SyncSender<Work>, pending: &mut bool) -> Result<(), String> {
+    if *pending {
+        return Ok(());
+    }
+    work.try_send(Work::History)
+        .map_err(|error| format!("Operation history was not queued: {error}"))?;
+    *pending = true;
+    Ok(())
+}
+
 impl Ledger {
+    pub(super) fn request_history(&mut self) {
+        if let Err(error) = queue_history(&self.work, &mut self.history_pending) {
+            self.history = Some(Err(error));
+        }
+    }
+
     fn finish_operation(&mut self, outcome: Outcome, activity: RecentActivity) {
         self.operation_busy = false;
+        self.history = None;
         if let Err(error) = self.recent.record_many(
             outcome.created.iter().chain(&outcome.completed).cloned(),
             activity,
@@ -294,6 +391,9 @@ impl Ledger {
             self.navigate(index, self.panes[index].path.clone());
         }
         self.last_outcome = Some(outcome);
+        if self.operations_open {
+            self.request_history();
+        }
     }
 
     pub(super) fn prepare_archive(&mut self, request: tomas_commander::archive_changes::Request) {
@@ -520,6 +620,33 @@ impl Ledger {
                             self.approval_focus = true;
                         }
                         Err(error) => self.fail(error),
+                    }
+                }
+                WorkResult::UndoPrepared(result) => {
+                    self.operation_busy = false;
+                    if self.cancellation.load(Ordering::Acquire) {
+                        self.log("Undo planning cancelled; no effects.");
+                        continue;
+                    }
+                    match result {
+                        Ok(plan) => {
+                            self.change_plan = Some(Change::Undo(plan));
+                            self.approval_focus = true;
+                        }
+                        Err(error) => self.fail(error),
+                    }
+                }
+                WorkResult::History(result) => {
+                    self.history_pending = false;
+                    match result {
+                        // Cancelled for queued work; read again once the dialog needs it.
+                        Err(error) if error == tomas_commander::undo::HISTORY_CANCELLED => {
+                            self.history = None;
+                            if self.operations_open {
+                                self.request_history();
+                            }
+                        }
+                        result => self.history = Some(result),
                     }
                 }
                 WorkResult::ArchivePrepared(result) => {

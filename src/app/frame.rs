@@ -330,6 +330,7 @@ impl Ledger {
                     .clicked()
                 {
                     self.operations_open = true;
+                    self.request_history();
                 }
                 if self.operation_busy && ui.button("Cancel work").clicked() {
                     self.cancellation.store(true, Ordering::Relaxed);

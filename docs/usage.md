@@ -99,6 +99,44 @@ ZIP-to-ZIP transfers are unsupported.
 Saved places are available in the left rail and Alt+Up popup. Edit changes the
 display name; Delete removes only its bookmark.
 
+### Undo
+
+Ctrl+Shift+U or `/undo` prepares the inverse of the most recent operation that
+can still be undone and opens the standard review, for example **Undo Move: 3
+items back to D:\x**. Details lists every path, including each Recycle Bin
+restore. Enter confirms, Escape cancels; nothing is undone automatically.
+**Operations** lists recent operations with **Undo** or a short reason
+(*Undone*, *Not undoable: ZIP insert*, *Changed since: D:\x\a.txt*), so older
+operations can be undone too. If nothing can be undone, a short message names
+the latest operation and why.
+
+| Operation | Undo |
+|---|---|
+| Rename | Renames the same item back if the old name is free. |
+| New folder | Recycles the folder if it is still empty and the same folder. |
+| Copy | Recycles the items the copy created, if unchanged (in merged folders only the new items, never existing content), then restores replaced files from the Recycle Bin. |
+| Move, same drive | Moves each item back without replacing, recreates source folders the Move emptied and removed, then restores replaced files. |
+| Move across drives | Restores the originals from the Recycle Bin, then recycles the unchanged copies. A copy whose original was kept (for example on a USB drive) is recycled only while that original is still present and unchanged; otherwise undo is refused and the copy stays. |
+| Delete | Restores the items from the Recycle Bin. |
+| Create ZIP / extract ZIP | Recycles the created ZIP or the extracted top-level items, if unchanged. |
+
+ZIP insertion, moving members out of a ZIP and source Save are not undoable.
+Undo itself cannot be undone (there is no redo), and operations recorded by
+older versions are not undoable. Operations checks rows quickly (results still
+exist and are the same items); preparing also checks folder contents. Preparing
+refuses with the exact path: a changed result, an occupied original path, an
+item no longer in the Recycle Bin (emptied or restored), an ambiguous match or
+a kept original that is gone (*Original no longer present: E:\Photos; the copy
+is kept.*). Results on a drive without a Recycle Bin are never deleted, so their
+undo is refused.
+For a partly completed or cancelled operation, undo reverses only what
+completed; the review says so and Details lists what stays.
+A restore never overwrites: the item moves into a new staging folder beside its
+original location and is then renamed into place. If the original path became
+occupied, the item stays in the Recycle Bin or in staging and Operations shows
+where. Execution stops at the first change it finds; an undo that changed
+anything is not repeated, even after a restart.
+
 ### Recent activity
 
 Ctrl+Shift+H toggles the workspace rail open/closed, regardless of keyboard focus.

@@ -315,13 +315,7 @@ impl Ledger {
             });
             return;
         }
-        for (key, command) in [
-            (Key::C, Command::Copy),
-            (Key::M, Command::Move),
-            (Key::S, Command::Sort),
-            (Key::F, Command::Search),
-            (Key::D, Command::Recycle),
-        ] {
+        for (key, command) in FILE_PANE_CHORDS {
             if ctx.input_mut(|input| input.consume_key(chord, key)) {
                 self.dispatch(command);
                 return;
@@ -444,15 +438,28 @@ pub(super) fn consume_file_action(ctx: &egui::Context) -> Option<Command> {
         shift: true,
         ..Modifiers::NONE
     };
-    [
-        (Key::E, Command::Rename),
-        (Key::N, Command::NewFolder),
-        (Key::R, Command::Refresh),
-        (Key::P, Command::CreateZip),
-    ]
-    .into_iter()
-    .find_map(|(key, command)| consume_prompt_key(ctx, chord, key).then_some(command))
+    FILE_ACTION_CHORDS
+        .into_iter()
+        .find_map(|(key, command)| consume_prompt_key(ctx, chord, key).then_some(command))
 }
+
+/// Ctrl+Shift actions matched exactly (no Alt), shared by keyboard handling and its tests.
+pub(super) const FILE_ACTION_CHORDS: [(Key, Command); 5] = [
+    (Key::E, Command::Rename),
+    (Key::N, Command::NewFolder),
+    (Key::R, Command::Refresh),
+    (Key::P, Command::CreateZip),
+    (Key::U, Command::Undo),
+];
+
+/// Other Ctrl+Shift file-pane chords.
+pub(super) const FILE_PANE_CHORDS: [(Key, Command); 5] = [
+    (Key::C, Command::Copy),
+    (Key::M, Command::Move),
+    (Key::S, Command::Sort),
+    (Key::F, Command::Search),
+    (Key::D, Command::Recycle),
+];
 
 // egui 0.36 text editors expose ValuePattern but do not process SetValue.
 pub(crate) fn accessible_text_value(ctx: &egui::Context, id: Id, text: &mut String) -> bool {

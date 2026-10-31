@@ -86,6 +86,8 @@ impl Ledger {
             recent_roots_edit: String::new(),
             recent_config_pending: false,
             operations_open: false,
+            history: None,
+            history_pending: false,
             viewport_zoom: creation.egui_ctx.zoom_factor(),
             preferences_writable,
             save_pending: false,
@@ -383,9 +385,16 @@ fn spawn_file_worker(
                         Change::Name(plan) => {
                             (plan.execute(&worker_scope, &journal, true, &cancel), false)
                         }
+                        Change::Undo(plan) => {
+                            (plan.execute(&worker_scope, &journal, true, &cancel), false)
+                        }
                     };
                     WorkResult::Changed { outcome, editor }
                 }
+                Work::PrepareUndo { id, key } => {
+                    prepare_undo_work(&worker_scope, &journal, id, key.as_deref(), &cancel)
+                }
+                Work::History => history_work(&worker_scope, &journal, &cancel),
                 Work::PrepareArchive { id, request } => {
                     WorkResult::ArchivePrepared(journal.initialize().and_then(|()| {
                         tomas_commander::archive_changes::prepare(

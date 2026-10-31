@@ -754,3 +754,95 @@ fn cross_volume_review_details_show_the_strategy() {
         "{text}"
     );
 }
+
+#[test]
+fn operations_rows_offer_undo_only_when_undoable_and_show_short_reasons() {
+    use tomas_commander::undo::{Entry, Status};
+    let entry = |key: &str, label: &str, status: Status| Entry {
+        key: key.into(),
+        label: label.into(),
+        age: Some(Duration::from_secs(120)),
+        status,
+    };
+    let entries = vec![
+        entry("4-1-0", "Move: 3 items to D:\\x", Status::Undoable),
+        entry(
+            "3-1-0",
+            "Copy into ZIP",
+            Status::Refused("Not undoable: ZIP insert".into()),
+        ),
+        entry("2-1-0", "Rename: a.txt to b.txt", Status::Undone),
+        entry(
+            "1-1-0",
+            "Copy: 1 item to D:\\x",
+            Status::Refused("Changed since: D:\\x\\a.txt".into()),
+        ),
+    ];
+    let ctx = egui::Context::default();
+    ctx.enable_accesskit();
+    let frame = |events: Vec<egui::Event>, enabled: bool| {
+        let mut chosen = None;
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                events,
+                ..Default::default()
+            },
+            |ui| chosen = history_rows(ui, &entries, enabled),
+        );
+        output.textures_delta.clear();
+        let texts: Vec<String> = output
+            .shapes
+            .iter()
+            .filter_map(|shape| {
+                if let egui::Shape::Text(text) = &shape.shape {
+                    Some(text.galley.job.text.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        (chosen, texts, output.platform_output)
+    };
+    let (chosen, texts, output) = frame(vec![], true);
+    assert!(chosen.is_none());
+    for expected in [
+        "Move: 3 items to D:\\x / 2 min ago",
+        "Not undoable: ZIP insert",
+        "Undone",
+        "Changed since: D:\\x\\a.txt",
+    ] {
+        assert!(
+            texts.iter().any(|text| text == expected),
+            "{expected:?} in {texts:?}"
+        );
+    }
+    assert_eq!(
+        texts.iter().filter(|text| *text == "Undo").count(),
+        1,
+        "{texts:?}"
+    );
+    let undo = output
+        .accesskit_update
+        .unwrap()
+        .nodes
+        .into_iter()
+        .find(|(_, node)| node.label() == Some("Undo"))
+        .unwrap()
+        .0;
+    let click = || {
+        vec![egui::Event::AccessKitActionRequest(
+            egui::accesskit::ActionRequest {
+                action: egui::accesskit::Action::Click,
+                target_tree: egui::accesskit::TreeId::ROOT,
+                target_node: undo,
+                data: None,
+            },
+        )]
+    };
+    assert_eq!(frame(click(), true).0.as_deref(), Some("4-1-0"));
+    assert_eq!(frame(click(), false).0, None, "Busy work disables Undo.");
+    let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+        assert!(history_rows(ui, &[], true).is_none());
+    });
+    output.textures_delta.clear();
+}

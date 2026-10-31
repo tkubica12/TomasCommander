@@ -97,3 +97,18 @@ fn palette_matching_is_offline_bounded_and_measured() {
             .any(|(_, name, _)| name.contains("nonexistent command"))
     );
 }
+
+#[test]
+fn undo_slash_command_takes_no_arguments() {
+    assert_eq!(
+        palette_submission("/undo", None).unwrap(),
+        (Command::Undo, String::new())
+    );
+    assert!(palette_matches("/und", Command::Undo, "Undo"));
+    assert!(!palette_matches(
+        "/und",
+        Command::Recycle,
+        "Delete selected items"
+    ));
+    assert!(palette_submission("/undo everything", Some(Command::Undo)).is_err());
+}

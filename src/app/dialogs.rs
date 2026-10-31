@@ -219,10 +219,15 @@ impl Ledger {
     fn operations_dialog(&mut self, ctx: &egui::Context) -> bool {
         if self.operations_open {
             let mut close = false;
+            let mut undo = None;
+            let can_undo = !self.operation_busy
+                && self.plan.is_none()
+                && self.change_plan.is_none()
+                && !self.reader.dirty();
             let modal = egui::Modal::new(Id::new("operations")).show(ctx, |ui| {
                 ui.set_width(620.0);
                 ui.heading("Operations");
-                ui.label("Exact results, errors and partial paths. No automatic undo.");
+                ui.label("Exact results, errors and partial paths. Undo prepares a reviewed plan; nothing is undone automatically.");
                 if let Some(outcome) = &self.last_outcome {
                     ui.label(format!("Operation #{}", outcome.id));
                     if let Some(summary) = outcome.summary() {
@@ -264,6 +269,17 @@ impl Ledger {
                 } else {
                     ui.label("No executed operation in this session.");
                 }
+                ui.separator();
+                ui.label(RichText::new("Recent operations").strong());
+                match &self.history {
+                    None => {
+                        ui.label("Reading the operation journal...");
+                    }
+                    Some(Err(error)) => {
+                        ui.colored_label(ui.visuals().error_fg_color, error);
+                    }
+                    Some(Ok(entries)) => undo = history_rows(ui, entries, can_undo),
+                }
                 egui::CollapsingHeader::new("Diagnostics / recent messages").show(ui, |ui| {
                     egui::ScrollArea::vertical()
                         .id_salt("operation-diagnostics")
@@ -278,6 +294,9 @@ impl Ledger {
             });
             if close || modal.should_close() {
                 self.operations_open = false;
+            } else if let Some(key) = undo {
+                self.operations_open = false;
+                self.prepare_undo(Some(key));
             }
             return true;
         }
@@ -591,10 +610,11 @@ impl Ledger {
         if let Some(plan) = &self.change_plan {
             let mut approve = false;
             let mut cancel = false;
+            let undo = matches!(plan, Change::Undo(_));
             let modal =
                 egui::Modal::new(Id::new(("source-change-approval", plan.id()))).show(ctx, |ui| {
                     ui.set_width(520.0);
-                    ui.heading(plan.label());
+                    ui.add(egui::Label::new(RichText::new(plan.heading()).heading()).wrap());
                     plan.show_summary(ui);
                     ui.separator();
                     (approve, cancel) =
@@ -603,14 +623,22 @@ impl Ledger {
             cancel |= modal.should_close();
             if cancel {
                 self.change_plan = None;
-                self.log("Source change cancelled; no source write.");
+                self.log(if undo {
+                    "Undo cancelled; no changes."
+                } else {
+                    "Source change cancelled; no source write."
+                });
             }
             if approve && let Some(plan) = self.change_plan.take() {
                 self.cancellation.store(false, Ordering::Relaxed);
                 match self.work.try_send(Work::Change(plan)) {
                     Ok(()) => {
                         self.operation_busy = true;
-                        self.log("Executing exactly approved source change...");
+                        self.log(if undo {
+                            "Executing exactly approved undo..."
+                        } else {
+                            "Executing exactly approved source change..."
+                        });
                     }
                     Err(error) => self.fail(format!("Source change was not queued: {error}")),
                 }
@@ -713,6 +741,50 @@ impl Ledger {
             }
         }
     }
+}
+
+/// Recent operations with Undo or the short reason it is unavailable; returns the chosen key.
+pub(super) fn history_rows(
+    ui: &mut egui::Ui,
+    entries: &[tomas_commander::undo::Entry],
+    enabled: bool,
+) -> Option<String> {
+    use tomas_commander::undo::Status;
+    if entries.is_empty() {
+        ui.label("No recorded operations.");
+        return None;
+    }
+    let mut chosen = None;
+    egui::ScrollArea::vertical()
+        .id_salt("operation-history")
+        .max_height(ROW_HEIGHT * 7.0)
+        .show(ui, |ui| {
+            for entry in entries {
+                // Wrapping keeps long paths readable without a fixed column width.
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(entry.title());
+                    match &entry.status {
+                        Status::Undoable => {
+                            if ui
+                                .add_enabled(enabled, egui::Button::new("Undo"))
+                                .on_hover_text("Prepare a reviewed inverse plan")
+                                .on_disabled_hover_text("Finish pending work first")
+                                .clicked()
+                            {
+                                chosen = Some(entry.key.clone());
+                            }
+                        }
+                        Status::Undone => {
+                            ui.label(RichText::new("Undone").weak());
+                        }
+                        Status::Refused(reason) => {
+                            ui.label(RichText::new(reason).weak());
+                        }
+                    }
+                });
+            }
+        });
+    chosen
 }
 
 pub(crate) fn confirmation_buttons(
