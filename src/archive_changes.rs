@@ -75,7 +75,11 @@ pub fn read_entry(
     Ok(result)
 }
 
-fn entry_bytes(bytes: &[u8], name: &str, cancel: impl Fn() -> bool) -> FileResult<Vec<u8>> {
+pub(crate) fn entry_bytes(
+    bytes: &[u8],
+    name: &str,
+    cancel: impl Fn() -> bool,
+) -> FileResult<Vec<u8>> {
     archives::validate_name(name)?;
     let mut archive =
         zip::ZipArchive::new(Cursor::new(bytes)).map_err(|error| format!("Read ZIP: {error}"))?;

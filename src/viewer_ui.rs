@@ -36,8 +36,11 @@ pub struct ReaderPanel {
     prefix: String,
     filter: String,
     archive_cursor: usize,
+    archive_anchor: usize,
+    archive_reveal_cursor: bool,
     archive_notice: Option<String>,
     markdown_cache: egui_commonmark::CommonMarkCache,
+    text_view: crate::text_preview_ui::TextView,
     inspected_link: Option<String>,
     quarter_turns: u8,
     pub edit_requested: bool,
@@ -47,6 +50,7 @@ pub struct ReaderPanel {
     close_prompt_focus: bool,
     virtual_entry: Option<String>,
     pub open_entry: Option<String>,
+    pub preview_entry: Option<String>,
     selected_archive: std::collections::BTreeSet<String>,
 }
 
@@ -111,8 +115,11 @@ impl ReaderPanel {
             prefix: String::new(),
             filter: String::new(),
             archive_cursor: 0,
+            archive_anchor: 0,
+            archive_reveal_cursor: false,
             archive_notice: None,
             markdown_cache: Default::default(),
+            text_view: Default::default(),
             inspected_link: None,
             quarter_turns: 0,
             edit_requested: false,
@@ -122,6 +129,7 @@ impl ReaderPanel {
             close_prompt_focus: false,
             virtual_entry: None,
             open_entry: None,
+            preview_entry: None,
             selected_archive: Default::default(),
         }
     }
@@ -188,13 +196,17 @@ impl ReaderPanel {
         self.prefix.clear();
         self.filter.clear();
         self.archive_cursor = 0;
+        self.archive_anchor = 0;
+        self.archive_reveal_cursor = false;
         self.archive_notice = None;
         self.markdown_cache = Default::default();
+        self.text_view = Default::default();
         self.inspected_link = None;
         self.quarter_turns = quarter_turns;
         self.close_prompt = false;
         self.selected_archive.clear();
         self.open_entry = None;
+        self.preview_entry = None;
         Ok(())
     }
 
@@ -248,7 +260,7 @@ impl ReaderPanel {
         (self.path.clone(), self.prefix.clone())
     }
     pub fn request_archive_preview(&mut self) {
-        self.archive_enter();
+        self.archive_preview();
     }
     pub fn is_virtual(&self) -> bool {
         self.virtual_entry.is_some()
@@ -263,6 +275,49 @@ impl ReaderPanel {
             .filter(|_| self.archive_cursor != 0)
             .map(|entry| vec![entry.path.clone()])
             .unwrap_or_default()
+    }
+
+    pub fn extraction_request(
+        &self,
+        destination: PathBuf,
+        all: bool,
+        move_entries: bool,
+    ) -> FileResult<tomas_commander::archive_changes::Request> {
+        let Some(Preview {
+            content: Content::Archive(inventory),
+            ..
+        }) = &self.preview
+        else {
+            return Err("Wait for the ZIP contents to load before extracting.".into());
+        };
+        let selected = if all {
+            inventory
+                .entries
+                .iter()
+                .map(|entry| entry.path.clone())
+                .collect()
+        } else {
+            self.archive_targets()
+        };
+        if selected.is_empty() {
+            return Err(if all {
+                "The ZIP is empty."
+            } else {
+                "Select a file or folder to extract, or use Extract all."
+            }
+            .into());
+        }
+        Ok(tomas_commander::archive_changes::Request::Extract {
+            archive: self.path.clone(),
+            prefix: if all {
+                String::new()
+            } else {
+                self.prefix.clone()
+            },
+            selected,
+            destination,
+            move_entries,
+        })
     }
 
     pub fn refresh_archive(&mut self) -> FileResult<()> {
@@ -354,6 +409,8 @@ impl ReaderPanel {
         self.filter.clear();
         self.selected_archive.clear();
         self.archive_cursor = 0;
+        self.archive_anchor = 0;
+        self.archive_reveal_cursor = false;
         self.offset = 0.0;
         false
     }
@@ -372,6 +429,8 @@ impl ReaderPanel {
                 self.filter.clear();
                 self.selected_archive.clear();
                 self.archive_cursor = 0;
+                self.archive_anchor = 0;
+                self.archive_reveal_cursor = false;
                 self.offset = 0.0;
                 self.archive_notice = None;
             } else {
@@ -379,6 +438,12 @@ impl ReaderPanel {
             }
         }
         false
+    }
+
+    fn archive_preview(&mut self) -> bool {
+        let close = self.archive_enter();
+        self.preview_entry = self.open_entry.take();
+        close
     }
 
     pub fn archive_keys(&mut self, context: &egui::Context) -> bool {
@@ -389,14 +454,45 @@ impl ReaderPanel {
                 .map(|entry| entry.path.clone())
                 .collect();
         }
-        for (key, down) in [(egui::Key::ArrowUp, false), (egui::Key::ArrowDown, true)] {
-            if context.input_mut(|input| input.consume_key(egui::Modifiers::CTRL, key)) {
-                self.archive_cursor = if down {
-                    (self.archive_cursor + 10).min(self.archive_rows().len())
+        for (key, modifiers, delta) in [
+            (egui::Key::ArrowUp, egui::Modifiers::CTRL, -10),
+            (egui::Key::ArrowDown, egui::Modifiers::CTRL, 10),
+            (egui::Key::PageUp, egui::Modifiers::NONE, -10),
+            (egui::Key::PageDown, egui::Modifiers::NONE, 10),
+            (egui::Key::ArrowUp, egui::Modifiers::NONE, -1),
+            (egui::Key::ArrowDown, egui::Modifiers::NONE, 1),
+        ] {
+            for extend in [true, false] {
+                let modifiers = if extend {
+                    modifiers | egui::Modifiers::SHIFT
                 } else {
-                    self.archive_cursor.saturating_sub(10)
+                    modifiers
                 };
-                self.offset = self.archive_cursor as f32 * 26.0;
+                if crate::app::consume_prompt_key(context, modifiers, key) {
+                    let next = self
+                        .archive_cursor
+                        .saturating_add_signed(delta)
+                        .min(self.archive_rows().len());
+                    self.move_archive_cursor(next, extend);
+                }
+            }
+        }
+        for (key, next) in [
+            (egui::Key::Home, 0),
+            (egui::Key::End, self.archive_rows().len()),
+        ] {
+            for extend in [true, false] {
+                if crate::app::consume_prompt_key(
+                    context,
+                    if extend {
+                        egui::Modifiers::SHIFT
+                    } else {
+                        egui::Modifiers::NONE
+                    },
+                    key,
+                ) {
+                    self.move_archive_cursor(next, extend);
+                }
             }
         }
         if context.input_mut(|input| input.consume_key(egui::Modifiers::CTRL, egui::Key::ArrowLeft))
@@ -415,16 +511,7 @@ impl ReaderPanel {
             }
         }
         if context.input_mut(|input| input.consume_key(egui::Modifiers::CTRL, egui::Key::Enter)) {
-            return self.archive_enter();
-        }
-        if context.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown))
-        {
-            self.archive_cursor = (self.archive_cursor + 1).min(self.archive_rows().len());
-            self.offset = self.archive_cursor as f32 * 26.0;
-        }
-        if context.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp)) {
-            self.archive_cursor = self.archive_cursor.saturating_sub(1);
-            self.offset = self.archive_cursor as f32 * 26.0;
+            return self.archive_preview();
         }
         if context.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Backspace))
         {
@@ -433,7 +520,57 @@ impl ReaderPanel {
         if context.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Enter)) {
             return self.archive_enter();
         }
+        if let Some(text) = crate::app::take_filter_text(context) {
+            self.filter.push_str(&text);
+            self.reset_archive_filter_cursor();
+            context.memory_mut(|memory| memory.request_focus(egui::Id::new("archive-filter")));
+        }
         false
+    }
+
+    pub fn archive_filter_keys(&mut self, context: &egui::Context) -> bool {
+        let id = egui::Id::new("archive-filter");
+        if !self.filter.is_empty()
+            && crate::app::consume_prompt_key(context, egui::Modifiers::NONE, egui::Key::Escape)
+        {
+            self.filter.clear();
+            self.reset_archive_filter_cursor();
+            return true;
+        }
+        if context.memory(|memory| memory.has_focus(id))
+            && crate::app::consume_prompt_key(context, egui::Modifiers::NONE, egui::Key::ArrowDown)
+        {
+            context.memory_mut(|memory| memory.surrender_focus(id));
+            self.move_archive_cursor(usize::from(!self.archive_rows().is_empty()), false);
+            return true;
+        }
+        false
+    }
+
+    fn reset_archive_filter_cursor(&mut self) {
+        self.archive_cursor = 0;
+        self.archive_anchor = 0;
+        self.archive_reveal_cursor = false;
+        self.offset = 0.0;
+    }
+
+    fn move_archive_cursor(&mut self, next: usize, extend: bool) {
+        if extend {
+            self.selected_archive = self
+                .archive_rows()
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| {
+                    (self.archive_anchor.min(next)..=self.archive_anchor.max(next))
+                        .contains(&(index + 1))
+                })
+                .map(|(_, entry)| entry.path.clone())
+                .collect();
+        } else {
+            self.archive_anchor = next;
+        }
+        self.archive_cursor = next;
+        self.archive_reveal_cursor = true;
     }
 
     pub fn close(&mut self) {
@@ -456,6 +593,7 @@ impl ReaderPanel {
         self.virtual_entry = None;
         self.selected_archive.clear();
         self.open_entry = None;
+        self.preview_entry = None;
     }
 
     pub fn scroll(&mut self, delta: f32) {
@@ -497,22 +635,61 @@ impl ReaderPanel {
     }
 
     pub fn show(&mut self, ui: &mut egui::Ui) -> bool {
+        self.show_inner(ui, None, &mut None)
+    }
+
+    pub fn show_archive(&mut self, ui: &mut egui::Ui, active: bool) -> (bool, Option<bool>) {
+        let mut extract = None;
+        let close = self.show_inner(ui, Some(active), &mut extract);
+        (close, extract)
+    }
+
+    fn show_inner(
+        &mut self,
+        ui: &mut egui::Ui,
+        archive_active: Option<bool>,
+        extract: &mut Option<bool>,
+    ) -> bool {
         let mut close = false;
         let mut page_delta = 0;
         let mut rotate = false;
+        let archive = self.is_archive();
+        let active = archive_active.unwrap_or(true);
         ui.horizontal(|ui| {
-            ui.heading(if self.is_archive() {
-                "ZIP / virtual folder"
+            ui.heading(if archive {
+                "ZIP"
             } else {
-                "Reading pane"
+                "Preview"
             });
+            if archive && archive_active.is_some() {
+                if ui.add_enabled(!self.archive_targets().is_empty(), egui::Button::new("Extract"))
+                    .on_hover_text("Extract selected items to the other pane / Ctrl Shift C").clicked() {
+                    *extract = Some(false);
+                }
+                if ui.add_enabled(matches!(&self.preview, Some(Preview { content: Content::Archive(inventory), .. }) if !inventory.entries.is_empty()), egui::Button::new("Extract all"))
+                    .on_hover_text("Extract the entire ZIP to the folder in the other pane").clicked() {
+                    *extract = Some(true);
+                }
+            }
             close = ui.button("Close").on_hover_text("Escape").clicked();
         });
-        ui.label(files::display_path(&self.path));
+        if archive {
+            ui.add(
+                egui::Label::new(format!(
+                    "{} /{}",
+                    files::display_path(&self.path),
+                    self.prefix
+                ))
+                .truncate(),
+            )
+            .on_hover_text(files::display_path(&self.path));
+        } else {
+            ui.add(egui::Label::new(files::display_path(&self.path)).truncate())
+                .on_hover_text(files::display_path(&self.path));
+        }
         if let Some(entry) = &self.virtual_entry {
             ui.label(format!("ZIP entry: {entry}"));
         }
-        ui.label("Original file-pane state retained / Tab switches focus");
         if self.close_prompt {
             let mut discard = false;
             let mut keep = false;
@@ -588,21 +765,19 @@ impl ReaderPanel {
             self.edit_requested |= ui.button("Edit").on_hover_text("Ctrl E").clicked();
         }
         if self.is_archive() && self.preview.is_some() {
-            ui.label(format!(
-                "{} selected / Space toggles / Ctrl A selects visible / Enter previews files",
-                self.selected_archive.len()
-            ));
-            ui.label(format!("Virtual folder: /{}", self.prefix));
-            ui.label("Filter / recursive filename search:");
             let id = egui::Id::new("archive-filter");
             let accessible_changed =
                 crate::app::accessible_text_value(ui.ctx(), id, &mut self.filter);
             let edited = ui
-                .add(egui::TextEdit::singleline(&mut self.filter).id(id))
+                .add(
+                    egui::TextEdit::singleline(&mut self.filter)
+                        .id(id)
+                        .hint_text("Filter ZIP...")
+                        .desired_width(f32::INFINITY),
+                )
                 .changed();
             if accessible_changed || edited {
-                self.archive_cursor = 0;
-                self.offset = 0.0;
+                self.reset_archive_filter_cursor();
             }
         }
         let Some(preview) = &self.preview else {
@@ -610,7 +785,10 @@ impl ReaderPanel {
             ui.label("Reading locally...");
             return close;
         };
-        ui.label(preview.notice);
+        if !archive {
+            ui.label(RichText::new("Read-only").small().weak())
+                .on_hover_text(preview.notice);
+        }
         if let Content::Pdf { page, count, .. } = &preview.content {
             ui.horizontal(|ui| {
                 ui.label(format!(
@@ -633,7 +811,27 @@ impl ReaderPanel {
         }
         match &preview.content {
             Content::Editable(_) => unreachable!("editor handled above"),
-            Content::Markdown { text, links } => {
+            Content::Markdown {
+                text,
+                links,
+                source,
+            } => {
+                self.text_view.markdown_tools(ui, source);
+                if self.text_view.source {
+                    self.text_view.code_tools(
+                        ui,
+                        source,
+                        None,
+                        tomas_commander::text_preview::Language::for_path(&preview.path),
+                    );
+                    self.text_view.show(
+                        ui,
+                        source,
+                        tomas_commander::text_preview::Language::for_path(&preview.path),
+                        &mut self.offset,
+                    );
+                    return close;
+                }
                 let area = egui::ScrollArea::both()
                     .id_salt("reader-markdown")
                     .vertical_scroll_offset(self.offset)
@@ -655,80 +853,252 @@ impl ReaderPanel {
             Content::Archive(_) => {
                 let rows: Vec<_> = self.archive_rows().into_iter().cloned().collect();
                 let mut chosen = None;
-                let area = egui::ScrollArea::both()
-                    .id_salt("archive-rows")
-                    .vertical_scroll_offset(self.offset)
-                    .show_rows(ui, 26.0, rows.len() + 1, |ui, range| {
-                        for index in range {
-                            let label = if index == 0 {
-                                if self.prefix.is_empty() {
-                                    ".. / exit ZIP".to_owned()
+                let row_height = crate::app::ROW_HEIGHT;
+                let height = ui.available_height() - row_height;
+                if self.archive_reveal_cursor {
+                    self.offset = crate::app::reveal_row(
+                        self.offset,
+                        self.archive_cursor,
+                        height.max(row_height),
+                    );
+                    self.archive_reveal_cursor = false;
+                }
+                let area = ui.scope(|ui| {
+                    ui.spacing_mut().item_spacing.y = 0.0;
+                    egui::ScrollArea::vertical()
+                        .id_salt("archive-rows")
+                        .auto_shrink([false, false])
+                        .vertical_scroll_offset(self.offset)
+                        .show_rows(ui, row_height, rows.len() + 1, |ui, range| {
+                            for index in range {
+                                let name = if index == 0 {
+                                    ".."
                                 } else {
-                                    ".. / parent".to_owned()
-                                }
-                            } else {
-                                let entry = &rows[index - 1];
-                                format!(
-                                    "{} {}{}",
-                                    if entry.directory { "[DIR]" } else { "[ZIP]" },
-                                    entry.path.strip_prefix(&self.prefix).unwrap_or(&entry.path),
-                                    if entry.directory {
-                                        String::new()
-                                    } else {
-                                        format!(" / {} B", entry.size)
-                                    }
-                                )
-                            };
-                            let selected =
-                                index != 0 && self.selected_archive.contains(&rows[index - 1].path);
-                            let response = ui.add(
-                                egui::Button::selectable(
-                                    self.archive_cursor == index || selected,
-                                    label,
-                                )
-                                .sense(if index == 0 {
-                                    egui::Sense::click()
-                                } else {
-                                    egui::Sense::click_and_drag()
-                                }),
-                            );
-                            if index != 0 && response.drag_started_by(egui::PointerButton::Primary)
-                            {
-                                let path = rows[index - 1].path.clone();
-                                let selected = if self.selected_archive.contains(&path) {
-                                    self.selected_archive.iter().cloned().collect()
-                                } else {
-                                    vec![path]
+                                    let entry = &rows[index - 1];
+                                    entry.path.strip_prefix(&self.prefix).unwrap_or(&entry.path)
                                 };
-                                egui::DragAndDrop::set_payload(
-                                    ui.ctx(),
-                                    crate::app::DragItems::Zip {
-                                        archive: self.path.clone(),
-                                        prefix: self.prefix.clone(),
-                                        selected,
+                                let selected = index != 0
+                                    && self.selected_archive.contains(&rows[index - 1].path);
+                                ui.push_id(
+                                    if index == 0 {
+                                        ".."
+                                    } else {
+                                        &rows[index - 1].path
+                                    },
+                                    |ui| {
+                                        let (rect, _) = ui.allocate_exact_size(
+                                            Vec2::new(ui.available_width(), row_height),
+                                            egui::Sense::hover(),
+                                        );
+                                        let row = egui::Rect::from_min_max(
+                                            egui::pos2(rect.left() + 30.0, rect.top()),
+                                            rect.max,
+                                        );
+                                        let response = ui.interact(
+                                            row,
+                                            ui.id().with("zip-row"),
+                                            if index == 0 {
+                                                egui::Sense::click()
+                                            } else {
+                                                egui::Sense::click_and_drag()
+                                            },
+                                        );
+                                        response.widget_info(|| {
+                                            egui::WidgetInfo::selected(
+                                                egui::WidgetType::Button,
+                                                ui.is_enabled(),
+                                                selected,
+                                                name,
+                                            )
+                                        });
+                                        crate::app::paint_file_row(
+                                            ui,
+                                            rect,
+                                            index,
+                                            self.archive_cursor == index,
+                                            selected,
+                                            active,
+                                            response.hovered(),
+                                        );
+                                        let mut checkbox_drag = false;
+                                        if index != 0 {
+                                            let mut checked = selected;
+                                            let checkbox = ui
+                                                .place(
+                                                    egui::Rect::from_center_size(
+                                                        egui::pos2(
+                                                            rect.left() + 16.0,
+                                                            rect.center().y,
+                                                        ),
+                                                        Vec2::splat(28.0),
+                                                    ),
+                                                    egui::Checkbox::without_text(&mut checked),
+                                                )
+                                                .interact(egui::Sense::click_and_drag())
+                                                .on_hover_text(format!("Select {name}"));
+                                            checkbox.widget_info(|| {
+                                                egui::WidgetInfo::selected(
+                                                    egui::WidgetType::Checkbox,
+                                                    ui.is_enabled(),
+                                                    checked,
+                                                    format!("Select {name}"),
+                                                )
+                                            });
+                                            if checkbox.changed() {
+                                                if checked {
+                                                    self.selected_archive
+                                                        .insert(rows[index - 1].path.clone());
+                                                } else {
+                                                    self.selected_archive
+                                                        .remove(&rows[index - 1].path);
+                                                }
+                                                self.archive_cursor = index;
+                                                self.archive_anchor = index;
+                                            }
+                                            checkbox_drag = checkbox
+                                                .drag_started_by(egui::PointerButton::Primary);
+                                        }
+                                        let directory = index == 0 || rows[index - 1].directory;
+                                        let painter = ui
+                                            .painter()
+                                            .with_clip_rect(rect.intersect(ui.clip_rect()));
+                                        painter.text(
+                                            egui::pos2(rect.left() + 32.0, rect.center().y),
+                                            egui::Align2::LEFT_CENTER,
+                                            if directory { "[/]" } else { "[.]" },
+                                            egui::FontId::monospace(10.0),
+                                            if directory {
+                                                ui.visuals().selection.stroke.color
+                                            } else {
+                                                ui.visuals().weak_text_color()
+                                            },
+                                        );
+                                        let size_width =
+                                            90.0_f32.min((rect.width() - 120.0).max(0.0));
+                                        let name_rect = egui::Rect::from_min_max(
+                                            egui::pos2(rect.left() + 56.0, rect.top()),
+                                            egui::pos2(
+                                                (rect.right() - size_width - 12.0)
+                                                    .max(rect.left() + 56.0),
+                                                rect.bottom(),
+                                            ),
+                                        );
+                                        ui.painter()
+                                            .with_clip_rect(name_rect.intersect(ui.clip_rect()))
+                                            .text(
+                                                name_rect.left_center(),
+                                                egui::Align2::LEFT_CENTER,
+                                                name,
+                                                crate::app::FILE_NAME_FONT,
+                                                ui.visuals().text_color(),
+                                            );
+                                        if size_width > 0.0 {
+                                            let size = if index == 0 {
+                                                "<UP>".into()
+                                            } else if directory {
+                                                "<DIR>".into()
+                                            } else {
+                                                crate::app::format_size(rows[index - 1].size)
+                                            };
+                                            painter.text(
+                                                egui::pos2(rect.right() - 10.0, rect.center().y),
+                                                egui::Align2::RIGHT_CENTER,
+                                                size,
+                                                egui::FontId::monospace(11.0),
+                                                ui.visuals().weak_text_color(),
+                                            );
+                                        }
+                                        if index != 0
+                                            && (response
+                                                .drag_started_by(egui::PointerButton::Primary)
+                                                || checkbox_drag)
+                                        {
+                                            let path = rows[index - 1].path.clone();
+                                            let selected = if self.selected_archive.contains(&path)
+                                            {
+                                                self.selected_archive.iter().cloned().collect()
+                                            } else {
+                                                vec![path]
+                                            };
+                                            egui::DragAndDrop::set_payload(
+                                                ui.ctx(),
+                                                crate::app::DragItems::Zip {
+                                                    archive: self.path.clone(),
+                                                    prefix: self.prefix.clone(),
+                                                    selected,
+                                                },
+                                            );
+                                            crate::app::remember_drag_reveal(ui.ctx());
+                                            self.archive_cursor = index;
+                                            self.archive_anchor = index;
+                                        }
+                                        if index != 0 && rows[index - 1].directory {
+                                            crate::app::register_drop_zone(
+                                                ui.ctx(),
+                                                response.rect.intersect(ui.clip_rect()),
+                                                crate::app::DropLocation::Zip {
+                                                    archive: self.path.clone(),
+                                                    prefix: format!("{}/", rows[index - 1].path),
+                                                },
+                                                2,
+                                            );
+                                        }
+                                        if response.clicked() || response.secondary_clicked() {
+                                            let modifiers = ui.input(|input| input.modifiers);
+                                            self.move_archive_cursor(index, modifiers.shift);
+                                            if index != 0 && modifiers.ctrl && response.clicked() {
+                                                let path = rows[index - 1].path.clone();
+                                                if !self.selected_archive.remove(&path) {
+                                                    self.selected_archive.insert(path);
+                                                }
+                                            }
+                                            response.request_focus();
+                                        }
+                                        if response.double_clicked() {
+                                            chosen = Some(index);
+                                        }
+                                        if index != 0 {
+                                            response.context_menu(|ui| {
+                                                if !rows[index - 1].directory
+                                                    && ui.button("Open / Enter").clicked()
+                                                {
+                                                    self.open_entry =
+                                                        Some(rows[index - 1].path.clone());
+                                                    ui.close();
+                                                }
+                                                if !rows[index - 1].directory
+                                                    && ui.button("Preview / Ctrl Enter").clicked()
+                                                {
+                                                    self.preview_entry =
+                                                        Some(rows[index - 1].path.clone());
+                                                    ui.close();
+                                                }
+                                                if ui.button("Extract").clicked() {
+                                                    if !self
+                                                        .selected_archive
+                                                        .contains(&rows[index - 1].path)
+                                                    {
+                                                        self.selected_archive.clear();
+                                                    }
+                                                    self.archive_cursor = index;
+                                                    *extract = Some(false);
+                                                    ui.close();
+                                                }
+                                            });
+                                        }
                                     },
                                 );
                             }
-                            if index != 0 && rows[index - 1].directory {
-                                crate::app::register_drop_zone(
-                                    ui.ctx(),
-                                    response.rect.intersect(ui.clip_rect()),
-                                    crate::app::DropLocation::Zip {
-                                        archive: self.path.clone(),
-                                        prefix: rows[index - 1].path.clone(),
-                                    },
-                                    2,
-                                );
-                            }
-                            if response.clicked() {
-                                chosen = Some(index);
-                            }
-                        }
-                    });
-                self.offset = area.state.offset.y;
+                        })
+                });
+                self.offset = area.inner.state.offset.y;
                 if let Some(index) = chosen {
                     self.archive_cursor = index;
-                    close |= self.archive_enter();
+                    close |= if ui.input(|input| input.modifiers.ctrl) {
+                        self.archive_preview()
+                    } else {
+                        self.archive_enter()
+                    };
                 }
                 if let Some(notice) = &self.archive_notice {
                     ui.colored_label(ui.visuals().error_fg_color, notice);
@@ -752,6 +1122,19 @@ impl ReaderPanel {
                         }
                     });
                 self.offset = area.state.offset.y;
+            }
+            Content::Code(code) => {
+                let text = self.text_view.code_tools(
+                    ui,
+                    &code.source,
+                    code.formatted.as_deref(),
+                    code.language,
+                );
+                if let Some(diagnostic) = &code.diagnostic {
+                    ui.colored_label(ui.visuals().error_fg_color, diagnostic);
+                }
+                self.text_view
+                    .show(ui, text, code.language, &mut self.offset);
             }
             Content::Table { rows, columns } => {
                 ui.label(format!("{} rows / {columns} columns", rows.len()));
@@ -994,11 +1377,10 @@ mod tests {
         std::fs::remove_dir(root).unwrap();
     }
 
-    #[test]
-    fn virtual_archive_navigation_filter_and_parent_never_become_filesystem_paths() {
+    fn archive_fixture() -> ReaderPanel {
         let (jobs, _requests) = mpsc::sync_channel(1);
         let (_sender, results) = mpsc::sync_channel(1);
-        let mut panel = ReaderPanel {
+        ReaderPanel {
             jobs,
             results,
             generation: Arc::new(AtomicU64::new(1)),
@@ -1035,8 +1417,11 @@ mod tests {
             prefix: String::new(),
             filter: String::new(),
             archive_cursor: 1,
+            archive_anchor: 1,
+            archive_reveal_cursor: false,
             archive_notice: None,
             markdown_cache: Default::default(),
+            text_view: Default::default(),
             inspected_link: None,
             quarter_turns: 0,
             edit_requested: false,
@@ -1046,8 +1431,490 @@ mod tests {
             recent_activity: None,
             virtual_entry: None,
             open_entry: None,
+            preview_entry: None,
             selected_archive: Default::default(),
+        }
+    }
+
+    fn archive_frame(
+        context: &egui::Context,
+        panel: &mut ReaderPanel,
+        events: Vec<egui::Event>,
+        time: f64,
+    ) -> (egui::FullOutput, Option<bool>) {
+        let mut extract = None;
+        let mut output = context.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    Vec2::new(640.0, 360.0),
+                )),
+                events,
+                time: Some(time),
+                ..Default::default()
+            },
+            |ui| {
+                assert!(!panel.archive_keys(context));
+                let (close, action) = panel.show_archive(ui, true);
+                assert!(!close);
+                extract = action;
+            },
+        );
+        output.textures_delta.clear();
+        (output, extract)
+    }
+
+    fn archive_text_position(output: &egui::FullOutput, label: &str) -> egui::Pos2 {
+        output
+            .shapes
+            .iter()
+            .find_map(|shape| {
+                if let egui::Shape::Text(text) = &shape.shape
+                    && text.galley.job.text == label
+                {
+                    Some(text.pos + text.galley.size() / 2.0)
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_else(|| panic!("Missing ZIP UI label {label}"))
+    }
+
+    fn archive_key(key: egui::Key, modifiers: egui::Modifiers) -> Vec<egui::Event> {
+        vec![
+            egui::Event::ModifiersChanged(modifiers),
+            egui::Event::Key {
+                key,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers,
+            },
+            egui::Event::Key {
+                key,
+                physical_key: None,
+                pressed: false,
+                repeat: false,
+                modifiers,
+            },
+        ]
+    }
+
+    #[test]
+    fn archive_has_compact_content_and_one_logical_cursor_with_separate_selection() {
+        let context = egui::Context::default();
+        let mut panel = archive_fixture();
+        panel.selected_archive.insert("root.txt".into());
+        let (output, _) = archive_frame(&context, &mut panel, vec![], 0.0);
+        let labels: Vec<_> = output
+            .shapes
+            .iter()
+            .filter_map(|shape| {
+                if let egui::Shape::Text(text) = &shape.shape {
+                    Some(text.galley.job.text.as_str())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        for unwanted in [
+            "Original file-pane",
+            "Space toggles",
+            "Virtual folder",
+            "CRC",
+            "TEST ONLY",
+            "[ZIP]",
+        ] {
+            assert!(
+                !labels.iter().any(|label| label.contains(unwanted)),
+                "{unwanted}"
+            );
+        }
+        assert!(labels.contains(&"Extract all"));
+        let row_rects: Vec<_> = output
+            .shapes
+            .iter()
+            .filter_map(|shape| {
+                if let egui::Shape::Rect(rect) = &shape.shape
+                    && (rect.rect.height() - crate::app::ROW_HEIGHT).abs() < 1.1
+                    && rect.rect.width() > 400.0
+                {
+                    Some(rect)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let outlines: Vec<_> = row_rects
+            .iter()
+            .filter(|rect| rect.stroke.width > 0.0)
+            .collect();
+        assert_eq!(outlines.len(), 1);
+        let directory = archive_text_position(&output, "Příliš");
+        assert!(outlines[0].rect.contains(directory));
+        let root = archive_text_position(&output, "root.txt");
+        let root_fill = row_rects
+            .iter()
+            .find(|rect| rect.rect.contains(root))
+            .unwrap()
+            .fill;
+        let directory_fill = row_rects
+            .iter()
+            .find(|rect| rect.stroke.width == 0.0 && rect.rect.contains(directory))
+            .unwrap()
+            .fill;
+        assert_ne!(root_fill, directory_fill);
+        for shape in &output.shapes {
+            if let egui::Shape::Text(text) = &shape.shape
+                && text.galley.job.text == "root.txt"
+            {
+                assert_eq!(
+                    text.galley.job.sections[0].format.font_id,
+                    crate::app::FILE_NAME_FONT
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn archive_single_click_focuses_and_double_click_previews_without_selecting() {
+        let context = egui::Context::default();
+        let mut panel = archive_fixture();
+        let (output, _) = archive_frame(&context, &mut panel, vec![], 0.0);
+        let pos = archive_text_position(&output, "root.txt");
+        for (time, pressed) in [(0.1, true), (0.12, false), (0.2, true), (0.22, false)] {
+            archive_frame(
+                &context,
+                &mut panel,
+                vec![
+                    egui::Event::PointerMoved(pos),
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+                time,
+            );
+            if time == 0.12 {
+                assert_eq!(panel.archive_cursor, 2);
+                assert!(panel.open_entry.is_none());
+            }
+        }
+        assert_eq!(panel.open_entry.as_deref(), Some("root.txt"));
+        assert!(panel.selected_archive.is_empty());
+    }
+
+    #[test]
+    fn archive_enter_opens_external_copy_but_ctrl_enter_requests_internal_preview() {
+        let context = egui::Context::default();
+        let mut panel = archive_fixture();
+        panel.archive_cursor = 2;
+        archive_frame(
+            &context,
+            &mut panel,
+            archive_key(egui::Key::Enter, egui::Modifiers::NONE),
+            0.0,
+        );
+        assert_eq!(panel.open_entry.take().as_deref(), Some("root.txt"));
+        assert!(panel.preview_entry.is_none());
+        archive_frame(
+            &context,
+            &mut panel,
+            archive_key(egui::Key::Enter, egui::Modifiers::CTRL),
+            0.1,
+        );
+        assert!(panel.open_entry.is_none());
+        assert_eq!(panel.preview_entry.take().as_deref(), Some("root.txt"));
+        panel.archive_cursor = 1;
+        archive_frame(
+            &context,
+            &mut panel,
+            archive_key(egui::Key::Enter, egui::Modifiers::NONE),
+            0.2,
+        );
+        assert_eq!(panel.prefix, "Příliš/");
+        assert!(panel.open_entry.is_none());
+    }
+
+    #[test]
+    fn archive_keyboard_keeps_nearby_rows_still_and_reveals_paged_cursor() {
+        let context = egui::Context::default();
+        let mut panel = archive_fixture();
+        if let Some(Preview {
+            content: Content::Archive(inventory),
+            ..
+        }) = &mut panel.preview
+        {
+            inventory.entries = (0..50)
+                .map(|index| tomas_commander::archives::ArchiveEntry {
+                    path: format!("file-{index:02}.txt"),
+                    directory: false,
+                    size: 7,
+                })
+                .collect();
+        }
+        archive_frame(&context, &mut panel, vec![], 0.0);
+        archive_frame(
+            &context,
+            &mut panel,
+            archive_key(egui::Key::ArrowDown, egui::Modifiers::NONE),
+            0.1,
+        );
+        assert_eq!(panel.archive_cursor, 2);
+        assert_eq!(panel.offset, 0.0);
+        archive_frame(
+            &context,
+            &mut panel,
+            archive_key(egui::Key::ArrowDown, egui::Modifiers::SHIFT),
+            0.2,
+        );
+        assert_eq!(panel.archive_cursor, 3);
+        assert_eq!(
+            panel.selected_archive.iter().cloned().collect::<Vec<_>>(),
+            ["file-01.txt", "file-02.txt"]
+        );
+        archive_frame(
+            &context,
+            &mut panel,
+            archive_key(egui::Key::PageDown, egui::Modifiers::NONE),
+            0.3,
+        );
+        assert_eq!(panel.archive_cursor, 13);
+        assert!(panel.offset > 0.0);
+        let (output, _) = archive_frame(
+            &context,
+            &mut panel,
+            archive_key(egui::Key::End, egui::Modifiers::NONE),
+            0.4,
+        );
+        assert_eq!(panel.archive_cursor, 50);
+        archive_text_position(&output, "file-49.txt");
+        archive_frame(
+            &context,
+            &mut panel,
+            archive_key(egui::Key::PageUp, egui::Modifiers::NONE),
+            0.5,
+        );
+        assert_eq!(panel.archive_cursor, 40);
+        archive_frame(
+            &context,
+            &mut panel,
+            archive_key(egui::Key::ArrowUp, egui::Modifiers::CTRL),
+            0.6,
+        );
+        assert_eq!(panel.archive_cursor, 30);
+        archive_frame(
+            &context,
+            &mut panel,
+            archive_key(egui::Key::Home, egui::Modifiers::NONE),
+            0.7,
+        );
+        assert_eq!(panel.archive_cursor, 0);
+        assert_eq!(panel.offset, 0.0);
+    }
+
+    #[test]
+    fn archive_extract_buttons_bind_selection_or_entire_archive_to_the_destination() {
+        use tomas_commander::archive_changes::Request;
+        let context = egui::Context::default();
+        let mut panel = archive_fixture();
+        let destination = PathBuf::from(r"D:\other-pane");
+        for (button, all) in [("Extract", false), ("Extract all", true)] {
+            let (output, _) =
+                archive_frame(&context, &mut panel, vec![], if all { 1.0 } else { 0.0 });
+            let pos = archive_text_position(&output, button);
+            for (time, pressed) in [
+                (if all { 1.1 } else { 0.1 }, true),
+                (if all { 1.2 } else { 0.2 }, false),
+            ] {
+                let (_, action) = archive_frame(
+                    &context,
+                    &mut panel,
+                    vec![
+                        egui::Event::PointerMoved(pos),
+                        egui::Event::PointerButton {
+                            pos,
+                            button: egui::PointerButton::Primary,
+                            pressed,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ],
+                    time,
+                );
+                if !pressed {
+                    assert_eq!(action, Some(all));
+                }
+            }
+        }
+        panel.prefix = "Příliš/".into();
+        panel.filter = "file".into();
+        panel.archive_cursor = 1;
+        for all in [false, true] {
+            let request = panel
+                .extraction_request(destination.clone(), all, false)
+                .unwrap();
+            assert!(
+                matches!(request, Request::Extract { archive, prefix, selected, destination: target, move_entries: false }
+                if archive == std::path::Path::new("owned.zip") && target == destination
+                && prefix == if all { "" } else { "Příliš/" }
+                && selected == if all { vec!["Příliš", "Příliš/file.txt", "root.txt"] } else { vec!["Příliš/file.txt"] })
+            );
+        }
+        panel.archive_cursor = 0;
+        assert!(
+            panel
+                .extraction_request(destination.clone(), false, false)
+                .is_err()
+        );
+        panel.preview = None;
+        assert!(panel.extraction_request(destination, true, false).is_err());
+    }
+
+    #[test]
+    fn archive_checkbox_drag_preserves_the_selected_virtual_group() {
+        let context = egui::Context::default();
+        let mut panel = archive_fixture();
+        panel.selected_archive = ["Příliš".into(), "root.txt".into()].into();
+        let (output, _) = archive_frame(&context, &mut panel, vec![], 0.0);
+        let name = archive_text_position(&output, "root.txt");
+        let pos = egui::pos2(16.0, name.y);
+        for (time, events) in [
+            (
+                0.1,
+                vec![
+                    egui::Event::PointerMoved(pos),
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            ),
+            (
+                0.2,
+                vec![egui::Event::PointerMoved(pos + Vec2::new(100.0, 40.0))],
+            ),
+        ] {
+            archive_frame(&context, &mut panel, events, time);
+        }
+        let payload = egui::DragAndDrop::payload::<crate::app::DragItems>(&context).unwrap();
+        assert!(
+            matches!(&*payload, crate::app::DragItems::Zip { archive, prefix, selected }
+            if archive == std::path::Path::new("owned.zip") && prefix.is_empty() && selected == &vec!["Příliš".to_owned(), "root.txt".to_owned()])
+        );
+        assert_eq!(panel.selected_archive.len(), 2);
+        assert!(panel.open_entry.is_none());
+    }
+
+    #[test]
+    fn archive_filter_typing_down_and_escape_match_file_panes() {
+        let context = egui::Context::default();
+        let mut panel = archive_fixture();
+        archive_frame(&context, &mut panel, vec![], 0.0);
+        archive_frame(
+            &context,
+            &mut panel,
+            vec![egui::Event::Text("prilis".into())],
+            0.1,
+        );
+        assert_eq!(panel.filter, "prilis");
+        assert_eq!(panel.archive_rows().len(), 2);
+        assert!(context.memory(|memory| memory.has_focus(egui::Id::new("archive-filter"))));
+        for (time, key) in [(0.2, egui::Key::ArrowDown), (0.3, egui::Key::Escape)] {
+            context
+                .run_ui(
+                    egui::RawInput {
+                        events: archive_key(key, egui::Modifiers::NONE),
+                        ..Default::default()
+                    },
+                    |_| assert!(panel.archive_filter_keys(&context)),
+                )
+                .textures_delta
+                .clear();
+            if time == 0.2 {
+                assert_eq!(panel.archive_cursor, 1);
+                assert!(
+                    !context.memory(|memory| memory.has_focus(egui::Id::new("archive-filter")))
+                );
+            }
+        }
+        assert!(panel.filter.is_empty());
+        assert_eq!(panel.archive_cursor, 0);
+        assert_eq!(panel.target, Some(0));
+    }
+
+    #[test]
+    fn extract_all_from_a_filtered_subfolder_prepares_a_guarded_complete_copy() {
+        use std::{
+            fs,
+            io::{Cursor, Write},
+            sync::atomic::AtomicBool,
         };
+        use tomas_commander::{archive_changes, journal::Journal};
+        let root = std::env::temp_dir().join(format!(
+            "tc-zip-ui-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&root).unwrap();
+        let archive = root.join("owned.zip");
+        let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        let options = zip::write::SimpleFileOptions::default();
+        writer.add_directory("Příliš/", options).unwrap();
+        writer.start_file("Příliš/file.txt", options).unwrap();
+        writer.write_all(b"nested content").unwrap();
+        writer.start_file("root.txt", options).unwrap();
+        writer.write_all(b"root content").unwrap();
+        let bytes = writer.finish().unwrap().into_inner();
+        fs::write(&archive, &bytes).unwrap();
+        let destination = root.join("other-pane");
+        fs::create_dir(&destination).unwrap();
+        let mut panel = archive_fixture();
+        panel.path = archive.clone();
+        panel.prefix = "Příliš/".into();
+        panel.filter = "file".into();
+        panel.selected_archive.insert("Příliš/file.txt".into());
+        let request = panel
+            .extraction_request(destination.clone(), true, false)
+            .unwrap();
+        let scope = Scope::fixture(&root).unwrap();
+        let cancel = AtomicBool::new(false);
+        let plan = archive_changes::prepare(&scope, 1, request, &cancel).unwrap();
+        assert!(!destination.join("root.txt").exists());
+        assert!(!destination.join("Příliš").exists());
+        let journal = Journal::new(root.join("journal"));
+        journal.initialize().unwrap();
+        assert!(
+            plan.execute(&scope, &journal, false, &cancel)
+                .error
+                .is_some()
+        );
+        assert!(!destination.join("root.txt").exists());
+        let outcome = plan.execute(&scope, &journal, true, &cancel);
+        assert!(outcome.error.is_none(), "{outcome:?}");
+        assert_eq!(
+            fs::read(destination.join("root.txt")).unwrap(),
+            b"root content"
+        );
+        assert_eq!(
+            fs::read(destination.join("Příliš").join("file.txt")).unwrap(),
+            b"nested content"
+        );
+        assert_eq!(fs::read(&archive).unwrap(), bytes);
+        let repeated = panel.extraction_request(destination, true, false).unwrap();
+        assert!(archive_changes::prepare(&scope, 2, repeated, &cancel).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn virtual_archive_navigation_filter_and_parent_never_become_filesystem_paths() {
+        let mut panel = archive_fixture();
         assert_eq!(panel.archive_rows().len(), 2);
         assert!(!panel.archive_enter());
         assert_eq!(panel.prefix, "Příliš/");
@@ -1112,8 +1979,11 @@ mod tests {
             prefix: String::new(),
             filter: String::new(),
             archive_cursor: 0,
+            archive_anchor: 0,
+            archive_reveal_cursor: false,
             archive_notice: None,
             markdown_cache: Default::default(),
+            text_view: Default::default(),
             inspected_link: None,
             quarter_turns: 0,
             edit_requested: false,
@@ -1123,6 +1993,7 @@ mod tests {
             recent_activity: None,
             virtual_entry: None,
             open_entry: None,
+            preview_entry: None,
             selected_archive: Default::default(),
         };
         sender.send((1, Err("stale failure".into()))).unwrap();
@@ -1161,8 +2032,11 @@ mod tests {
             prefix: String::new(),
             filter: String::new(),
             archive_cursor: 0,
+            archive_anchor: 0,
+            archive_reveal_cursor: false,
             archive_notice: None,
             markdown_cache: Default::default(),
+            text_view: Default::default(),
             inspected_link: None,
             quarter_turns: 0,
             edit_requested: false,
@@ -1172,6 +2046,7 @@ mod tests {
             recent_activity: None,
             virtual_entry: None,
             open_entry: None,
+            preview_entry: None,
             selected_archive: Default::default(),
         };
         for content in [
@@ -1185,6 +2060,7 @@ mod tests {
             Content::Markdown {
                 text: "# Heading\n\n- **item**\n\n| a | b |\n|---|---|\n| 1 | 2 |\n\n```rust\nlet value = 1;\n```\n\n[unsafe](javascript:alert)".into(),
                 links: vec!["javascript:alert".into()],
+                source: "# Heading".into(),
             },
             Content::Text(vec!["Příliš".into(), String::new()]),
             Content::Table {
@@ -1250,8 +2126,11 @@ mod tests {
             prefix: String::new(),
             filter: String::new(),
             archive_cursor: 0,
+            archive_anchor: 0,
+            archive_reveal_cursor: false,
             archive_notice: None,
             markdown_cache: Default::default(),
+            text_view: Default::default(),
             inspected_link: None,
             quarter_turns: 0,
             edit_requested: false,
@@ -1261,6 +2140,7 @@ mod tests {
             recent_activity: None,
             virtual_entry: None,
             open_entry: None,
+            preview_entry: None,
             selected_archive: Default::default(),
         };
         panel.step_pdf(-1).unwrap();

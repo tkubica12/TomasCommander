@@ -372,6 +372,63 @@ pub mod external_drag {
         }
 
         #[test]
+        fn zip_export_shell_data_contains_every_selected_real_member() {
+            use std::io::Write;
+            let _apartment = OleApartment::new().unwrap();
+            let root = std::env::temp_dir().join(format!(
+                "tc-zip-shell-{}",
+                crate::changes::identity().unwrap()
+            ));
+            std::fs::create_dir(&root).unwrap();
+            let archive = root.join("files.zip");
+            let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+            for name in ["nested/first.txt", "second.txt"] {
+                writer
+                    .start_file(name, zip::write::SimpleFileOptions::default())
+                    .unwrap();
+                writer.write_all(name.as_bytes()).unwrap();
+            }
+            std::fs::write(&archive, writer.finish().unwrap().into_inner()).unwrap();
+            let before = std::fs::read(&archive).unwrap();
+            let export = crate::archive_export::prepare(
+                &crate::files::Scope::fixture(&root).unwrap(),
+                &archive,
+                &["nested/first.txt".into(), "second.txt".into()],
+                &std::sync::atomic::AtomicBool::new(false),
+            )
+            .unwrap();
+            let data = data_object(&export.paths).unwrap();
+            let format = FORMATETC {
+                cfFormat: 15,
+                dwAspect: DVASPECT_CONTENT.0,
+                lindex: -1,
+                tymed: TYMED_HGLOBAL.0 as u32,
+                ..Default::default()
+            };
+            let mut medium = unsafe { data.GetData(&format) }.unwrap();
+            let hdrop = HDROP(unsafe { medium.u.hGlobal }.0);
+            assert_eq!(unsafe { DragQueryFileW(hdrop, u32::MAX, None) }, 2);
+            for (index, expected) in export.paths.iter().enumerate() {
+                let length = unsafe { DragQueryFileW(hdrop, index as u32, None) };
+                let mut value = vec![0; length as usize + 1];
+                unsafe { DragQueryFileW(hdrop, index as u32, Some(&mut value)) };
+                assert_eq!(
+                    std::fs::canonicalize(PathBuf::from(
+                        String::from_utf16(&value[..length as usize]).unwrap()
+                    ))
+                    .unwrap(),
+                    *expected
+                );
+            }
+            unsafe { ReleaseStgMedium(&mut medium) };
+            drop(data);
+            assert_eq!(std::fs::read(&archive).unwrap(), before);
+            export.cleanup().unwrap();
+            std::fs::remove_file(archive).unwrap();
+            std::fs::remove_dir(root).unwrap();
+        }
+
+        #[test]
         fn invalid_external_sources_are_explicit_errors() {
             let _apartment = OleApartment::new().unwrap();
             assert!(data_object(&[]).is_err());

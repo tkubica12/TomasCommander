@@ -2,6 +2,32 @@
 
 ## Unreleased
 
+## v0.6.0 - 2026-10-31
+
+ZIP workflows and developer-file previews for Windows x64.
+
+- ZIP Enter/double-click opens CRC-verified temporary copies in the default
+  Windows application; Ctrl+Enter retains the internal preview. External dragging
+  now accepts ZIP multi-selections and folder trees as Copy-only real Shell files.
+  Failed/cancelled exports are cleaned; successful handoffs have a seven-day
+  temporary-file lease and never update the source ZIP.
+- Ctrl+Shift+P, `/zip` and a context-sensitive bottom action create ZIPs from
+  selected files/folders or extract the focused ZIP/browsed members to the other
+  pane, retaining destination review and no-overwrite checks.
+- Native code/config previews add theme-aware syntax colors, selectable source,
+  line numbers, wrapping and copying. JSON autoformat is view-only, with original
+  copying and readable parse errors. Markdown/HTML can switch to original source.
+
+- ZIP browsing uses compact headers without persistent tutorial/verification
+  text and the same row typography, cursor outline and selection tint as file
+  panes. Single-click focuses; double-click/Enter opens. Checkbox/range selection,
+  paging and minimal scrolling keep keyboard and mouse navigation consistent.
+- ZIP Extract and Extract all actions prepare extraction to the other pane,
+  retaining exact-plan confirmation and no-overwrite checks. Extract all ignores
+  the current ZIP subfolder/filter; the archive remains unchanged.
+
+Unsigned, unsupported and provided at your own risk.
+
 ## v0.5.0 - 2026-10-20
 
 Compact confirmations, improved file dragging and accent-insensitive search

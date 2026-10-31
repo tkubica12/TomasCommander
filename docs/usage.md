@@ -60,8 +60,10 @@ applications such as Teams or Explorer. External dragging offers Copy only:
 the source is never moved/deleted, even with Shift. The target decides whether
 it accepts the files; accepting a drop does not prove an upload completed.
 Once Windows takes over, Escape cancels; release and start a new drag to return
-to internal pane operations. Virtual ZIP members cannot be dragged externally,
-and ZIP-to-ZIP transfers are unsupported.
+to internal pane operations. ZIP members and multi-selections use the same
+external Copy-only drag after background extraction to verified temporary files.
+Alt can reveal the target under Commander for these ZIP drags too.
+ZIP-to-ZIP transfers are unsupported.
 
 Saved places are available in the left rail and Alt+Up popup. Edit changes the
 display name; Delete removes only its bookmark.
@@ -127,6 +129,18 @@ Unsupported table/list structures fail explicitly. PDF uses Windows.Data.Pdf.
 Images support JPEG/PNG/BMP, EXIF orientation, fit, zoom and quarter-turn rotation.
 Reads/decoding run off the UI thread with bounded sizes.
 
+Markdown/HTML previews switch between **Rendered** and **Source** and offer
+**Copy source**. Rendered Markdown retains headings, tables, task lists and
+copyable fenced code. Python, Rust, JSON, `.env` (including `.env.local`),
+configuration and script previews use local lexical syntax colors in both
+themes, selectable read-only text, optional line numbers and wrapping.
+**Copy** copies displayed text; select text and Ctrl+C to copy a part.
+JSON has a view-only **Autoformat** toggle and **Copy original**.
+Invalid JSON stays readable with its line/column error instead of a blank
+preview. No Python/config formatter runs: rewriting whitespace can change
+semantics. Formatting/copying a preview never saves changes or sends data to AI.
+These are quick readers, not a replacement for a full language-aware editor.
+
 Ctrl+E opens the original UTF-8 source, not a JSON-prettified/rendered copy.
 Ctrl+S prepares Save for explicit approval. BOM and LF/CRLF are preserved;
 mixed/legacy newlines, readonly files, external changes and invalid JSON fail.
@@ -137,13 +151,42 @@ editable. Failed writes can retain protected staging files: check Operations.
 
 Enter opens a ZIP as a virtual directory without extraction. Backspace moves
 up or exits at its root; a nonempty filter searches relative member names.
-Enter on a member previews bounded CRC-verified contents.
+One click focuses a row; double-click or Enter opens a directory, or extracts a
+CRC-verified temporary file and opens it with its Windows default application.
+Ctrl+Enter / Ctrl-double-click previews a member internally without extraction.
+ZIP rows use the same font, height, cursor
+outline and selection tint as file panes. Checkboxes, Space and Ctrl+click select
+items; Shift+arrows selects a range and Ctrl+A selects visible entries.
+PageUp/PageDown jump ten rows, like Ctrl+Up/Down. Home/End jumps to either end.
+Typing starts a filter; Down leaves the filter for the first match. Escape clears
+a nonempty filter before closing the ZIP.
 
-Copy/move can extract selected members or insert files from the other pane.
-Create ZIP is in Ask. Changes review physical/member paths and use staged
+**Extract** (also in a row's context menu) prepares extraction of selected
+members, or the current file/folder, to the folder in the other pane.
+**Extract all** prepares extraction of the entire ZIP, even when browsing a
+subfolder or filtering. Both show the destination in the existing confirmation
+before writing; neither removes or overwrites source files.
+
+**Ctrl+Shift+P**, the bottom **Create ZIP / Extract ZIP** box and `/zip` share
+one context-aware command. On regular selected files/folders it asks for a ZIP
+filename and writes to the other pane's folder. On a single ZIP it prepares
+extraction of the entire archive without first opening it. Inside ZIP it
+extracts selected/current members, or the entire archive on the parent row.
+The existing Extract all button always ignores the ZIP subfolder and filter.
+Copy/move can also extract selected members or insert files from the other pane.
+Changes review physical/member paths and use staged
 publication; move removes sources only after destination verification.
 No overwrite/merge, ZIP-to-ZIP transfer or virtual Recycle Bin operation.
 Only Store/Deflate; ZIP64, encrypted, split and unsafe/ambiguous archives fail.
+Temporary opening/dragging is Copy-only and never changes the source archive;
+edits saved by another app affect only its temporary copy. Successful handoffs
+stay under `%TEMP%\tomas-commander-export-*` for asynchronous consumers; the
+next Commander launch cleans managed copies older than seven days.
+Cancelled/failed/abandoned exports are cleaned immediately. Files inherit the
+archive's protected access permissions. Duplicate filenames selected from
+different ZIP folders are disambiguated with numbered suffixes; selected folder
+trees and empty directories are preserved. Temporary exports retain existing
+ZIP limits (32 MiB input/selected expanded bytes, 16 MiB per file).
 
 ## Settings and integrations
 

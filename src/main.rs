@@ -6,6 +6,7 @@ mod app;
 #[cfg(feature = "native-desktop-tests")]
 mod desktop_metrics;
 mod file_agent_ui;
+mod text_preview_ui;
 mod viewer_ui;
 
 use eframe::egui;

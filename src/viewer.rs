@@ -30,9 +30,11 @@ pub enum Content {
     Markdown {
         text: String,
         links: Vec<String>,
+        source: String,
     },
     Archive(crate::archives::Inventory),
     Text(Vec<String>),
+    Code(crate::text_preview::Code),
     Table {
         rows: Vec<Vec<String>>,
         columns: usize,
@@ -274,24 +276,28 @@ pub(crate) fn decode_snapshot(
                     "CSV / comma delimiter / quoted fields / read-only",
                 )
             }
-            "json" => {
-                let parsed: serde_json::Value =
-                    serde_json::from_str(text).map_err(|error| format!("Invalid JSON: {error}"))?;
-                let formatted = serde_json::to_string_pretty(&parsed)
-                    .map_err(|error| format!("Format JSON: {error}"))?;
-                (
-                    Content::Text(text_lines(&formatted)?),
-                    "Formatted JSON / read-only / original bytes unchanged",
-                )
-            }
             "md" | "markdown" => (
                 prepare_markdown(text, &cancelled)?,
                 "Native Markdown / read-only / document images omitted / links inspected locally, never automatically opened",
             ),
-            "html" | "htm" => (
-                prepare_markdown(&crate::html::markdown(text)?, &cancelled)?,
-                "Native semantic HTML / headings, emphasis, lists, tables, code / CSS layout, scripts, images and embedded content not activated",
-            ),
+            "html" | "htm" => {
+                let mut content = prepare_markdown(&crate::html::markdown(text)?, &cancelled)?;
+                if let Content::Markdown { source, .. } = &mut content {
+                    *source = text.to_owned();
+                }
+                (
+                    content,
+                    "Native semantic HTML / headings, emphasis, lists, tables, code / CSS layout, scripts, images and embedded content not activated",
+                )
+            }
+            _ if crate::text_preview::Language::for_path(&path)
+                != crate::text_preview::Language::Plain =>
+            {
+                (
+                    Content::Code(crate::text_preview::Code::new(&path, text)?),
+                    "Highlighted source / read-only / formatting never changes the original",
+                )
+            }
             _ => (
                 Content::Text(text_lines(text)?),
                 "UTF-8 text/source / read-only / no upload",
@@ -393,6 +399,7 @@ fn prepare_markdown(text: &str, cancelled: impl Fn() -> bool) -> FileResult<Cont
     Ok(Content::Markdown {
         text: rendered,
         links: links.into_iter().collect(),
+        source: text.to_owned(),
     })
 }
 
@@ -489,7 +496,8 @@ mod tests {
     #[test]
     fn markdown_is_bounded_and_removes_assets_while_intercepting_all_link_schemes() {
         let source = "# Příliš\n\n- one\n- **two**\n\n| a | b |\n|---|---|\n| 1 | 2 |\n\n```rust\nlet x = 1;\n```\n\n![private](file:///secret.env)\n![remote](https://example.org/image.png)\n[web](https://example.org) $[unsafe](javascript:alert)${}\n";
-        let Content::Markdown { text, links } = prepare_markdown(source, || false).unwrap() else {
+        let Content::Markdown { text, links, .. } = prepare_markdown(source, || false).unwrap()
+        else {
             panic!("Expected rendered Markdown");
         };
         assert!(text.contains("| a | b |") && text.contains("```rust"));
@@ -577,11 +585,17 @@ mod tests {
         fs::write(&json, "{\"name\":\"Příliš\"}").unwrap();
         assert!(matches!(
             load(&scope, &json, || false).unwrap().content,
-            Content::Text(_)
+            Content::Code(_)
         ));
         assert_eq!(fs::read_to_string(&json).unwrap(), "{\"name\":\"Příliš\"}");
         fs::write(&json, "{bad").unwrap();
-        assert!(load(&scope, &json, || false).is_err());
+        assert!(matches!(
+            load(&scope, &json, || false).unwrap().content,
+            Content::Code(crate::text_preview::Code {
+                diagnostic: Some(_),
+                ..
+            })
+        ));
         let csv = root.join("sample.csv");
         fs::write(&csv, "a,b\r\n\"x,y\",z").unwrap();
         let Content::Table { rows, columns } = load(&scope, &csv, || false).unwrap().content else {

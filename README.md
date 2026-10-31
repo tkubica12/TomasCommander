@@ -22,7 +22,7 @@ before the release cleanup.
 ## Download and run
 
 Download `tomas-commander.exe` from [GitHub Releases](https://github.com/tkubica12/TomasCommander/releases).
-The latest version is **v0.5.0**, an experimental Windows x64 release.
+The latest version is **v0.6.0**, an experimental Windows x64 release.
 No installer or Rust toolchain is needed to run the downloaded executable.
 The binary is unsigned; this project does not provide code-signing or support.
 
@@ -48,6 +48,8 @@ The binary is unsigned; this project does not provide code-signing or support.
   Settings separates Appearance, Recent activity and AI connections.
 - Native previews for Markdown, semantic HTML, PDF, JPEG/PNG/BMP, UTF-8
   text/config/source files, formatted JSON and comma-delimited CSV.
+  Code/config previews have syntax colors, selectable text, line numbers,
+  wrapping and one-click copying; Markdown switches between rendered and source.
 - Source editing with guarded Save; ZIP browsing, creation, insertion and
   extraction with reviewed operation plans.
 - Ask for AI prompts and slash commands, and Open with choices for VS Code, GitHub Copilot CLI and
@@ -55,7 +57,8 @@ The binary is unsigned; this project does not provide code-signing or support.
 - Light/dark mode, four accent choices, proportional UI zoom and internal
   drag-and-drop: Move by default, Ctrl for Copy.
 - Native Windows dragging of real files to external applications, offering Copy
-  only. Virtual ZIP members must be extracted first.
+  only. ZIP selections are automatically extracted to temporary copies for
+  external opening and dragging, including multiple files and folders.
 
 ## Keyboard essentials
 
@@ -75,6 +78,7 @@ The binary is unsigned; this project does not provide code-signing or support.
 | Ctrl+Shift+S | Cycle sorting: name A-Z / newest first / largest first |
 | Ctrl+Shift+C / Ctrl+Shift+M / Ctrl+Shift+D | Copy / move / Recycle Bin |
 | Ctrl+Shift+N / Ctrl+Shift+E / Ctrl+Shift+R | New folder / rename / refresh |
+| Ctrl+Shift+P | Create ZIP / extract ZIP by context |
 | Ctrl+plus / Ctrl+minus / Ctrl+wheel | Global UI zoom |
 | Ctrl+0 | Reset zoom |
 | ? / status-bar Help | Shortcut help |
@@ -103,6 +107,10 @@ Click a filename to focus it. A further slow click on the current filename
 starts in-place editing; Enter reviews the rename and Escape cancels.
 Rapid double-click opens normally; Ctrl-double-click previews and
 Shift-double-click opens the chooser.
+Inside a ZIP, Enter/double-click extracts a temporary file and opens its Windows
+default application; Ctrl+Enter/Ctrl-double-click stays in the internal preview.
+The bottom ZIP action creates an archive from selected files/folders, or extracts
+the selected ZIP/its browsed members to the other pane, with reviewed destinations.
 
 Preferences, saved-location names and appearance persist in
 `%LOCALAPPDATA%\TomasCommander\preferences.txt`.

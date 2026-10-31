@@ -1,6 +1,7 @@
 pub mod ai;
 pub mod answers;
 pub mod archive_changes;
+pub mod archive_export;
 pub mod archives;
 pub mod changes;
 pub mod commands;
@@ -16,6 +17,7 @@ pub mod platform;
 pub mod preferences;
 pub mod recent;
 pub mod search;
+pub mod text_preview;
 pub mod viewer;
 
 #[cfg(windows)]

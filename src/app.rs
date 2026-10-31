@@ -20,15 +20,15 @@ use tomas_commander::{
     search,
 };
 
-const ROW_HEIGHT: f32 = 29.0;
-const FILE_NAME_FONT: egui::FontId = egui::FontId {
+pub(super) const ROW_HEIGHT: f32 = 29.0;
+pub(super) const FILE_NAME_FONT: egui::FontId = egui::FontId {
     size: 12.0,
     family: egui::FontFamily::Monospace,
 };
 const SCROLL_GUTTER: f32 = 12.0;
 pub const MIN_WINDOW_SIZE: [f32; 2] = [880.0, 560.0];
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum DragItems {
     Files(Vec<PathBuf>),
     Zip {
@@ -59,9 +59,13 @@ impl DragItems {
 }
 
 fn start_file_drag(ctx: &egui::Context, paths: Vec<PathBuf>) {
+    remember_drag_reveal(ctx);
+    egui::DragAndDrop::set_payload(ctx, DragItems::Files(paths));
+}
+
+pub(crate) fn remember_drag_reveal(ctx: &egui::Context) {
     let reveal_target = ctx.input(|input| input.modifiers.alt);
     ctx.data_mut(|data| data.insert_temp(Id::new("file-drag-reveal-target"), reveal_target));
-    egui::DragAndDrop::set_payload(ctx, DragItems::Files(paths));
 }
 
 fn drag_reveal_requested(ctx: &egui::Context) -> bool {
@@ -117,7 +121,7 @@ pub(crate) fn register_drop_zone(
     }
 }
 
-fn reveal_row(offset: f32, position: usize, viewport_height: f32) -> f32 {
+pub(super) fn reveal_row(offset: f32, position: usize, viewport_height: f32) -> f32 {
     let top = position as f32 * ROW_HEIGHT;
     let bottom = top + ROW_HEIGHT;
     if top < offset {
@@ -138,6 +142,39 @@ fn tint(surface: Color32, accent: Color32, amount: u8) -> Color32 {
         blend(surface.g(), accent.g()),
         blend(surface.b(), accent.b()),
     )
+}
+
+pub(super) fn paint_file_row(
+    ui: &egui::Ui,
+    rect: egui::Rect,
+    position: usize,
+    focused: bool,
+    selected: bool,
+    active: bool,
+    hovered: bool,
+) {
+    let surface = ui.visuals().panel_fill;
+    let accent = ui.visuals().selection.stroke.color;
+    let fill = if selected {
+        tint(surface, accent, if focused && active { 40 } else { 28 })
+    } else if focused || hovered || position % 2 == 1 {
+        ui.visuals().faint_bg_color
+    } else {
+        surface
+    };
+    ui.painter().rect_filled(rect, 0.0, fill);
+    if focused {
+        ui.painter().rect_stroke(
+            rect.shrink(0.5),
+            0.0,
+            if active {
+                Stroke::new(1.0, accent)
+            } else {
+                ui.visuals().widgets.noninteractive.bg_stroke
+            },
+            egui::StrokeKind::Inside,
+        );
+    }
 }
 
 struct RowColumns {
@@ -547,6 +584,21 @@ enum Work {
         id: u64,
         request: tomas_commander::archive_changes::Request,
     },
+    PrepareExtraction {
+        id: u64,
+        archive: PathBuf,
+        destination: PathBuf,
+    },
+    OpenArchiveEntry {
+        archive: PathBuf,
+        entry: String,
+    },
+    ExportDrag {
+        id: u64,
+        archive: PathBuf,
+        selected: Vec<String>,
+        cancel: Arc<AtomicBool>,
+    },
     ResolveCommand {
         roots: [PathBuf; 2],
         intent: commands::Intent,
@@ -667,6 +719,11 @@ enum WorkResult {
         editor: bool,
     },
     ArchivePrepared(FileResult<tomas_commander::archive_changes::Plan>),
+    ArchiveOpened(FileResult<PathBuf>),
+    DragExported {
+        id: u64,
+        result: FileResult<tomas_commander::archive_export::Export>,
+    },
     #[cfg(feature = "native-desktop-tests")]
     DesktopRejections(FileResult<String>),
     CommandResolved(FileResult<commands::Resolution>),
@@ -1008,8 +1065,8 @@ const COMMANDS: [(Command, &str, &str); 41] = [
     (Command::Accent, "Cycle accent color", ""),
     (
         Command::CreateZip,
-        "Create ZIP from selected files / folders",
-        "",
+        "Create ZIP / extract ZIP by context",
+        "Ctrl Shift P",
     ),
     (
         Command::EditSource,
@@ -1053,6 +1110,7 @@ pub struct Ledger {
     reader: crate::viewer_ui::ReaderPanel,
     archive: crate::viewer_ui::ReaderPanel,
     zip_dialog: Option<ZipDialog>,
+    zip_drag: Option<ZipDrag>,
     change_plan: Option<Change>,
     ai: crate::ai_ui::AiPanel,
     file_agent: crate::file_agent_ui::FileAgentPanel,
@@ -1122,6 +1180,13 @@ pub struct Ledger {
     copy_modifiers: Modifiers,
     #[cfg(feature = "native-desktop-tests")]
     desktop_metrics: Option<crate::desktop_metrics::Metrics>,
+}
+
+struct ZipDrag {
+    id: u64,
+    items: DragItems,
+    cancel: Arc<AtomicBool>,
+    export: Option<tomas_commander::archive_export::Export>,
 }
 
 impl Ledger {
@@ -1314,6 +1379,14 @@ impl Ledger {
             move || recent_context.request_repaint(),
         );
         thread::spawn(move || {
+            if let Err(error) =
+                tomas_commander::archive_export::cleanup_expired(&worker_scope, SystemTime::now())
+            {
+                if results.send(WorkResult::Recovery(error)).is_err() {
+                    return;
+                }
+                context.request_repaint();
+            }
             let journal =
                 tomas_commander::journal::Journal::new(settings.with_extension("operations"));
             if let Err(error) = journal.pending().and_then(|pending| {
@@ -1368,6 +1441,64 @@ impl Ledger {
                             )
                         }))
                     }
+                    Work::PrepareExtraction {
+                        id,
+                        archive,
+                        destination,
+                    } => WorkResult::ArchivePrepared(journal.initialize().and_then(|()| {
+                        let inventory =
+                            tomas_commander::archives::inventory(&worker_scope, &archive, || {
+                                cancel.load(Ordering::Acquire)
+                            })?;
+                        tomas_commander::archive_changes::prepare(
+                            &worker_scope,
+                            id,
+                            tomas_commander::archive_changes::Request::Extract {
+                                archive,
+                                prefix: String::new(),
+                                selected: inventory
+                                    .entries
+                                    .into_iter()
+                                    .map(|entry| entry.path)
+                                    .collect(),
+                                destination,
+                                move_entries: false,
+                            },
+                            &cancel,
+                        )
+                    })),
+                    Work::OpenArchiveEntry { archive, entry } => {
+                        WorkResult::ArchiveOpened((|| {
+                            let exported = tomas_commander::archive_export::prepare(
+                                &worker_scope,
+                                &archive,
+                                &[entry],
+                                &AtomicBool::new(false),
+                            )?;
+                            if let Err(error) = platform::open_file(&exported.paths[0]) {
+                                return match exported.cleanup() {
+                                    Ok(()) => Err(error),
+                                    Err(cleanup) => Err(format!("{error}\n{cleanup}")),
+                                };
+                            }
+                            exported.retain();
+                            Ok(archive)
+                        })())
+                    }
+                    Work::ExportDrag {
+                        id,
+                        archive,
+                        selected,
+                        cancel,
+                    } => WorkResult::DragExported {
+                        id,
+                        result: tomas_commander::archive_export::prepare(
+                            &worker_scope,
+                            &archive,
+                            &selected,
+                            &cancel,
+                        ),
+                    },
                     #[cfg(feature = "native-desktop-tests")]
                     Work::DesktopRejections(root) => WorkResult::DesktopRejections(
                         tomas_commander::journal::Journal::desktop_rejection_probe(
@@ -1465,6 +1596,7 @@ impl Ledger {
             change_plan: None,
             archive: crate::viewer_ui::ReaderPanel::new(scope.clone(), creation.egui_ctx.clone()),
             zip_dialog: None,
+            zip_drag: None,
             ai: crate::ai_ui::AiPanel::new(),
             file_agent: crate::file_agent_ui::FileAgentPanel::new(),
             answers: crate::answers_ui::AnswerPanel::new(),
@@ -1692,13 +1824,45 @@ impl Ledger {
 
     fn finish_drag(&mut self, ctx: &egui::Context) {
         let Some(payload) = egui::DragAndDrop::payload::<DragItems>(ctx) else {
+            self.clear_zip_drag();
             ctx.data_mut(|data| data.remove::<bool>(Id::new("file-drag-reveal-target")));
             return;
         };
         #[cfg(windows)]
-        if self.drag_allowed()
-            && let DragItems::Files(paths) = &*payload
-        {
+        if self.drag_allowed() {
+            if let DragItems::Zip {
+                archive, selected, ..
+            } = &*payload
+                && self
+                    .zip_drag
+                    .as_ref()
+                    .is_none_or(|drag| drag.items != *payload)
+            {
+                self.clear_zip_drag();
+                let id = self.next_id;
+                self.next_id += 1;
+                let cancel = Arc::new(AtomicBool::new(false));
+                match self.work.try_send(Work::ExportDrag {
+                    id,
+                    archive: archive.clone(),
+                    selected: selected.clone(),
+                    cancel: cancel.clone(),
+                }) {
+                    Ok(()) => {
+                        self.zip_drag = Some(ZipDrag {
+                            id,
+                            items: (*payload).clone(),
+                            cancel,
+                            export: None,
+                        })
+                    }
+                    Err(error) => {
+                        egui::DragAndDrop::clear_payload(ctx);
+                        self.fail(format!("Could not prepare external ZIP drag: {error}"));
+                        return;
+                    }
+                }
+            }
             let reveal_target = drag_reveal_requested(ctx);
             let external = if reveal_target {
                 Ok(true)
@@ -1707,21 +1871,43 @@ impl Ledger {
             };
             match external {
                 Ok(true) => {
+                    let paths = match &*payload {
+                        DragItems::Files(paths) => paths
+                            .iter()
+                            .map(|path| self.scope.resolve(path))
+                            .collect::<FileResult<Vec<_>>>(),
+                        DragItems::Zip { .. } => {
+                            let Some(export) =
+                                self.zip_drag.as_ref().and_then(|drag| drag.export.as_ref())
+                            else {
+                                ctx.set_cursor_icon(egui::CursorIcon::Progress);
+                                ctx.request_repaint_after(Duration::from_millis(16));
+                                return;
+                            };
+                            Ok(export.paths.clone())
+                        }
+                    };
                     egui::DragAndDrop::clear_payload(ctx);
                     ctx.data_mut(|data| data.remove::<bool>(Id::new("file-drag-reveal-target")));
-                    let sources = paths
-                        .iter()
-                        .map(|path| self.scope.resolve(path))
-                        .collect::<FileResult<Vec<_>>>();
-                    let result = sources.and_then(|paths| {
+                    let result = paths.and_then(|paths| {
                         platform::external_drag::copy_files(&paths, reveal_target)
                     });
                     ctx.input_mut(|input| input.pointer = Default::default());
                     ctx.request_repaint();
                     match result {
-                        Ok(true) => self.log("Files handed to the target application as Copy; source files unchanged."),
-                        Ok(false) => {},
-                        Err(error) => self.fail(error),
+                        Ok(true) => {
+                            if let Some(drag) = self.zip_drag.take()
+                                && let Some(export) = drag.export
+                            {
+                                export.retain();
+                            }
+                            self.log("Files handed to the target application as Copy; sources and ZIP unchanged.");
+                        }
+                        Ok(false) => self.clear_zip_drag(),
+                        Err(error) => {
+                            self.clear_zip_drag();
+                            self.fail(error);
+                        }
                     }
                     return;
                 }
@@ -1792,6 +1978,87 @@ impl Ledger {
                 }
                 self.prepare_drop((*payload).clone(), hover.location, copy);
             }
+        }
+    }
+
+    fn clear_zip_drag(&mut self) {
+        if let Some(drag) = self.zip_drag.take() {
+            drag.cancel.store(true, Ordering::Release);
+            if let Some(export) = drag.export
+                && let Err(error) = export.cleanup()
+            {
+                self.fail(error);
+            }
+        }
+    }
+
+    fn zip_extract_target(&self) -> Option<PathBuf> {
+        let targets = self.panes[self.active].targets();
+        if targets.len() == 1
+            && targets[0]
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("zip"))
+            && self.panes[self.active]
+                .entries
+                .iter()
+                .any(|entry| entry.path == targets[0] && !entry.directory && !entry.link)
+        {
+            Some(targets[0].clone())
+        } else {
+            None
+        }
+    }
+
+    fn zip_command(&mut self) {
+        if !self.file_actions_allowed() || self.panes.iter().any(|pane| pane.busy) {
+            self.fail("Finish pending work before a ZIP operation.");
+            return;
+        }
+        if self.archive.target == Some(self.active) {
+            match self.archive.extraction_request(
+                self.panes[1 - self.active].path.clone(),
+                self.archive.archive_targets().is_empty(),
+                false,
+            ) {
+                Ok(request) => self.prepare_archive(request),
+                Err(error) => self.fail(error),
+            }
+        } else if self.reader.target == Some(self.active) {
+            self.fail("Tab back to the file or ZIP pane before using the ZIP command.");
+        } else if let Some(archive) = self.zip_extract_target() {
+            self.cancellation.store(false, Ordering::Release);
+            match self.work.try_send(Work::PrepareExtraction {
+                id: self.next_id,
+                archive,
+                destination: self.panes[1 - self.active].path.clone(),
+            }) {
+                Ok(()) => {
+                    self.next_id += 1;
+                    self.operation_busy = true;
+                    self.log("Preparing ZIP extraction / no effects before approval.");
+                }
+                Err(error) => self.fail(format!("Could not queue ZIP extraction: {error}")),
+            }
+        } else {
+            let sources = self.panes[self.active].targets();
+            if sources.is_empty() {
+                self.fail("Select files or folders to archive.");
+                return;
+            }
+            let name = if sources.len() == 1 {
+                sources[0]
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("Archive")
+            } else {
+                "Archive"
+            };
+            self.zip_dialog = Some(ZipDialog {
+                name: format!("{name}.zip"),
+                sources,
+                destination: self.panes[1 - self.active].path.clone(),
+                focus: true,
+            });
         }
     }
 
@@ -1935,6 +2202,10 @@ impl Ledger {
             self.fail("Confirm or cancel the pending exact source change first.");
             return;
         }
+        if matches!(command, Command::CreateZip) {
+            self.zip_command();
+            return;
+        }
         if self.archive.is_archive() && matches!(command, Command::Copy | Command::Move) {
             if self.operation_busy || self.plan.is_some() || self.reader.dirty() {
                 self.fail("Finish pending work and Save/discard edits before a ZIP operation.");
@@ -1942,12 +2213,16 @@ impl Ledger {
             }
             let (archive, prefix) = self.archive.archive_location();
             let request = if self.archive.target == Some(self.active) {
-                tomas_commander::archive_changes::Request::Extract {
-                    archive,
-                    prefix,
-                    selected: self.archive.archive_targets(),
-                    destination: self.panes[1 - self.active].path.clone(),
-                    move_entries: matches!(command, Command::Move),
+                match self.archive.extraction_request(
+                    self.panes[1 - self.active].path.clone(),
+                    false,
+                    matches!(command, Command::Move),
+                ) {
+                    Ok(request) => request,
+                    Err(error) => {
+                        self.fail(error);
+                        return;
+                    }
                 }
             } else {
                 if self.reader.target == Some(self.active) {
@@ -2094,31 +2369,7 @@ impl Ledger {
                 self.log("Selection cleared.");
             }
             Command::ZoomIn | Command::ZoomOut | Command::ZoomReset => unreachable!(),
-            Command::CreateZip => {
-                if self.operation_busy
-                    || self.plan.is_some()
-                    || self.reader.dirty()
-                    || self.archive.is_archive()
-                {
-                    self.fail("Finish work and use a regular filesystem pane before creating ZIP.");
-                    return;
-                }
-                let sources = self.panes[self.active].targets();
-                if sources.is_empty() {
-                    self.fail("Select files or folders to archive.");
-                    return;
-                }
-                let name = sources[0]
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("Archive");
-                self.zip_dialog = Some(ZipDialog {
-                    name: format!("{name}.zip"),
-                    sources,
-                    destination: self.panes[1 - self.active].path.clone(),
-                    focus: true,
-                });
-            }
+            Command::CreateZip => unreachable!("contextual ZIP command handled above"),
             Command::EditSource => {
                 if self.operation_busy || self.plan.is_some() {
                     self.fail("Finish the pending operation before editing.");
@@ -2459,6 +2710,9 @@ impl Ledger {
             if memory.has_focus(Id::new("archive-filter")) {
                 return true;
             }
+            if memory.has_focus(Id::new("reader-source-preview")) {
+                return true;
+            }
             (0..2).any(|pane| {
                 memory.has_focus(Id::new(("path", pane)))
                     || memory.has_focus(Id::new(("filter", pane)))
@@ -2540,12 +2794,32 @@ impl Ledger {
             return;
         }
         if self.reader.target == Some(self.active) && self.rail_index.is_none() {
+            if consume_prompt_key(ctx, Modifiers::NONE, Key::Tab) {
+                self.active = 1 - self.active;
+                ctx.memory_mut(|memory| memory.surrender_focus(Id::new("reader-source-preview")));
+                self.file_focus_requested = true;
+                return;
+            }
+            if ctx.memory(|memory| memory.has_focus(Id::new("reader-source-preview")))
+                && consume_prompt_key(ctx, Modifiers::CTRL, Key::Enter)
+            {
+                self.reader.close();
+                self.active = self.reader.source;
+                self.file_focus_requested = true;
+                return;
+            }
             for (key, command) in [(Key::S, Command::SaveSource), (Key::E, Command::EditSource)] {
                 if ctx.input_mut(|input| input.consume_key(Modifiers::CTRL, key)) {
                     self.dispatch(command);
                     return;
                 }
             }
+        }
+        if self.archive.target == Some(self.active)
+            && self.rail_index.is_none()
+            && self.archive.archive_filter_keys(ctx)
+        {
+            return;
         }
         if self.archive.target == Some(self.active)
             && self.rail_index.is_none()
@@ -2632,6 +2906,10 @@ impl Ledger {
             }
             if ctx.input_mut(|input| input.consume_key(chord, Key::M)) {
                 self.dispatch(Command::Move);
+                return;
+            }
+            if consume_prompt_key(ctx, chord, Key::P) {
+                self.dispatch(Command::CreateZip);
                 return;
             }
             if ctx.input_mut(|input| input.consume_key(chord, Key::D)) {
@@ -2972,6 +3250,35 @@ impl Ledger {
         }
         while let Ok(result) = self.work_results.try_recv() {
             match result {
+                WorkResult::DragExported { id, result } => match result {
+                    Ok(export) => {
+                        if let Some(drag) = &mut self.zip_drag
+                            && drag.id == id
+                        {
+                            drag.export = Some(export);
+                        } else if let Err(error) = export.cleanup() {
+                            self.fail(error);
+                        }
+                    }
+                    Err(error) => {
+                        if self.zip_drag.as_ref().is_some_and(|drag| drag.id == id) {
+                            self.zip_drag = None;
+                            egui::DragAndDrop::clear_payload(ctx);
+                            self.fail(error);
+                        } else if error != "Temporary ZIP extraction cancelled." {
+                            self.fail(error);
+                        }
+                    }
+                },
+                WorkResult::ArchiveOpened(result) => match result {
+                    Ok(path) => {
+                        if let Err(error) = self.recent.record(path, RecentActivity::Opened) {
+                            self.fail(error);
+                        }
+                        self.log("Temporary ZIP copy opened; edits in the external app do not update the archive.");
+                    }
+                    Err(error) => self.fail(error),
+                },
                 WorkResult::CommandResolved(result) => {
                     self.operation_busy = false;
                     if let Some(dialog) = &mut self.command_dialog {
@@ -3171,13 +3478,29 @@ impl Ledger {
                 self.active = index;
                 self.rail_index = None;
             }
-            if self.archive.show(ui) {
+            let (close, extract) = self.archive.show_archive(ui, self.active == index);
+            if close {
                 self.archive.close();
                 if self.reader.is_virtual() {
                     self.reader.close();
                 }
                 self.active = index;
                 self.file_focus_requested = true;
+            }
+            if let Some(all) = extract {
+                self.active = index;
+                if !self.file_actions_allowed() || self.reader.dirty() {
+                    self.fail("Finish pending work and Save/discard edits before a ZIP operation.");
+                } else {
+                    match self.archive.extraction_request(
+                        self.panes[1 - index].path.clone(),
+                        all,
+                        false,
+                    ) {
+                        Ok(request) => self.prepare_archive(request),
+                        Err(error) => self.fail(error),
+                    }
+                }
             }
             let (archive, prefix) = self.archive.archive_location();
             if self.archive.is_archive() {
@@ -3226,7 +3549,6 @@ impl Ledger {
         }
         let accent = self.accent();
         let active = self.active == index;
-        let surface = ui.visuals().panel_fill;
         let muted = ui.visuals().weak_text_color();
         let stripe = ui.visuals().faint_bg_color;
         let border = ui.visuals().widgets.noninteractive.bg_stroke;
@@ -3593,26 +3915,7 @@ impl Ledger {
                                     }
                                 ));
                             });
-                            let fill = if selected {
-                                tint(surface, accent, if focused && active { 40 } else { 28 })
-                            } else if focused || response.hovered() || position % 2 == 1 {
-                                stripe
-                            } else {
-                                surface
-                            };
-                            ui.painter().rect_filled(rect, 0.0, fill);
-                            if focused {
-                                ui.painter().rect_stroke(
-                                    rect.shrink(0.5),
-                                    0.0,
-                                    if active {
-                                        Stroke::new(1.0, accent)
-                                    } else {
-                                        border
-                                    },
-                                    egui::StrokeKind::Inside,
-                                );
-                            }
+                            paint_file_row(ui, rect, position, focused, selected, active, response.hovered());
                             let mut checked = selected;
                             if !navigation {
                                 let checkbox = ui
@@ -5211,9 +5514,23 @@ impl eframe::App for Ledger {
         if std::mem::take(&mut self.reader.save_requested) {
             self.dispatch(Command::SaveSource);
         }
-        if let Some(entry) = self.archive.open_entry.take() {
+        if let Some(entry) = self.archive.preview_entry.take() {
             let (path, _) = self.archive.archive_location();
             if let Err(error) = self.reader.start_virtual(self.archive.source, path, entry) {
+                self.fail(error);
+            }
+        }
+        let allowed = self.file_actions_allowed();
+        if let Err(error) = queue_archive_open(&self.work, &mut self.archive, allowed) {
+            self.fail(error);
+        }
+        let allowed = self.file_actions_allowed();
+        if let Err(error) = queue_archive_open(&self.work, &mut self.reader, allowed) {
+            self.fail(error);
+        }
+        if let Some(entry) = self.reader.preview_entry.take() {
+            let (path, _) = self.reader.archive_location();
+            if let Err(error) = self.reader.start_virtual(self.reader.source, path, entry) {
                 self.fail(error);
             }
         }
@@ -5404,6 +5721,11 @@ impl eframe::App for Ledger {
             });
         });
         egui::Panel::bottom("actions").show(ui, |ui| {
+            let zip_label = if self.archive.target == Some(self.active) || self.zip_extract_target().is_some() {
+                "Extract ZIP"
+            } else {
+                "Create ZIP"
+            };
             ui.horizontal_wrapped(|ui| {
                 for (command, label, hint) in [
                     (Command::Copy, "Copy", "Ctrl Shift C"),
@@ -5413,6 +5735,7 @@ impl eframe::App for Ledger {
                     (Command::Search, "Search", "Ctrl Shift F"),
                     (Command::Rename, "Rename", "Ctrl Shift E"),
                     (Command::NewFolder, "New folder", "Ctrl Shift N"),
+                    (Command::CreateZip, zip_label, "Ctrl Shift P"),
                     (Command::OpenWith, "Open with", "Shift Enter"),
                 ] {
                     let response = action_button(ui, label, hint, !self.operation_busy && self.plan.is_none());
@@ -5756,6 +6079,7 @@ fn consume_file_action(ctx: &egui::Context) -> Option<Command> {
         (Key::E, Command::Rename),
         (Key::N, Command::NewFolder),
         (Key::R, Command::Refresh),
+        (Key::P, Command::CreateZip),
     ]
     .into_iter()
     .find_map(|(key, command)| consume_prompt_key(ctx, chord, key).then_some(command))
@@ -5786,7 +6110,7 @@ pub(crate) fn accessible_text_value(ctx: &egui::Context, id: Id, text: &mut Stri
     changed
 }
 
-fn format_size(bytes: u64) -> String {
+pub(super) fn format_size(bytes: u64) -> String {
     if bytes >= 1_000_000_000 {
         format!("{:.1} GB", bytes as f64 / 1e9)
     } else if bytes >= 1_000_000 {
@@ -6471,6 +6795,22 @@ pub(crate) fn action_button(
     .inner
 }
 
+fn queue_archive_open(
+    work: &SyncSender<Work>,
+    panel: &mut crate::viewer_ui::ReaderPanel,
+    allowed: bool,
+) -> FileResult<()> {
+    let Some(entry) = panel.open_entry.take() else {
+        return Ok(());
+    };
+    if !allowed {
+        return Err("Finish pending work before opening a ZIP member.".into());
+    }
+    let (archive, _) = panel.archive_location();
+    work.try_send(Work::OpenArchiveEntry { archive, entry })
+        .map_err(|error| format!("Could not queue ZIP member opening: {error}"))
+}
+
 fn leave_filter_with_down(ctx: &egui::Context, pane: usize) -> bool {
     let id = Id::new(("filter", pane));
     if !ctx.memory(|memory| memory.has_focus(id))
@@ -6501,7 +6841,7 @@ fn clear_filter_on_escape(ctx: &egui::Context, pane: &mut Pane, index: usize) ->
     true
 }
 
-fn take_filter_text(ctx: &egui::Context) -> Option<String> {
+pub(super) fn take_filter_text(ctx: &egui::Context) -> Option<String> {
     ctx.input_mut(|input| {
         if input.modifiers.mac_cmd
             || (input.modifiers.ctrl && !input.modifiers.alt)
@@ -6582,6 +6922,68 @@ fn format_modified(modified: Option<SystemTime>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn archive_open_queue_does_not_depend_on_an_internal_preview_request() {
+        for source in [0, 1] {
+            let mut panel =
+                crate::viewer_ui::ReaderPanel::new(Scope::unrestricted(), egui::Context::default());
+            let archive = std::env::temp_dir().join(format!(
+                "tc-queue-{}-{}.zip",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            panel.start(source, archive.clone()).unwrap();
+            let (work, jobs) = mpsc::sync_channel(1);
+            for preview in [None, Some("preview.json".to_owned())] {
+                panel.preview_entry = preview.clone();
+                panel.open_entry = Some("open.txt".into());
+                queue_archive_open(&work, &mut panel, true).unwrap();
+                assert!(matches!(
+                    jobs.try_recv().unwrap(),
+                    Work::OpenArchiveEntry { archive: path, entry }
+                        if path == archive && entry == "open.txt"
+                ));
+                assert!(panel.open_entry.is_none());
+                assert_eq!(panel.preview_entry, preview);
+            }
+            queue_archive_open(&work, &mut panel, false).unwrap();
+            assert!(jobs.try_recv().is_err());
+        }
+    }
+
+    #[test]
+    fn archive_open_queue_reports_blocked_and_full_queues_without_replaying_requests() {
+        let mut panel =
+            crate::viewer_ui::ReaderPanel::new(Scope::unrestricted(), egui::Context::default());
+        let (work, jobs) = mpsc::sync_channel(1);
+        panel.open_entry = Some("blocked.txt".into());
+        assert!(
+            queue_archive_open(&work, &mut panel, false)
+                .unwrap_err()
+                .contains("Finish pending work")
+        );
+        assert!(panel.open_entry.is_none());
+        assert!(jobs.try_recv().is_err());
+        panel.open_entry = Some("first.txt".into());
+        queue_archive_open(&work, &mut panel, true).unwrap();
+        panel.open_entry = Some("second.txt".into());
+        assert!(
+            queue_archive_open(&work, &mut panel, true)
+                .unwrap_err()
+                .contains("Could not queue ZIP member opening")
+        );
+        assert!(panel.open_entry.is_none());
+        assert!(matches!(
+            jobs.try_recv().unwrap(),
+            Work::OpenArchiveEntry { entry, .. } if entry == "first.txt"
+        ));
+        queue_archive_open(&work, &mut panel, true).unwrap();
+        assert!(jobs.try_recv().is_err());
+    }
 
     fn recent_item(name: &str, at_ms: u64) -> recent::Item {
         serde_json::from_value(serde_json::json!({
@@ -7541,6 +7943,7 @@ mod tests {
             (Key::E, Command::Rename, "Ctrl Shift E"),
             (Key::N, Command::NewFolder, "Ctrl Shift N"),
             (Key::R, Command::Refresh, "Ctrl Shift R"),
+            (Key::P, Command::CreateZip, "Ctrl Shift P"),
         ] {
             assert!(
                 COMMANDS
