@@ -8,7 +8,7 @@ not ship a browser, WebView, JavaScript runtime or localhost server.
 
 | Area | Implementation |
 |---|---|
-| Window, commands, pane state and interaction | `src\main.rs`, `src\app.rs` |
+| Window, commands, pane state and interaction | `src\main.rs`; `src\app.rs` (`Ledger` state) with `src\app\`: `setup.rs` (startup/workers), `frame.rs` (frame/panels), `pane.rs` + `pane_ui.rs`, `keyboard.rs`, `dispatch.rs`, `palette.rs`, `dialogs.rs`, `command_dialog.rs`, `search_dialog.rs`, `recent_rail.rs`, `drag.rs`, `work.rs` (jobs/polling), `theme.rs`; tests in `src\app\tests\` |
 | Files, snapshots and native adapters | `src\files.rs`, `src\platform.rs` |
 | Reviewed effects and durable receipts | `src\journal.rs`, `src\naming.rs`, `src\changes.rs`, `src\archive_changes.rs` |
 | Aggregate metadata/watch invalidation | `src\directory_cache.rs` |

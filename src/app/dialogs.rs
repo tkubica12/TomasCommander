@@ -1,0 +1,825 @@
+use super::*;
+
+pub(super) struct ZipDialog {
+    pub(super) sources: Vec<PathBuf>,
+    pub(super) destination: PathBuf,
+    pub(super) name: String,
+    pub(super) focus: bool,
+}
+pub(super) struct NameDialog {
+    pub(super) folder: PathBuf,
+    pub(super) source: Option<PathBuf>,
+    pub(super) name: String,
+    pub(super) focus: bool,
+    pub(super) error: Option<String>,
+    pub(super) inline: bool,
+    pub(super) pane: usize,
+}
+pub(super) struct OpenWith {
+    pub(super) folder: PathBuf,
+    pub(super) index: usize,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum SettingsTab {
+    Appearance,
+    Recent,
+    Connections,
+}
+
+impl Ledger {
+    pub(super) fn prepare_name_change(&mut self) {
+        let Some(dialog) = &mut self.name_dialog else {
+            return;
+        };
+        if let Err(error) = tomas_commander::naming::validate_name(&dialog.name) {
+            self.name_dialog = None;
+            self.fail(error);
+            return;
+        }
+        let dialog = self.name_dialog.take().expect("name dialog present");
+        self.cancellation.store(false, Ordering::Release);
+        match self.work.try_send(Work::PrepareName {
+            id: self.next_id,
+            folder: dialog.folder,
+            source: dialog.source,
+            name: dialog.name,
+        }) {
+            Ok(()) => {
+                self.next_id += 1;
+                self.operation_busy = true;
+                self.log("Preparing exact name change.");
+            }
+            Err(error) => self.fail(format!("Name change was not queued: {error}")),
+        }
+    }
+
+    pub(super) fn dialogs(&mut self, ctx: &egui::Context) {
+        // A modal returning true owns this frame; later dialogs are skipped.
+        if self.drive_picker_dialog(ctx)
+            || self.place_edit_dialog(ctx)
+            || self.settings_dialog(ctx)
+            || self.operations_dialog(ctx)
+            || self.open_with_dialog(ctx)
+        {
+            return;
+        }
+        if self
+            .name_dialog
+            .as_ref()
+            .is_some_and(|dialog| dialog.inline)
+        {
+            return;
+        }
+        if self.name_change_dialog(ctx) {
+            return;
+        }
+        self.zip_name_dialog(ctx);
+        if self.help_dialog(ctx) || self.saved_places_dialog(ctx) {
+            return;
+        }
+        self.command_dialog_ui(ctx);
+        self.search_dialog_ui(ctx);
+        if self.palette_ui(ctx) {
+            return;
+        }
+        self.change_approval_dialog(ctx);
+        self.plan_approval_dialog(ctx);
+        self.error_dialog(ctx);
+    }
+
+    fn drive_picker_dialog(&mut self, ctx: &egui::Context) -> bool {
+        if let Some(picker) = &mut self.drives_popup {
+            let pane = picker.pane;
+            let (selected, close) = picker.show(ctx);
+            if close || selected.is_some() {
+                self.drives_popup = None;
+                self.file_focus_requested = true;
+            }
+            if let Some(path) = selected {
+                self.active = pane;
+                self.navigate(pane, path);
+            }
+            return true;
+        }
+        false
+    }
+
+    fn place_edit_dialog(&mut self, ctx: &egui::Context) -> bool {
+        if let Some((path, name)) = &mut self.place_edit {
+            let mut save = false;
+            let mut cancel = false;
+            let modal = egui::Modal::new(Id::new("saved-place-name")).show(ctx, |ui| {
+                ui.heading("Saved place name");
+                ui.label(files::display_path(path));
+                let id = Id::new("saved-place-name-input");
+                accessible_text_value(ctx, id, name);
+                ui.add(egui::TextEdit::singleline(name).id(id));
+                if let Some(error) = &self.error {
+                    ui.colored_label(ui.visuals().error_fg_color, error);
+                }
+                (save, cancel) = confirmation_buttons(ui, "Save", &mut false);
+            });
+            if cancel || modal.should_close() {
+                self.place_edit = None;
+                self.error = None;
+            } else if save {
+                let (path, name) = self.place_edit.clone().expect("place edit present");
+                match self.preferences.name_favorite(path, name) {
+                    Ok(()) => {
+                        self.save_pending = true;
+                        self.place_edit = None;
+                        self.error = None;
+                    }
+                    Err(error) => self.fail(error),
+                }
+            }
+            return true;
+        }
+        false
+    }
+
+    fn settings_dialog(&mut self, ctx: &egui::Context) -> bool {
+        if self.settings_open {
+            let mut connection = false;
+            let mut close = false;
+            let modal = egui::Modal::new(Id::new("settings")).show(ctx, |ui| {
+                ui.set_width(660.0);
+                ui.heading("Settings");
+                ui.horizontal(|ui| {
+                    for (tab, label) in [(SettingsTab::Appearance, "Appearance"), (SettingsTab::Recent, "Recent activity"), (SettingsTab::Connections, "AI connections")] {
+                        ui.selectable_value(&mut self.settings_tab, tab, label);
+                    }
+                });
+                ui.separator();
+                egui::ScrollArea::vertical().id_salt("settings-content").max_height(360.0).show(ui, |ui| {
+                match self.settings_tab {
+                SettingsTab::Appearance => {
+                ui.heading("Appearance");
+                ui.label("Theme, accent and scale for the entire application.");
+                if ui.button(if self.preferences.dark { "Switch to light mode" } else { "Switch to dark mode" }).clicked() { self.dispatch(Command::Theme); }
+                if ui.button(format!("Accent: {}", ACCENTS[self.preferences.accent].0)).clicked() { self.dispatch(Command::Accent); }
+                ui.horizontal(|ui| {
+                    if ui.button("-").clicked() { self.dispatch(Command::ZoomOut); }
+                    ui.label(format!("UI zoom: {:.0}%", self.preferences.zoom * 100.0));
+                    if ui.button("+").clicked() { self.dispatch(Command::ZoomIn); }
+                    if ui.button("Reset").clicked() { self.dispatch(Command::ZoomReset); }
+                });
+                },
+                SettingsTab::Recent => {
+                    ui.heading("Recent activity");
+                    ui.label("Watch these document folders while Tomas Commander is running.");
+                    ui.label("One absolute path per line. Subfolders are included; an empty list disables external change tracking.");
+                    ui.add_enabled_ui(self.scope.root().is_none(), |ui| {
+                        let id = Id::new("recent-roots-input");
+                        accessible_text_value(ctx, id, &mut self.recent_roots_edit);
+                        ui.add(egui::TextEdit::multiline(&mut self.recent_roots_edit).id(id)
+                            .desired_rows(5).desired_width(f32::INFINITY).hint_text("D:\\\nC:\\Users\\you\\OneDrive"));
+                        if ui.button("Add active folder").clicked() {
+                            if !self.recent_roots_edit.is_empty() { self.recent_roots_edit.push('\n'); }
+                            self.recent_roots_edit.push_str(&files::display_path(&self.panes[self.active].path));
+                        }
+                        if ui.add_enabled(!self.recent_config_pending, egui::Button::new("Apply watched folders")).clicked() {
+                            let roots = self.recent_roots_edit.lines().map(str::trim).filter(|line| !line.is_empty()).map(PathBuf::from).collect();
+                            match self.recent.configure(roots) {
+                                Ok(()) => self.recent_config_pending = true,
+                                Err(error) => self.fail(error),
+                            }
+                        }
+                    });
+                    if self.recent_config_pending { ui.label("Validating and applying folders in the background..."); }
+                    if self.scope.root().is_some() { ui.label("Test mode: tracking is restricted to the fixture root."); }
+                    ui.label("Defaults: D: and detected personal/work OneDrive folders. Commander opens/views/saves are also recorded. Windows Recent is best effort, limited to these folders.");
+                    ui.label("100 files, newest activity first. Startup inspects up to 30 days of modification times, with a bounded scan. No content upload or background service.");
+                    for warning in &self.recent_snapshot.warnings { ui.colored_label(ui.visuals().warn_fg_color, warning); }
+                },
+                SettingsTab::Connections => {
+                ui.heading("AI connections");
+                connection = ui.button("Foundry connection / advanced pilot").clicked();
+                ui.label("Connection configuration and explicit pilot controls stay separate from everyday file work.");
+                },
+                }
+                });
+                if let Some(error) = &self.error { ui.colored_label(ui.visuals().error_fg_color, error); }
+                ui.separator();
+                close = ui.button("Close").on_hover_text("Escape").clicked();
+            });
+            if connection {
+                self.settings_open = false;
+                self.ai.open = true;
+            } else if close || modal.should_close() {
+                self.settings_open = false;
+            }
+            return true;
+        }
+        false
+    }
+
+    fn operations_dialog(&mut self, ctx: &egui::Context) -> bool {
+        if self.operations_open {
+            let mut close = false;
+            let modal = egui::Modal::new(Id::new("operations")).show(ctx, |ui| {
+                ui.set_width(620.0);
+                ui.heading("Operations");
+                ui.label("Exact results, errors and partial paths. No automatic undo.");
+                if let Some(outcome) = &self.last_outcome {
+                    ui.label(format!("Operation #{}", outcome.id));
+                    if let Some(error) = &outcome.error {
+                        ui.colored_label(ui.visuals().error_fg_color, error);
+                    }
+                    if outcome.cancelled {
+                        ui.label(
+                            "Cancelled / inspect any created or incomplete paths before retrying.",
+                        );
+                    }
+                    egui::ScrollArea::vertical()
+                        .id_salt("operation-paths")
+                        .max_height(170.0)
+                        .show(ui, |ui| {
+                            for (label, paths) in [
+                                ("CREATED", &outcome.created),
+                                ("COMPLETED", &outcome.completed),
+                                ("NOT COMPLETED", &outcome.incomplete),
+                            ] {
+                                for path in paths {
+                                    ui.label(format!("{label}: {}", files::display_path(path)));
+                                }
+                            }
+                        });
+                } else {
+                    ui.label("No executed operation in this session.");
+                }
+                egui::CollapsingHeader::new("Diagnostics / recent messages").show(ui, |ui| {
+                    egui::ScrollArea::vertical()
+                        .id_salt("operation-diagnostics")
+                        .max_height(200.0)
+                        .show(ui, |ui| {
+                            for message in &self.activity {
+                                ui.label(message);
+                            }
+                        });
+                });
+                close = ui.button("Close").on_hover_text("Escape").clicked();
+            });
+            if close || modal.should_close() {
+                self.operations_open = false;
+            }
+            return true;
+        }
+        false
+    }
+
+    fn open_with_dialog(&mut self, ctx: &egui::Context) -> bool {
+        if let Some(dialog) = &mut self.open_with {
+            let mut chosen = None;
+            let mut close = false;
+            let folder = dialog.folder.clone();
+            let modal = egui::Modal::new(Id::new("open-with")).show(ctx, |ui| {
+                ui.set_width(480.0);
+                ui.heading("Open with / Shift Enter");
+                ui.label(format!("Workspace: {}", files::display_path(&folder)));
+                if ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::ArrowUp)) {
+                    dialog.index = dialog.index.saturating_sub(1);
+                }
+                if ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::ArrowDown)) {
+                    dialog.index = (dialog.index + 1).min(2);
+                }
+                let enter = ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Enter));
+                for (index, label) in ["VS Code", "GitHub Copilot CLI", "GitHub Copilot App"]
+                    .iter()
+                    .enumerate()
+                {
+                    if ui
+                        .add(egui::Button::selectable(dialog.index == index, *label))
+                        .clicked()
+                        || (enter && dialog.index == index)
+                    {
+                        chosen = Some(index);
+                    }
+                }
+                close = ui.button("Cancel").on_hover_text("Escape").clicked();
+            });
+            if close || modal.should_close() {
+                self.open_with = None;
+            } else if let Some(index) = chosen {
+                let job = match index {
+                    0 => Work::Code(folder),
+                    1 => Work::Copilot {
+                        path: folder,
+                        app: false,
+                    },
+                    _ => Work::Copilot {
+                        path: folder,
+                        app: true,
+                    },
+                };
+                self.open_with = None;
+                if let Err(error) = self.work.try_send(job) {
+                    self.fail(format!("Open with was not queued: {error}"));
+                }
+            }
+            return true;
+        }
+        false
+    }
+
+    fn name_change_dialog(&mut self, ctx: &egui::Context) -> bool {
+        if let Some(dialog) = &mut self.name_dialog {
+            let mut prepare = false;
+            let mut close = false;
+            let modal = egui::Modal::new(Id::new("name-dialog")).show(ctx, |ui| {
+                ui.set_width(500.0);
+                ui.heading(if dialog.source.is_some() {
+                    "Rename"
+                } else {
+                    "New folder"
+                });
+                confirmation_path(ui, "Folder", &dialog.folder);
+                if let Some(source) = &dialog.source {
+                    confirmation_path(ui, "File", source);
+                }
+                let id = Id::new("name-input");
+                accessible_text_value(ui.ctx(), id, &mut dialog.name);
+                let response = ui.add(
+                    egui::TextEdit::singleline(&mut dialog.name)
+                        .id(id)
+                        .hint_text("One name, not a path")
+                        .desired_width(f32::INFINITY),
+                );
+                ui.ctx().accesskit_node_builder(id, |node| {
+                    node.set_label("New name");
+                    node.add_action(egui::accesskit::Action::SetValue);
+                });
+                if dialog.focus {
+                    response.request_focus();
+                    dialog.focus = false;
+                }
+                if let Some(error) = &dialog.error {
+                    ui.colored_label(ui.visuals().error_fg_color, error);
+                }
+                (prepare, close) = confirmation_buttons(
+                    ui,
+                    if dialog.source.is_some() {
+                        "Review"
+                    } else {
+                        "Create"
+                    },
+                    &mut false,
+                );
+            });
+            if close || modal.should_close() {
+                self.name_dialog = None;
+            } else if prepare {
+                if let Err(error) = tomas_commander::naming::validate_name(&dialog.name) {
+                    dialog.error = Some(error);
+                } else {
+                    self.prepare_name_change();
+                }
+            }
+            return true;
+        }
+        false
+    }
+
+    fn zip_name_dialog(&mut self, ctx: &egui::Context) {
+        if let Some(dialog) = &mut self.zip_dialog {
+            let mut prepare = false;
+            let mut close = false;
+            let modal = egui::Modal::new(Id::new("create-zip-name")).show(ctx, |ui| {
+                ui.set_width(600.0);
+                ui.heading("Create ZIP");
+                confirmation_path(ui, "Folder", &dialog.destination);
+                ui.label(format!("{} selected items", dialog.sources.len()));
+                let id = Id::new("zip-output-name");
+                accessible_text_value(ctx, id, &mut dialog.name);
+                let response = ui.add(egui::TextEdit::singleline(&mut dialog.name).id(id));
+                if dialog.focus {
+                    response.request_focus();
+                    dialog.focus = false;
+                }
+                (prepare, close) = confirmation_buttons(ui, "Review", &mut false);
+            });
+            close |= modal.should_close();
+            if close {
+                self.zip_dialog = None;
+            } else if prepare && let Some(dialog) = self.zip_dialog.take() {
+                if dialog.name.is_empty() || dialog.name.contains(['/', '\\', ':']) {
+                    self.fail("ZIP output must be one filename inside the displayed destination, not a path.");
+                } else {
+                    self.prepare_archive(tomas_commander::archive_changes::Request::Create {
+                        sources: dialog.sources,
+                        target: dialog.destination.join(dialog.name),
+                    });
+                }
+            }
+        }
+    }
+
+    fn help_dialog(&mut self, ctx: &egui::Context) -> bool {
+        if self.help_open {
+            let mut close = false;
+            let modal = egui::Modal::new(Id::new("keyboard-help")).show(ctx, |ui| {
+                ui.set_width(600.0);
+                ui.heading("Keyboard shortcuts");
+                ui.label("File shortcuts apply outside text editors. Escape closes dialogs.");
+                egui::ScrollArea::vertical()
+                    .max_height(400.0)
+                    .show(ui, |ui| {
+                        egui::Grid::new("help-shortcuts")
+                            .striped(true)
+                            .show(ui, |ui| {
+                                for (key, label) in [
+                                    ("Ctrl Space", "Ask / AI and slash commands"),
+                                    ("Tab", "Switch file pane"),
+                                    ("Type in file pane", "Filter immediately"),
+                                    ("Down from filter", "Focus first matching file"),
+                                    ("Palette Enter / Shift Enter", "Run / insert newline"),
+                                    ("Up / Down / Home / End", "Navigate rows"),
+                                    (
+                                        "Space / Shift arrows / Ctrl A",
+                                        "Toggle / range / select all",
+                                    ),
+                                    ("Enter", "Open file or folder"),
+                                    ("Ctrl Shift Left / Right", "Resize file panes"),
+                                ] {
+                                    ui.label(RichText::new(key).monospace());
+                                    ui.label(label);
+                                    ui.end_row();
+                                }
+                                for (_, label, key) in
+                                    COMMANDS.iter().filter(|(_, _, key)| !key.is_empty())
+                                {
+                                    ui.label(RichText::new(*key).monospace());
+                                    ui.label(*label);
+                                    ui.end_row();
+                                }
+                                ui.label(RichText::new("Ctrl Enter / Escape").monospace());
+                                ui.label("Approve exact plan / Cancel");
+                                ui.end_row();
+                            });
+                    });
+                close = ui.button("Close").on_hover_text("Escape").clicked();
+            });
+            if close || modal.should_close() {
+                self.help_open = false;
+                self.file_focus_requested = true;
+            }
+            return true;
+        }
+        false
+    }
+
+    fn saved_places_dialog(&mut self, ctx: &egui::Context) -> bool {
+        if let Some(mut index) = self.places_popup {
+            let mut selected = None;
+            let mut close = false;
+            let mut pin = false;
+            let mut remove = None;
+            let mut edit = None;
+            let can_pin =
+                self.reader.target != Some(self.active) && self.archive.target != Some(self.active);
+            let pinned = self
+                .preferences
+                .favorites
+                .contains(&self.panes[self.active].path);
+            let modal = egui::Modal::new(Id::new("saved-places")).show(ctx, |ui| {
+                ui.set_width(460.0);
+                ui.heading("Saved places");
+                if ui.input_mut(|input| input.consume_key(Modifiers::NONE, Key::ArrowUp)) {
+                    index = index.saturating_sub(1);
+                }
+                if ui.input_mut(|input| input.consume_key(Modifiers::NONE, Key::ArrowDown)) {
+                    index = index.saturating_add(1);
+                }
+                index = index.min(self.preferences.favorites.len());
+                if ui.input_mut(|input| input.consume_key(Modifiers::NONE, Key::Enter)) {
+                    if index == self.preferences.favorites.len() {
+                        pin = can_pin && !pinned;
+                    } else {
+                        selected = self.preferences.favorites.get(index).cloned();
+                    }
+                }
+                if self.preferences.favorites.is_empty() {
+                    ui.label("No saved places yet.");
+                }
+                egui::ScrollArea::vertical()
+                    .max_height(320.0)
+                    .show(ui, |ui| {
+                        for (row, path) in self.preferences.favorites.iter().enumerate() {
+                            let (response, rename, delete) = saved_place_row(
+                                ui,
+                                &self.preferences.favorite_name(path),
+                                path,
+                                row == index,
+                            );
+                            if rename {
+                                edit = Some((path.clone(), self.preferences.favorite_name(path)));
+                            }
+                            if delete {
+                                remove = Some(path.clone());
+                            }
+                            if response.clicked() {
+                                selected = Some(path.clone());
+                            }
+                            if row == index {
+                                response.scroll_to_me(None);
+                            }
+                        }
+                    });
+                ui.separator();
+                let response = ui.add_enabled(
+                    can_pin && !pinned,
+                    egui::Button::new(if pinned {
+                        "Current folder already saved"
+                    } else {
+                        "+ Add current folder"
+                    })
+                    .selected(index == self.preferences.favorites.len()),
+                );
+                pin |= response.clicked();
+                response.on_hover_text(files::display_path(&self.panes[self.active].path));
+                close = ui.button("Cancel").on_hover_text("Escape").clicked();
+            });
+            self.places_popup = Some(index);
+            if let Some(path) = remove {
+                self.preferences.remove_favorite(&path);
+                self.save_pending = true;
+                self.places_popup = Some(index.min(self.preferences.favorites.len()));
+            }
+            if edit.is_some() {
+                self.name_dialog = None;
+                self.inline_pending = None;
+                self.place_edit = edit;
+            }
+            if selected.is_some() || close || modal.should_close() {
+                self.places_popup = None;
+                self.file_focus_requested = true;
+            }
+            if let Some(path) = selected {
+                match self.scope.resolve(&path) {
+                    Ok(path) if path.is_dir() => self.navigate(self.active, path),
+                    Ok(_) => self.fail("Saved place is no longer a directory."),
+                    Err(error) => self.fail(error),
+                }
+            }
+            if pin {
+                self.places_popup = None;
+                self.dispatch(Command::Pin);
+                self.file_focus_requested = true;
+            }
+            return true;
+        }
+        false
+    }
+
+    fn change_approval_dialog(&mut self, ctx: &egui::Context) {
+        if let Some(plan) = &self.change_plan {
+            let mut approve = false;
+            let mut cancel = false;
+            let modal =
+                egui::Modal::new(Id::new(("source-change-approval", plan.id()))).show(ctx, |ui| {
+                    ui.set_width(520.0);
+                    ui.heading(plan.label());
+                    plan.show_summary(ui);
+                    ui.separator();
+                    (approve, cancel) =
+                        confirmation_buttons(ui, plan.confirm_label(), &mut self.approval_focus);
+                });
+            cancel |= modal.should_close();
+            if cancel {
+                self.change_plan = None;
+                self.log("Source change cancelled; no source write.");
+            }
+            if approve && let Some(plan) = self.change_plan.take() {
+                self.cancellation.store(false, Ordering::Relaxed);
+                match self.work.try_send(Work::Change(plan)) {
+                    Ok(()) => {
+                        self.operation_busy = true;
+                        self.log("Executing exactly approved source change...");
+                    }
+                    Err(error) => self.fail(format!("Source change was not queued: {error}")),
+                }
+            }
+        }
+    }
+
+    fn plan_approval_dialog(&mut self, ctx: &egui::Context) {
+        if let Some(plan) = &self.plan {
+            let mut approve = false;
+            let mut cancel = false;
+            let modal = egui::Modal::new(Id::new(("approval", plan.id()))).show(ctx, |ui| {
+                ui.set_width(520.0);
+                let count = plan.sources().len();
+                ui.heading(format!(
+                    "{} {count} {}",
+                    plan.operation().name(),
+                    if count == 1 { "item" } else { "items" }
+                ));
+                if let Some(destination) = plan.destination() {
+                    confirmation_path(ui, "To", destination);
+                } else {
+                    ui.label("To: Recycle Bin");
+                }
+                confirmation_sources(ui, plan.sources());
+                ui.label(match plan.operation() {
+                    Operation::Copy => "Sources are kept. No overwrite.",
+                    Operation::Move => "Sources are moved. No overwrite.",
+                    Operation::Recycle => {
+                        "Recoverable from the Recycle Bin. No permanent deletion."
+                    }
+                });
+                ui.separator();
+                (approve, cancel) =
+                    confirmation_buttons(ui, plan.operation().name(), &mut self.approval_focus);
+            });
+            cancel |= modal.should_close();
+            if cancel {
+                self.plan = None;
+                self.log("Plan cancelled. No filesystem changes.");
+                self.file_focus_requested = true;
+            }
+            if approve && let Some(plan) = self.plan.take() {
+                self.cancellation.store(false, Ordering::Relaxed);
+                match self.work.try_send(Work::Execute(plan)) {
+                    Ok(()) => {
+                        self.operation_busy = true;
+                        self.log("Executing approved plan...");
+                    }
+                    Err(error) => self.fail(format!("Operation was not queued: {error}")),
+                }
+            }
+        }
+    }
+
+    fn error_dialog(&mut self, ctx: &egui::Context) {
+        if let Some(error) = &self.error {
+            let mut dismiss = false;
+            let modal = egui::Modal::new(Id::new("error")).show(ctx, |ui| {
+                ui.set_width(620.0);
+                ui.heading("Error");
+                ui.label(error);
+                let button = ui.button("OK").on_hover_text("Enter / Escape");
+                button.request_focus();
+                dismiss = button.clicked() || consume_prompt_key(ctx, Modifiers::NONE, Key::Enter);
+            });
+            dismiss |= modal.should_close();
+            if dismiss {
+                self.error = None;
+            }
+        }
+    }
+}
+
+pub(crate) fn confirmation_buttons(
+    ui: &mut egui::Ui,
+    label: &str,
+    focus: &mut bool,
+) -> (bool, bool) {
+    let (mut enter, mut escape) = (false, false);
+    let mut key_event = false;
+    ui.input_mut(|input| {
+        input.events.retain(|event| {
+            if let egui::Event::Key {
+                key,
+                pressed: true,
+                repeat,
+                modifiers,
+                ..
+            } = event
+                && matches!(key, Key::Enter | Key::Escape)
+            {
+                key_event = true;
+                if modifiers.is_none() {
+                    enter |= *key == Key::Enter && !repeat;
+                    escape |= *key == Key::Escape;
+                }
+                false
+            } else {
+                true
+            }
+        });
+    });
+    ui.horizontal(|ui| {
+        let cancel = ui.button("Cancel").on_hover_text("Escape");
+        let confirm = ui.button(label).on_hover_text("Enter");
+        if *focus {
+            confirm.request_focus();
+            *focus = false;
+        }
+        // egui can synthesize button clicks before the key event is consumed here.
+        let cancel_chosen =
+            (cancel.clicked() && !key_event) || escape || (enter && cancel.has_focus());
+        (
+            !cancel_chosen && ((confirm.clicked() && !key_event) || (enter && !cancel.has_focus())),
+            cancel_chosen,
+        )
+    })
+    .inner
+}
+
+pub(super) fn confirmation_path(ui: &mut egui::Ui, label: &str, path: &std::path::Path) {
+    ui.horizontal_top(|ui| {
+        ui.label(RichText::new(format!("{label}:")).strong());
+        ui.add(
+            egui::Label::new(
+                RichText::new(files::display_path(path))
+                    .monospace()
+                    .size(12.0),
+            )
+            .wrap(),
+        );
+    });
+}
+
+fn confirmation_sources(ui: &mut egui::Ui, sources: &[PathBuf]) {
+    let parent = sources
+        .first()
+        .and_then(|path| path.parent())
+        .filter(|parent| sources.iter().all(|path| path.parent() == Some(*parent)));
+    if let Some(parent) = parent {
+        confirmation_path(ui, "From", parent);
+    }
+    egui::ScrollArea::vertical()
+        .id_salt("confirmation-sources")
+        .max_height(ROW_HEIGHT * 5.0)
+        .show(ui, |ui| {
+            for path in sources {
+                let name = if parent.is_some() {
+                    path.file_name().map(std::path::Path::new).unwrap_or(path)
+                } else {
+                    path
+                };
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(files::display_path(name))
+                            .monospace()
+                            .size(12.0),
+                    )
+                    .wrap(),
+                )
+                .on_hover_text(files::display_path(path));
+            }
+        });
+}
+
+pub(super) struct DrivePicker {
+    pub(super) pane: usize,
+    drives: Vec<PathBuf>,
+    pub(super) index: usize,
+}
+
+impl DrivePicker {
+    pub(super) fn new(pane: usize, drives: Vec<PathBuf>, current: &std::path::Path) -> Self {
+        let current = files::display_path(current);
+        let index = drives
+            .iter()
+            .position(|drive| files::display_path(drive).eq_ignore_ascii_case(&current))
+            .unwrap_or(0);
+        Self {
+            pane,
+            drives,
+            index,
+        }
+    }
+
+    pub(super) fn show(&mut self, ctx: &egui::Context) -> (Option<PathBuf>, bool) {
+        let mut selected = None;
+        let mut close = false;
+        let modal = egui::Modal::new(Id::new("choose-drive")).show(ctx, |ui| {
+            ui.set_width(320.0);
+            ui.heading("Choose drive");
+            if ui.input_mut(|input| input.consume_key(Modifiers::NONE, Key::ArrowUp)) {
+                self.index = self.index.saturating_sub(1);
+            }
+            if ui.input_mut(|input| input.consume_key(Modifiers::NONE, Key::ArrowDown)) {
+                self.index = (self.index + 1).min(self.drives.len().saturating_sub(1));
+            }
+            if ui.input_mut(|input| input.consume_key(Modifiers::NONE, Key::Enter)) {
+                selected = self.drives.get(self.index).cloned();
+            }
+            if self.drives.is_empty() {
+                ui.label("No Windows drives are available.");
+            }
+            egui::ScrollArea::vertical()
+                .max_height(320.0)
+                .show(ui, |ui| {
+                    for (index, drive) in self.drives.iter().enumerate() {
+                        let response = ui.add_sized(
+                            Vec2::new(ui.available_width(), 28.0),
+                            egui::Button::new(files::display_path(drive))
+                                .selected(index == self.index),
+                        );
+                        if response.clicked() {
+                            selected = Some(drive.clone());
+                        }
+                        if index == self.index {
+                            response.scroll_to_me(None);
+                        }
+                    }
+                });
+            ui.separator();
+            close = ui.button("Cancel").on_hover_text("Escape").clicked();
+        });
+        (selected, close || modal.should_close())
+    }
+}
