@@ -15,6 +15,7 @@ native-desktop-tests = ["native-answer-tests"]
 eframe = { version = "=0.36.2", default-features = false, features = ["accesskit", "default_fonts", "glow"] }
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.151"
+crc32fast = "=1.5.2"
 image = { version = "=0.25.10", default-features = false, features = ["jpeg", "png", "bmp"] }
 zip = { version = "=7.2.0", default-features = false, features = ["deflate-flate2"] }
 egui_commonmark = { version = "=0.25.0", default-features = false, features = ["pulldown_cmark"] }

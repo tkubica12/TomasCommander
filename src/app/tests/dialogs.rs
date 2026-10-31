@@ -267,13 +267,31 @@ impl ReviewFixture {
     }
 
     fn plan(&self, id: u64, sources: &[PathBuf], policy: ConflictPolicy) -> Plan {
-        files::plan_with_policy(
+        self.plan_with(
+            id,
+            sources,
+            Operation::Copy,
+            policy,
+            files::PlanOptions::default(),
+        )
+    }
+
+    fn plan_with(
+        &self,
+        id: u64,
+        sources: &[PathBuf],
+        operation: Operation,
+        policy: ConflictPolicy,
+        options: files::PlanOptions,
+    ) -> Plan {
+        files::plan_with_options(
             &self.scope,
             id,
-            Operation::Copy,
+            operation,
             sources,
             Some(&self.destination),
             policy,
+            options,
             &AtomicBool::new(false),
         )
         .unwrap()
@@ -581,4 +599,158 @@ fn conflict_policy_is_reachable_by_tab_and_arrows_without_stealing_enter() {
     let (action, _, _) = review_frame(&ctx, &plan, &mut review, &mut focus, key_tap(Key::Enter));
     assert_eq!(action, Some(ReviewAction::Approve));
     assert_eq!(review.policy, ConflictPolicy::Skip);
+}
+
+fn across(recycle_bin: bool) -> files::PlanOptions {
+    files::PlanOptions {
+        force_cross_volume: true,
+        recycle_bin: Some(recycle_bin),
+        ..Default::default()
+    }
+}
+
+const ACROSS_RECYCLE: &str = "Across drives: copy, verify, then send originals to the Recycle Bin";
+const ACROSS_KEEP: &str =
+    "Source drive has no Recycle Bin: files will be copied and verified, originals are kept";
+
+#[test]
+fn cross_volume_move_review_adds_one_strategy_line_and_keeps_the_move_label() {
+    let fixture = ReviewFixture::new("review-across");
+    let clean = &fixture.sources[1..];
+    for (id, recycle_bin, shown, hidden) in [
+        (1, true, ACROSS_RECYCLE, ACROSS_KEEP),
+        (2, false, ACROSS_KEEP, ACROSS_RECYCLE),
+    ] {
+        let plan = fixture.plan_with(
+            id,
+            clean,
+            Operation::Move,
+            ConflictPolicy::Skip,
+            across(recycle_bin),
+        );
+        assert_eq!(
+            plan.move_strategy(),
+            Some(files::MoveStrategy::CrossVolume {
+                recycle_originals: recycle_bin
+            })
+        );
+        let mut review = PlanReview::new(&plan);
+        let (action, text, _) = review_frame(
+            &egui::Context::default(),
+            &plan,
+            &mut review,
+            &mut true,
+            vec![],
+        );
+        assert!(action.is_none());
+        for expected in [
+            "Move 1 item",
+            "Sources are moved. No overwrite.",
+            shown,
+            "Details",
+        ] {
+            assert!(text.contains(expected), "{expected:?} missing in {text}");
+        }
+        assert!(!text.contains(hidden), "{text}");
+        assert!(text.lines().any(|line| line == "Move"), "{text}");
+        assert!(review.ready(&plan));
+    }
+
+    let replace = fixture.plan_with(
+        3,
+        &fixture.sources,
+        Operation::Move,
+        ConflictPolicy::ReplaceAll,
+        across(true),
+    );
+    let mut review = PlanReview::new(&replace);
+    let (_, text, _) = review_frame(
+        &egui::Context::default(),
+        &replace,
+        &mut review,
+        &mut true,
+        vec![],
+    );
+    for expected in [
+        "Sources are moved; emptied merged folders are removed.",
+        ACROSS_RECYCLE,
+        "Move + replace 1",
+        "1 replaced; originals go to the Recycle Bin",
+    ] {
+        assert!(text.contains(expected), "{expected:?} missing in {text}");
+    }
+
+    let same = fixture.plan_with(
+        4,
+        clean,
+        Operation::Move,
+        ConflictPolicy::Skip,
+        files::PlanOptions::default(),
+    );
+    assert_eq!(same.move_strategy(), Some(files::MoveStrategy::SameVolume));
+    let mut review = PlanReview::new(&same);
+    let (_, text, _) = review_frame(
+        &egui::Context::default(),
+        &same,
+        &mut review,
+        &mut true,
+        vec![],
+    );
+    assert!(text.contains("Sources are moved. No overwrite."), "{text}");
+    for absent in ["Across drives", "Recycle Bin", "Details"] {
+        assert!(!text.contains(absent), "{absent:?} in {text}");
+    }
+    assert_eq!(cross_volume_text(files::MoveStrategy::SameVolume), None);
+}
+
+#[test]
+fn cross_volume_review_details_show_the_strategy() {
+    let fixture = ReviewFixture::new("review-across-details");
+    let plan = fixture.plan_with(
+        1,
+        &fixture.sources[1..],
+        Operation::Move,
+        ConflictPolicy::Skip,
+        across(true),
+    );
+    let ctx = egui::Context::default();
+    ctx.enable_accesskit();
+    let mut review = PlanReview::new(&plan);
+    let mut focus = true;
+    let (_, text, output) = review_frame(&ctx, &plan, &mut review, &mut focus, vec![]);
+    assert!(
+        !text.contains("Strategy:"),
+        "Details start collapsed: {text}"
+    );
+    let details = output
+        .accesskit_update
+        .unwrap()
+        .nodes
+        .into_iter()
+        .find(|(_, node)| node.label() == Some("Details"))
+        .unwrap()
+        .0;
+    let click = egui::Event::AccessKitActionRequest(egui::accesskit::ActionRequest {
+        action: egui::accesskit::Action::Click,
+        target_tree: egui::accesskit::TreeId::ROOT,
+        target_node: details,
+        data: None,
+    });
+    let (action, _, _) = review_frame(&ctx, &plan, &mut review, &mut focus, vec![click]);
+    assert!(action.is_none(), "Opening Details never approves.");
+    let mut text = String::new();
+    for _ in 0..30 {
+        text = review_frame(&ctx, &plan, &mut review, &mut focus, vec![]).1;
+        if text.contains("Strategy:") {
+            break;
+        }
+    }
+    assert!(
+        text.contains("Strategy: across drives / copy each file, verify its CRC-32"),
+        "{text}"
+    );
+    assert!(
+        text.contains("then send the originals to the Recycle Bin"),
+        "{text}"
+    );
 }

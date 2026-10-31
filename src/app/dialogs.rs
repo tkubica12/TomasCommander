@@ -1,4 +1,5 @@
 use super::*;
+use tomas_commander::files::MoveStrategy;
 
 pub(super) struct ZipDialog {
     pub(super) sources: Vec<PathBuf>,
@@ -245,6 +246,14 @@ impl Ledger {
                                 ("REPLACED (original in Recycle Bin)", &outcome.replaced),
                                 ("MERGED", &outcome.merged),
                                 ("SKIPPED", &outcome.skipped),
+                                (
+                                    "RECYCLED (verified original in Recycle Bin)",
+                                    &outcome.recycled,
+                                ),
+                                (
+                                    "KEPT (original retained beside its verified copy)",
+                                    &outcome.kept,
+                                ),
                                 ("NOT COMPLETED", &outcome.incomplete),
                             ] {
                                 for path in paths {
@@ -858,19 +867,29 @@ pub(super) fn plan_review(
     }
     confirmation_sources(ui, plan.sources());
     let conflicts = plan.conflicts();
+    let across = plan
+        .move_strategy()
+        .filter(|strategy| strategy.cross_volume());
     let mut chosen = None;
     if conflicts.any() {
         ui.label(match plan.operation() {
             Operation::Move => "Sources are moved; emptied merged folders are removed.",
             _ => "Sources are kept.",
         });
-        chosen = conflict_section(ui, plan, &conflicts, review);
+        cross_volume_line(ui, across);
+        chosen = conflict_section(ui, plan, &conflicts, review, across);
     } else {
         ui.label(match plan.operation() {
             Operation::Copy => "Sources are kept. No overwrite.",
             Operation::Move => "Sources are moved. No overwrite.",
             Operation::Recycle => "Recoverable from the Recycle Bin. No permanent deletion.",
         });
+        cross_volume_line(ui, across);
+        if let Some(strategy) = across {
+            ui.collapsing("Details", |ui| {
+                ui.add(egui::Label::new(strategy.detail()).wrap());
+            });
+        }
     }
     ui.separator();
     let label = if conflicts.replace > 0 {
@@ -895,11 +914,33 @@ pub(super) fn plan_review(
     }
 }
 
+/// The one-line effect of a Move between drives, shown under the review summary.
+pub(super) fn cross_volume_text(strategy: MoveStrategy) -> Option<&'static str> {
+    match strategy {
+        MoveStrategy::SameVolume => None,
+        MoveStrategy::CrossVolume {
+            recycle_originals: true,
+        } => Some("Across drives: copy, verify, then send originals to the Recycle Bin"),
+        MoveStrategy::CrossVolume {
+            recycle_originals: false,
+        } => Some(
+            "Source drive has no Recycle Bin: files will be copied and verified, originals are kept",
+        ),
+    }
+}
+
+fn cross_volume_line(ui: &mut egui::Ui, strategy: Option<MoveStrategy>) {
+    if let Some(text) = strategy.and_then(cross_volume_text) {
+        ui.add(egui::Label::new(RichText::new(text).strong()).wrap());
+    }
+}
+
 fn conflict_section(
     ui: &mut egui::Ui,
     plan: &Plan,
     conflicts: &files::ConflictSummary,
     review: &mut PlanReview,
+    strategy: Option<MoveStrategy>,
 ) -> Option<ConflictPolicy> {
     let plural = |count: usize, one: &str, many: &str| {
         format!("{count} {}", if count == 1 { one } else { many })
@@ -945,6 +986,9 @@ fn conflict_section(
             .id_salt("conflict-rows")
             .max_height(ROW_HEIGHT * 5.0)
             .show(ui, |ui| {
+                if let Some(strategy) = strategy {
+                    ui.add(egui::Label::new(strategy.detail()).wrap());
+                }
                 for row in plan.conflict_rows() {
                     ui.add(egui::Label::new(row).wrap_mode(egui::TextWrapMode::Extend));
                 }

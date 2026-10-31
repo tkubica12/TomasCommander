@@ -284,8 +284,21 @@ impl Journal {
         approved: bool,
         cancelled: &AtomicBool,
     ) -> Outcome {
+        self.execute_with(scope, plan, approved, cancelled, &files::Hooks::default())
+    }
+
+    /// `execute` with the file-operation test seams.
+    #[doc(hidden)]
+    pub fn execute_with(
+        &self,
+        scope: &Scope,
+        plan: &Plan,
+        approved: bool,
+        cancelled: &AtomicBool,
+        hooks: &files::Hooks,
+    ) -> Outcome {
         if !approved {
-            return files::execute(scope, plan, false, cancelled);
+            return files::execute_with(scope, plan, false, cancelled, hooks);
         }
         let record = match self.claim(plan) {
             Ok(record) => record,
@@ -298,11 +311,15 @@ impl Journal {
                     cancelled: false,
                     error: Some(error),
                     operation: Some(plan.operation()),
+                    strategy: plan.move_strategy(),
                     ..Default::default()
                 };
             }
         };
-        Self::finish(record, files::execute(scope, plan, true, cancelled))
+        Self::finish(
+            record,
+            files::execute_with(scope, plan, true, cancelled, hooks),
+        )
     }
 
     pub(crate) fn finish(mut record: File, mut outcome: Outcome) -> Outcome {
@@ -320,6 +337,8 @@ impl Journal {
             ("replaced", &outcome.replaced),
             ("merged", &outcome.merged),
             ("skipped", &outcome.skipped),
+            ("recycled", &outcome.recycled),
+            ("kept", &outcome.kept),
         ] {
             for path in paths {
                 result.push_str(&format!("{key}={}\n", encode_path(path)));

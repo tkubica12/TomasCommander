@@ -36,10 +36,11 @@ The binary is unsigned; this project does not provide code-signing or support.
 
 - Two file panes, keyboard navigation, multi-selection, filtering, recursive
   filename search and sortable size/date columns.
-- Copy, same-volume move, Recycle Bin deletion, rename and new folder, with
+- Copy, move, Recycle Bin deletion, rename and new folder, with
   exact-path confirmation and durable operation receipts. Copy/Move conflicts
   offer Skip, Replace older, Replace all (originals to the Recycle Bin) or Keep
-  both, and same-name folders are merged.
+  both, and same-name folders are merged. Moves across drives copy, verify
+  (CRC-32) and then send originals to the Recycle Bin.
 - Saved locations with editable names and removal, unified Recent activity, compact
   clickable breadcrumbs and inline filename editing.
 - Recent document and ZIP-file changes in configurable folders (D: and both detected OneDrive
@@ -124,8 +125,11 @@ operations never overwrite in place: Copy/Move replacement sends the existing
 file to the Recycle Bin and is chosen explicitly in the review; AI commands and
 ZIP flows do not overwrite or merge existing destinations. Cancellation can
 leave partial outputs or staging files; inspect **Operations** before retrying.
-Copy preserves modification times but not creation times, all Windows metadata,
-ACLs or alternate streams. Cross-volume moves are not supported.
+Copy and moves across drives preserve modification times but not creation
+times, all Windows metadata, ACLs or alternate streams. Moves between drives are
+a verified copy followed by sending the originals to the Recycle Bin; from
+removable or network drives, which have no Recycle Bin, originals are kept and
+never deleted permanently.
 
 HTML previews are semantic, not full CSS/browser rendering; scripts and external
 assets are not loaded. ZIP support is limited to Store/Deflate and excludes

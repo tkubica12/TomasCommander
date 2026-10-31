@@ -429,6 +429,85 @@ impl ConflictPolicy {
     }
 }
 
+/// How an approved Move reaches its destination.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MoveStrategy {
+    /// Identity-verified handle rename on one volume.
+    SameVolume,
+    /// Copy and CRC-32-verify on the destination volume, then send the originals to the
+    /// Recycle Bin, or keep them when the source drive has no Recycle Bin.
+    CrossVolume { recycle_originals: bool },
+}
+
+impl MoveStrategy {
+    pub fn cross_volume(self) -> bool {
+        matches!(self, Self::CrossVolume { .. })
+    }
+
+    fn key(self) -> &'static str {
+        match self {
+            Self::SameVolume => "same-volume-rename",
+            Self::CrossVolume {
+                recycle_originals: true,
+            } => "cross-volume-copy-verify-recycle",
+            Self::CrossVolume {
+                recycle_originals: false,
+            } => "cross-volume-copy-verify-keep",
+        }
+    }
+
+    /// One technical line for review details.
+    pub fn detail(self) -> &'static str {
+        match self {
+            Self::SameVolume => "Strategy: same-drive rename; nothing is copied.",
+            Self::CrossVolume {
+                recycle_originals: true,
+            } => {
+                "Strategy: across drives / copy each file, verify its CRC-32 by re-reading it, recheck the sources, then send the originals to the Recycle Bin."
+            }
+            Self::CrossVolume {
+                recycle_originals: false,
+            } => {
+                "Strategy: across drives / copy each file and verify its CRC-32 by re-reading it. The source drive has no Recycle Bin, so originals are kept."
+            }
+        }
+    }
+}
+
+/// Planning switches beyond the conflict policy.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PlanOptions {
+    /// Refuse a Move between volumes instead of planning copy, verify and recycle.
+    pub same_volume_only: bool,
+    /// Test seam: plan a same-volume Move with the cross-volume strategy.
+    #[doc(hidden)]
+    pub force_cross_volume: bool,
+    /// Test seam: replaces the source-drive Recycle Bin probe.
+    #[doc(hidden)]
+    pub recycle_bin: Option<bool>,
+}
+
+/// Effect seams for tests; `Hooks::default()` uses the real Recycle Bin.
+#[doc(hidden)]
+#[derive(Clone, Copy)]
+pub struct Hooks<'a> {
+    /// Sends the items to the Recycle Bin as one batch; must never delete permanently.
+    pub recycle: &'a dyn Fn(&[PathBuf]) -> FileResult<()>,
+    /// Runs after a verified-copy target is flushed and closed, before it is re-read.
+    pub copied: &'a dyn Fn(&Path, &Path),
+}
+
+fn no_copy_hook(_source: &Path, _target: &Path) {}
+
+impl Default for Hooks<'static> {
+    fn default() -> Self {
+        Self {
+            recycle: &crate::platform::recycle_many,
+            copied: &no_copy_hook,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Resolution {
     Create,
@@ -505,6 +584,8 @@ pub struct Plan {
     destination: Option<PathBuf>,
     nodes: Vec<PlannedNode>,
     destination_identity: Option<Fingerprint>,
+    strategy: Option<MoveStrategy>,
+    options: PlanOptions,
     execution_key: String,
 }
 
@@ -551,6 +632,16 @@ impl Plan {
 
     pub fn destination(&self) -> Option<&Path> {
         self.destination.as_deref()
+    }
+
+    /// The Move strategy recorded at planning; `None` for Copy and Recycle.
+    pub fn move_strategy(&self) -> Option<MoveStrategy> {
+        self.strategy
+    }
+
+    /// Copy and cross-volume Move stream file contents into the destination.
+    fn streams(&self) -> bool {
+        self.operation == Operation::Copy || self.strategy.is_some_and(MoveStrategy::cross_volume)
     }
 
     pub(crate) fn execution_key(&self) -> &str {
@@ -632,7 +723,7 @@ impl Plan {
 
     fn stage_path(&self, index: usize) -> Option<PathBuf> {
         let node = self.nodes.get(index)?;
-        if self.operation != Operation::Copy || node.resolution != Resolution::Replace {
+        if !self.streams() || node.resolution != Resolution::Replace {
             return None;
         }
         Some(node.target.as_ref()?.parent()?.join(format!(
@@ -668,6 +759,9 @@ impl Plan {
             self.id,
             self.policy.key()
         );
+        if let Some(strategy) = self.strategy {
+            snapshot.push_str(&format!("strategy={}\n", strategy.key()));
+        }
         if let Some(destination) = &self.destination {
             snapshot.push_str(&format!(
                 "destination={}\ndestination_identity={:?}\n",
@@ -892,6 +986,77 @@ pub fn plan_with_policy(
     policy: ConflictPolicy,
     cancelled: &AtomicBool,
 ) -> FileResult<Plan> {
+    plan_with_options(
+        scope,
+        id,
+        operation,
+        sources,
+        destination,
+        policy,
+        PlanOptions::default(),
+        cancelled,
+    )
+}
+
+/// Chooses rename or copy-verify-recycle for a Move from the real volume identities.
+fn move_strategy(
+    sources: &[PathBuf],
+    destination: &Path,
+    options: PlanOptions,
+) -> FileResult<MoveStrategy> {
+    #[cfg(windows)]
+    let across = options.force_cross_volume || {
+        // Serial plus volume root: shares or cloned volumes may repeat a serial.
+        let volume = |path: &Path| -> FileResult<(u32, Option<String>)> {
+            Ok((
+                crate::platform::path_identity(path)?.0,
+                crate::platform::volume_root(path).ok(),
+            ))
+        };
+        let target = volume(destination)?;
+        let mut across = false;
+        for source in sources {
+            let source = volume(source)?;
+            across |= source.0 != target.0
+                || matches!((&source.1, &target.1), (Some(a), Some(b)) if a != b);
+        }
+        across
+    };
+    #[cfg(not(windows))]
+    let across = {
+        let _ = (sources, destination);
+        options.force_cross_volume
+    };
+    if !across {
+        return Ok(MoveStrategy::SameVolume);
+    }
+    if options.same_volume_only {
+        return Err(
+            "AI command moves stay on one drive; use Move in the panes across drives. No plan."
+                .into(),
+        );
+    }
+    let recycle_originals = match options.recycle_bin {
+        Some(available) => available,
+        // An unanswered probe keeps the originals; it never risks permanent deletion.
+        None => sources
+            .iter()
+            .all(|source| crate::platform::recycle_bin_available(source).unwrap_or(false)),
+    };
+    Ok(MoveStrategy::CrossVolume { recycle_originals })
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn plan_with_options(
+    scope: &Scope,
+    id: u64,
+    operation: Operation,
+    sources: &[PathBuf],
+    destination: Option<&Path>,
+    policy: ConflictPolicy,
+    options: PlanOptions,
+    cancelled: &AtomicBool,
+) -> FileResult<Plan> {
     if sources.is_empty() {
         return Err("Select or focus an item first.".into());
     }
@@ -995,6 +1160,12 @@ pub fn plan_with_policy(
             .then(a.source.cmp(&b.source))
     });
     let destination_identity = destination.as_deref().map(fingerprint).transpose()?;
+    let strategy = match (operation, &destination) {
+        (Operation::Move, Some(destination)) => {
+            Some(move_strategy(&sources, destination, options)?)
+        }
+        _ => None,
+    };
     static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let timestamp = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
@@ -1008,6 +1179,8 @@ pub fn plan_with_policy(
         destination,
         nodes,
         destination_identity,
+        strategy,
+        options,
         execution_key: format!(
             "{timestamp}-{}-{}",
             std::process::id(),
@@ -1030,18 +1203,29 @@ pub struct Outcome {
     pub merged: Vec<PathBuf>,
     /// Sources excluded by the approved conflict policy.
     pub skipped: Vec<PathBuf>,
+    /// Cross-volume Move: verified originals sent to the Recycle Bin.
+    pub recycled: Vec<PathBuf>,
+    /// Cross-volume Move: originals kept although their verified copies exist.
+    pub kept: Vec<PathBuf>,
     pub operation: Option<Operation>,
+    pub strategy: Option<MoveStrategy>,
 }
 
 impl Outcome {
     /// Counts such as "12 copied, 3 replaced (originals in Recycle Bin), 2 skipped".
     pub fn summary(&self) -> Option<String> {
+        let across = self.strategy.is_some_and(MoveStrategy::cross_volume);
         let verb = match self.operation? {
             Operation::Copy => "copied",
+            Operation::Move if across && self.recycled.is_empty() => {
+                "copied across drives (verified)"
+            }
+            Operation::Move if across => "moved across drives (verified)",
             Operation::Move => "moved",
             Operation::Recycle => return None,
         };
-        if self.replaced.is_empty() && self.merged.is_empty() && self.skipped.is_empty() {
+        if !across && self.replaced.is_empty() && self.merged.is_empty() && self.skipped.is_empty()
+        {
             return None;
         }
         let mut parts = vec![format!(
@@ -1069,6 +1253,15 @@ impl Outcome {
         }
         if !self.skipped.is_empty() {
             parts.push(format!("{} skipped", self.skipped.len()));
+        }
+        if !self.recycled.is_empty() {
+            parts.push("originals in Recycle Bin".into());
+        }
+        match self.kept.len() {
+            0 => (),
+            _ if self.recycled.is_empty() => parts.push("originals kept".into()),
+            1 => parts.push("1 original kept".into()),
+            kept => parts.push(format!("{kept} originals kept")),
         }
         Some(parts.join(", "))
     }
@@ -1115,13 +1308,14 @@ fn validate_plan(scope: &Scope, plan: &Plan, cancelled: &AtomicBool) -> FileResu
         }
     }
     // Re-enumeration detects added/removed children and new or resolved conflicts.
-    let current = self::plan_with_policy(
+    let current = self::plan_with_options(
         scope,
         plan.id,
         plan.operation,
         &plan.sources,
         plan.destination.as_deref(),
         plan.policy,
+        plan.options,
         cancelled,
     )?;
     if current.nodes.len() != plan.nodes.len()
@@ -1136,12 +1330,17 @@ fn validate_plan(scope: &Scope, plan: &Plan, cancelled: &AtomicBool) -> FileResu
     if current.nodes != plan.nodes {
         return Err("Destination changed; create a new plan.".into());
     }
+    if current.strategy != plan.strategy {
+        return Err("Move strategy changed (drive or Recycle Bin); create a new plan.".into());
+    }
     Ok(())
 }
 
 fn stream_copy(
     node: &PlannedNode,
     target: &Path,
+    verify: bool,
+    hooks: &Hooks,
     outcome: &mut Outcome,
     cancelled: &AtomicBool,
 ) -> FileResult<bool> {
@@ -1181,6 +1380,7 @@ fn stream_copy(
         .open(target)
         .map_err(|e| io_error("Create destination without overwrite", target, e))?;
     outcome.created.push(target.to_owned());
+    let mut checksum = crc32fast::Hasher::new();
     let mut buffer = [0u8; 64 * 1024];
     let mut finished = true;
     loop {
@@ -1194,6 +1394,9 @@ fn stream_copy(
             .map_err(|e| io_error("Read source", &node.source, e))?;
         if count == 0 {
             break;
+        }
+        if verify {
+            checksum.update(&buffer[..count]);
         }
         output
             .write_all(&buffer[..count])
@@ -1218,11 +1421,48 @@ fn stream_copy(
     {
         return Err("Copied file length does not match the approved source.".into());
     }
+    if !verify {
+        return Ok(true);
+    }
+    drop(output);
+    drop(source);
+    (hooks.copied)(&node.source, target);
+    let Some((length, actual)) = file_checksum(target, cancelled)? else {
+        outcome.cancelled = true;
+        return Ok(false);
+    };
+    if length != node.identity.size || actual != checksum.finalize() {
+        return Err(format!(
+            "Copy verification failed: the destination bytes differ from the source (CRC-32). The source was kept; inspect {}",
+            display_path(target)
+        ));
+    }
     Ok(true)
 }
 
-fn recycle_replaced(target: &Path) -> FileResult<()> {
-    crate::platform::recycle(target)?;
+/// Re-reads a written file; `None` when cancelled between chunks.
+fn file_checksum(path: &Path, cancelled: &AtomicBool) -> FileResult<Option<(u64, u32)>> {
+    let mut file = File::open(path).map_err(|e| io_error("Open copy for verification", path, e))?;
+    let mut checksum = crc32fast::Hasher::new();
+    let mut buffer = [0u8; 64 * 1024];
+    let mut length = 0u64;
+    loop {
+        if cancelled.load(Ordering::Relaxed) {
+            return Ok(None);
+        }
+        let count = file
+            .read(&mut buffer)
+            .map_err(|e| io_error("Verify copy", path, e))?;
+        if count == 0 {
+            return Ok(Some((length, checksum.finalize())));
+        }
+        checksum.update(&buffer[..count]);
+        length += count as u64;
+    }
+}
+
+fn recycle_replaced(target: &Path, hooks: &Hooks) -> FileResult<()> {
+    (hooks.recycle)(&[target.to_owned()])?;
     if target
         .try_exists()
         .map_err(|e| io_error("Verify recycling", target, e))?
@@ -1259,7 +1499,12 @@ fn lock_merged_folder(target: &Path, existing: &Fingerprint) -> FileResult<File>
     Ok(handle)
 }
 
-fn move_node(plan: &Plan, node: &PlannedNode, outcome: &mut Outcome) -> FileResult<()> {
+fn move_node(
+    plan: &Plan,
+    node: &PlannedNode,
+    hooks: &Hooks,
+    outcome: &mut Outcome,
+) -> FileResult<()> {
     let target = node.target.as_ref().ok_or("Move destination is missing.")?;
     #[cfg(windows)]
     let parent = plan.parent_identity(target)?;
@@ -1274,7 +1519,7 @@ fn move_node(plan: &Plan, node: &PlannedNode, outcome: &mut Outcome) -> FileResu
         #[cfg(windows)]
         if existing.identity.file_id.0 != node.identity.file_id.0 {
             return Err(format!(
-                "Cross-volume moves are not supported; nothing was replaced: {}",
+                "Source and destination are on different drives; create a new plan. Nothing was replaced: {}",
                 display_path(target)
             ));
         }
@@ -1284,7 +1529,7 @@ fn move_node(plan: &Plan, node: &PlannedNode, outcome: &mut Outcome) -> FileResu
                 display_path(target)
             ));
         }
-        recycle_replaced(target)?;
+        recycle_replaced(target, hooks)?;
         outcome.replaced.push(target.clone());
     }
     #[cfg(windows)]
@@ -1303,15 +1548,363 @@ fn move_node(plan: &Plan, node: &PlannedNode, outcome: &mut Outcome) -> FileResu
     Ok(())
 }
 
+/// Handles that pin paths during a streamed copy, keyed by the pinned path.
+pub(crate) type Guards = Vec<(PathBuf, File)>;
+
+/// Copies plan nodes in order by exclusive creation or staged replacement; cross-volume Move
+/// also verifies every file. Returns `false` when cancelled; completed copies are reported.
+fn copy_nodes(
+    scope: &Scope,
+    plan: &Plan,
+    indices: &[usize],
+    hooks: &Hooks,
+    #[cfg_attr(not(windows), allow(unused_variables))] guards: &mut Guards,
+    outcome: &mut Outcome,
+    cancelled: &AtomicBool,
+) -> FileResult<bool> {
+    let verify = plan.strategy.is_some_and(MoveStrategy::cross_volume);
+    for &index in indices {
+        let node = &plan.nodes[index];
+        if cancelled.load(Ordering::Relaxed) {
+            outcome.cancelled = true;
+            return Ok(false);
+        }
+        if node.resolution == Resolution::Skip {
+            outcome.skipped.push(node.source.clone());
+            continue;
+        }
+        scope.mutation_source(&node.source)?;
+        #[cfg(windows)]
+        if let Some(destination) = &plan.destination
+            && crate::platform::path_identity(destination)?
+                != plan
+                    .destination_identity
+                    .as_ref()
+                    .ok_or("Destination identity missing.")?
+                    .file_id
+        {
+            return Err("Destination identity changed; copy stopped.".into());
+        }
+        if fingerprint(&node.source)? != node.identity {
+            return Err(format!(
+                "Source changed; copy stopped: {}",
+                display_path(&node.source)
+            ));
+        }
+        let target = node
+            .target
+            .as_ref()
+            .ok_or("Copy plan has no destination.")?;
+        let parent = target.parent().ok_or("Target has no parent folder.")?;
+        if scope.resolve(parent)? != parent {
+            return Err("Destination parent changed; copy stopped.".into());
+        }
+        match node.resolution {
+            Resolution::Merge => {
+                let existing = node
+                    .existing
+                    .as_ref()
+                    .ok_or("Merge plan has no destination snapshot.")?;
+                #[cfg(windows)]
+                guards.push((
+                    target.clone(),
+                    lock_merged_folder(target, &existing.identity)?,
+                ));
+                #[cfg(not(windows))]
+                if !fingerprint(target)?.directory || !existing.identity.directory {
+                    return Err("Merged destination folder changed; copy stopped.".into());
+                }
+                outcome.merged.push(target.clone());
+            }
+            _ if node.identity.directory => {
+                fs::create_dir(target).map_err(|e| io_error("Create folder", target, e))?;
+                outcome.created.push(target.clone());
+                #[cfg(windows)]
+                {
+                    use std::os::windows::fs::OpenOptionsExt;
+                    let handle = OpenOptions::new()
+                        .access_mode(0)
+                        .share_mode(3)
+                        .custom_flags(0x0220_0000)
+                        .open(target)
+                        .map_err(|e| io_error("Lock created folder", target, e))?;
+                    if reparse(
+                        &handle
+                            .metadata()
+                            .map_err(|e| io_error("Inspect created folder", target, e))?,
+                    ) {
+                        return Err("Created copy folder changed to a link; copy stopped.".into());
+                    }
+                    guards.push((target.clone(), handle));
+                }
+            }
+            Resolution::Replace => {
+                let stage = plan
+                    .stage_path(index)
+                    .ok_or("Replacement staging path missing.")?;
+                if !stream_copy(node, &stage, verify, hooks, outcome, cancelled)? {
+                    return Ok(false);
+                }
+                let existing = node
+                    .existing
+                    .as_ref()
+                    .ok_or("Replace plan has no destination snapshot.")?;
+                let retained = format!("staged copy retained: {}", display_path(&stage));
+                if fingerprint(target).ok().as_ref() != Some(&existing.identity) {
+                    return Err(format!(
+                        "Destination changed before replacement; {retained}"
+                    ));
+                }
+                recycle_replaced(target, hooks).map_err(|e| format!("{e}; {retained}"))?;
+                outcome.replaced.push(target.clone());
+                crate::platform::move_no_replace(&stage, target).map_err(|e| {
+                    format!(
+                        "Publishing the copy failed; the replaced original is in the Recycle Bin and the {retained}: {e}"
+                    )
+                })?;
+                outcome.created.retain(|path| path != &stage);
+                outcome.created.push(target.clone());
+            }
+            _ => {
+                if !stream_copy(node, target, verify, hooks, outcome, cancelled)? {
+                    return Ok(false);
+                }
+            }
+        }
+        outcome.completed.push(node.source.clone());
+    }
+    Ok(true)
+}
+
+/// Rechecks a copied top-level source against the plan, including folder membership.
+fn sources_unchanged(scope: &Scope, plan: &Plan, members: &[usize]) -> FileResult<()> {
+    let mut children = std::collections::BTreeMap::<&Path, usize>::new();
+    for &index in members {
+        if let Some(parent) = plan.nodes[index].source.parent() {
+            *children.entry(parent).or_default() += 1;
+        }
+    }
+    for &index in members {
+        let node = &plan.nodes[index];
+        if scope.mutation_source(&node.source)? != node.source
+            || fingerprint(&node.source)? != node.identity
+        {
+            return Err(format!(
+                "Source changed during the copy: {}",
+                display_path(&node.source)
+            ));
+        }
+        if node.identity.directory && node.resolution != Resolution::Skip {
+            let count = fs::read_dir(&node.source)
+                .map_err(|e| io_error("Recheck folder", &node.source, e))?
+                .count();
+            if children.get(node.source.as_path()).copied().unwrap_or(0) != count {
+                return Err(format!(
+                    "Source folder contents changed during the copy: {}",
+                    display_path(&node.source)
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Confirms every copy of a top-level source is still in place just before recycling it.
+fn copies_present(plan: &Plan, members: &[usize]) -> FileResult<()> {
+    for &index in members {
+        let node = &plan.nodes[index];
+        let Some(target) = node
+            .target
+            .as_ref()
+            .filter(|_| node.resolution != Resolution::Skip)
+        else {
+            continue;
+        };
+        let present = fs::symlink_metadata(target).is_ok_and(|metadata| {
+            !reparse(&metadata)
+                && if node.identity.directory {
+                    metadata.is_dir()
+                } else {
+                    metadata.is_file() && metadata.len() == node.identity.size
+                }
+        });
+        if !present {
+            return Err(format!(
+                "Verified copy changed before recycling: {}",
+                display_path(target)
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Cross-volume Move: copy and verify each top-level source, recheck it, then recycle it.
+/// Originals are never deleted permanently; any doubt keeps them beside their verified copies.
+fn move_across(
+    scope: &Scope,
+    plan: &Plan,
+    recycle_originals: bool,
+    hooks: &Hooks,
+    guards: &mut Guards,
+    outcome: &mut Outcome,
+    cancelled: &AtomicBool,
+) -> FileResult<()> {
+    let resolutions: std::collections::BTreeMap<&Path, Resolution> = plan
+        .nodes
+        .iter()
+        .map(|node| (node.source.as_path(), node.resolution))
+        .collect();
+    for source in &plan.sources {
+        if cancelled.load(Ordering::Relaxed) {
+            outcome.cancelled = true;
+            return Ok(());
+        }
+        let members: Vec<usize> = (0..plan.nodes.len())
+            .filter(|&index| plan.nodes[index].source.starts_with(source))
+            .collect();
+        let top = members
+            .iter()
+            .map(|&index| &plan.nodes[index])
+            .find(|node| node.source == *source)
+            .ok_or("Approved move source identity missing.")?;
+        if top.resolution == Resolution::Skip {
+            outcome.skipped.push(source.clone());
+            continue;
+        }
+        let target = top.target.as_ref().ok_or("Move destination is missing.")?;
+        if !copy_nodes(scope, plan, &members, hooks, guards, outcome, cancelled)? {
+            return Ok(());
+        }
+        if !recycle_originals {
+            outcome.kept.push(source.clone());
+            continue;
+        }
+        // Windows must be able to remove the source tree; destination pins stay.
+        guards.retain(|(path, _)| !path.starts_with(source));
+        if cancelled.load(Ordering::Relaxed) {
+            outcome.cancelled = true;
+            outcome.kept.push(source.clone());
+            return Ok(());
+        }
+        if let Err(error) =
+            sources_unchanged(scope, plan, &members).and_then(|()| copies_present(plan, &members))
+        {
+            outcome.kept.push(source.clone());
+            return Err(format!(
+                "{error}\nMove stopped before recycling. The original was kept: {}\nVerified copy: {}",
+                display_path(source),
+                display_path(target)
+            ));
+        }
+        let skipped_inside = members
+            .iter()
+            .any(|&index| plan.nodes[index].resolution == Resolution::Skip);
+        // Without skipped items the whole source is one Recycle Bin entry.
+        let units: Vec<PathBuf> = if skipped_inside {
+            members
+                .iter()
+                .map(|&index| &plan.nodes[index])
+                .filter(|node| {
+                    !matches!(node.resolution, Resolution::Merge | Resolution::Skip)
+                        && node
+                            .source
+                            .parent()
+                            .and_then(|parent| resolutions.get(parent))
+                            == Some(&Resolution::Merge)
+                })
+                .map(|node| node.source.clone())
+                .collect()
+        } else {
+            vec![source.clone()]
+        };
+        let result = if units.is_empty() {
+            Ok(())
+        } else {
+            (hooks.recycle)(&units)
+        };
+        let mut remaining = Vec::new();
+        for unit in units {
+            match fs::symlink_metadata(&unit) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    outcome.recycled.push(unit)
+                }
+                _ => remaining.push(unit),
+            }
+        }
+        if result.is_err() || !remaining.is_empty() {
+            let reason = result
+                .err()
+                .unwrap_or_else(|| "Windows did not remove every original.".into());
+            let count = remaining.len();
+            outcome.kept.extend(remaining);
+            return Err(format!(
+                "Recycling originals failed; {count} {} kept and every verified copy remains in {}: {reason}",
+                if count == 1 {
+                    "original was"
+                } else {
+                    "originals were"
+                },
+                display_path(plan.destination.as_deref().unwrap_or(target))
+            ));
+        }
+        if !skipped_inside {
+            continue;
+        }
+        let mut merged: Vec<&PlannedNode> = members
+            .iter()
+            .map(|&index| &plan.nodes[index])
+            .filter(|node| node.resolution == Resolution::Merge)
+            .collect();
+        merged.sort_by_key(|node| std::cmp::Reverse(node.source.components().count()));
+        for node in merged {
+            let holds_skipped = members.iter().any(|&index| {
+                plan.nodes[index].resolution == Resolution::Skip
+                    && plan.nodes[index].source.starts_with(&node.source)
+            });
+            if holds_skipped {
+                continue;
+            }
+            #[cfg(windows)]
+            if crate::platform::path_identity(&node.source)? != node.identity.file_id {
+                return Err(format!(
+                    "Merged source folder changed; it was kept: {}",
+                    display_path(&node.source)
+                ));
+            }
+            // remove_dir succeeds only for an empty folder.
+            fs::remove_dir(&node.source).map_err(|e| {
+                format!(
+                    "Merged source folder was kept; it could not be removed as empty: {}: {e}",
+                    display_path(&node.source)
+                )
+            })?;
+        }
+    }
+    Ok(())
+}
+
 pub fn execute(scope: &Scope, plan: &Plan, approved: bool, cancelled: &AtomicBool) -> Outcome {
+    execute_with(scope, plan, approved, cancelled, &Hooks::default())
+}
+
+/// `execute` with test seams for recycling and copy verification.
+#[doc(hidden)]
+pub fn execute_with(
+    scope: &Scope,
+    plan: &Plan,
+    approved: bool,
+    cancelled: &AtomicBool,
+    hooks: &Hooks,
+) -> Outcome {
     let skipped = |path: &PathBuf| {
         plan.nodes
             .iter()
             .any(|node| node.source == *path && node.resolution == Resolution::Skip)
     };
+    let streams = plan.streams();
     let mut outcome = Outcome {
         id: plan.id,
-        incomplete: if plan.operation == Operation::Copy {
+        incomplete: if streams {
             plan.nodes
                 .iter()
                 .filter(|node| node.resolution != Resolution::Skip)
@@ -1325,6 +1918,7 @@ pub fn execute(scope: &Scope, plan: &Plan, approved: bool, cancelled: &AtomicBoo
                 .collect()
         },
         operation: Some(plan.operation),
+        strategy: plan.strategy,
         ..Default::default()
     };
     if !approved {
@@ -1337,135 +1931,39 @@ pub fn execute(scope: &Scope, plan: &Plan, approved: bool, cancelled: &AtomicBoo
             return Ok(());
         }
         #[cfg(windows)]
-        let mut copy_guards = if plan.operation == Operation::Copy {
-            Some(lock_copy_paths(plan)?)
+        let mut guards = if streams {
+            lock_copy_paths(plan)?
         } else {
-            None
+            Guards::new()
         };
+        #[cfg(not(windows))]
+        let mut guards = Guards::new();
         validate_plan(scope, plan, cancelled)?;
-        match plan.operation {
-            Operation::Copy => {
-                for (index, node) in plan.nodes.iter().enumerate() {
-                    if cancelled.load(Ordering::Relaxed) {
-                        outcome.cancelled = true;
-                        break;
-                    }
-                    if node.resolution == Resolution::Skip {
-                        outcome.skipped.push(node.source.clone());
-                        continue;
-                    }
-                    scope.mutation_source(&node.source)?;
-                    #[cfg(windows)]
-                    if let Some(destination) = &plan.destination
-                        && crate::platform::path_identity(destination)?
-                            != plan
-                                .destination_identity
-                                .as_ref()
-                                .ok_or("Destination identity missing.")?
-                                .file_id
-                    {
-                        return Err("Destination identity changed; copy stopped.".into());
-                    }
-                    if fingerprint(&node.source)? != node.identity {
-                        return Err(format!(
-                            "Source changed; copy stopped: {}",
-                            display_path(&node.source)
-                        ));
-                    }
-                    let target = node
-                        .target
-                        .as_ref()
-                        .ok_or("Copy plan has no destination.")?;
-                    let parent = target.parent().ok_or("Target has no parent folder.")?;
-                    if scope.resolve(parent)? != parent {
-                        return Err("Destination parent changed; copy stopped.".into());
-                    }
-                    match node.resolution {
-                        Resolution::Merge => {
-                            let existing = node
-                                .existing
-                                .as_ref()
-                                .ok_or("Merge plan has no destination snapshot.")?;
-                            #[cfg(windows)]
-                            copy_guards
-                                .as_mut()
-                                .ok_or("Copy guards missing.")?
-                                .push(lock_merged_folder(target, &existing.identity)?);
-                            #[cfg(not(windows))]
-                            if !fingerprint(target)?.directory || !existing.identity.directory {
-                                return Err(
-                                    "Merged destination folder changed; copy stopped.".into()
-                                );
-                            }
-                            outcome.merged.push(target.clone());
-                        }
-                        _ if node.identity.directory => {
-                            fs::create_dir(target)
-                                .map_err(|e| io_error("Create folder", target, e))?;
-                            outcome.created.push(target.clone());
-                            #[cfg(windows)]
-                            {
-                                use std::os::windows::fs::OpenOptionsExt;
-                                let handle = OpenOptions::new()
-                                    .access_mode(0)
-                                    .share_mode(3)
-                                    .custom_flags(0x0220_0000)
-                                    .open(target)
-                                    .map_err(|e| io_error("Lock created folder", target, e))?;
-                                if reparse(
-                                    &handle.metadata().map_err(|e| {
-                                        io_error("Inspect created folder", target, e)
-                                    })?,
-                                ) {
-                                    return Err(
-                                        "Created copy folder changed to a link; copy stopped."
-                                            .into(),
-                                    );
-                                }
-                                copy_guards
-                                    .as_mut()
-                                    .ok_or("Copy guards missing.")?
-                                    .push(handle);
-                            }
-                        }
-                        Resolution::Replace => {
-                            let stage = plan
-                                .stage_path(index)
-                                .ok_or("Replacement staging path missing.")?;
-                            if !stream_copy(node, &stage, &mut outcome, cancelled)? {
-                                break;
-                            }
-                            let existing = node
-                                .existing
-                                .as_ref()
-                                .ok_or("Replace plan has no destination snapshot.")?;
-                            let retained =
-                                format!("staged copy retained: {}", display_path(&stage));
-                            if fingerprint(target).ok().as_ref() != Some(&existing.identity) {
-                                return Err(format!(
-                                    "Destination changed before replacement; {retained}"
-                                ));
-                            }
-                            recycle_replaced(target).map_err(|e| format!("{e}; {retained}"))?;
-                            outcome.replaced.push(target.clone());
-                            crate::platform::move_no_replace(&stage, target).map_err(|e| {
-                                format!(
-                                    "Publishing the copy failed; the replaced original is in the Recycle Bin and the {retained}: {e}"
-                                )
-                            })?;
-                            outcome.created.retain(|path| path != &stage);
-                            outcome.created.push(target.clone());
-                        }
-                        _ => {
-                            if !stream_copy(node, target, &mut outcome, cancelled)? {
-                                break;
-                            }
-                        }
-                    }
-                    outcome.completed.push(node.source.clone());
-                }
+        match (plan.operation, plan.strategy) {
+            (Operation::Copy, _) => {
+                let all: Vec<usize> = (0..plan.nodes.len()).collect();
+                copy_nodes(
+                    scope,
+                    plan,
+                    &all,
+                    hooks,
+                    &mut guards,
+                    &mut outcome,
+                    cancelled,
+                )?;
             }
-            Operation::Move => {
+            (Operation::Move, Some(MoveStrategy::CrossVolume { recycle_originals })) => {
+                move_across(
+                    scope,
+                    plan,
+                    recycle_originals,
+                    hooks,
+                    &mut guards,
+                    &mut outcome,
+                    cancelled,
+                )?;
+            }
+            (Operation::Move, _) => {
                 let resolutions: std::collections::BTreeMap<&Path, Resolution> = plan
                     .nodes
                     .iter()
@@ -1520,7 +2018,7 @@ pub fn execute(scope: &Scope, plan: &Plan, approved: bool, cancelled: &AtomicBoo
                         break;
                     }
                     if top.resolution != Resolution::Merge {
-                        move_node(plan, top, &mut outcome)?;
+                        move_node(plan, top, hooks, &mut outcome)?;
                         continue;
                     }
                     // A merged folder cannot be renamed as a whole; move its direct units.
@@ -1540,7 +2038,7 @@ pub fn execute(scope: &Scope, plan: &Plan, approved: bool, cancelled: &AtomicBoo
                         if node.resolution == Resolution::Skip {
                             outcome.skipped.push(node.source.clone());
                         } else {
-                            move_node(plan, node, &mut outcome)?;
+                            move_node(plan, node, hooks, &mut outcome)?;
                         }
                     }
                     let mut merged: Vec<&PlannedNode> = members
@@ -1578,7 +2076,7 @@ pub fn execute(scope: &Scope, plan: &Plan, approved: bool, cancelled: &AtomicBoo
                     }
                 }
             }
-            Operation::Recycle => {
+            (Operation::Recycle, _) => {
                 for source in &plan.sources {
                     if cancelled.load(Ordering::Relaxed) {
                         outcome.cancelled = true;
@@ -1606,7 +2104,7 @@ pub fn execute(scope: &Scope, plan: &Plan, approved: bool, cancelled: &AtomicBoo
                         outcome.cancelled = true;
                         break;
                     }
-                    crate::platform::recycle(source)?;
+                    (hooks.recycle)(std::slice::from_ref(source))?;
                     if source
                         .try_exists()
                         .map_err(|e| io_error("Verify recycling", source, e))?
@@ -1634,12 +2132,12 @@ pub fn execute(scope: &Scope, plan: &Plan, approved: bool, cancelled: &AtomicBoo
 }
 
 #[cfg(windows)]
-pub(crate) fn lock_mutation_parents(parent: &Path) -> FileResult<Vec<File>> {
+pub(crate) fn lock_mutation_parents(parent: &Path) -> FileResult<Guards> {
     lock_paths(parent.ancestors().map(Path::to_owned).collect())
 }
 
 #[cfg(windows)]
-fn lock_copy_paths(plan: &Plan) -> FileResult<Vec<File>> {
+fn lock_copy_paths(plan: &Plan) -> FileResult<Guards> {
     let mut paths = BTreeSet::new();
     for node in &plan.nodes {
         paths.extend(node.source.ancestors().map(Path::to_owned));
@@ -1651,7 +2149,7 @@ fn lock_copy_paths(plan: &Plan) -> FileResult<Vec<File>> {
 }
 
 #[cfg(windows)]
-fn lock_paths(paths: BTreeSet<PathBuf>) -> FileResult<Vec<File>> {
+fn lock_paths(paths: BTreeSet<PathBuf>) -> FileResult<Guards> {
     use std::os::windows::fs::OpenOptionsExt;
     let mut handles = Vec::with_capacity(paths.len());
     for path in paths {
@@ -1669,7 +2167,7 @@ fn lock_paths(paths: BTreeSet<PathBuf>) -> FileResult<Vec<File>> {
             .custom_flags(0x0220_0000)
             .open(&path)
             .map_err(|e| io_error("Lock copy path against replacement", &path, e))?;
-        handles.push(handle);
+        handles.push((path, handle));
     }
     Ok(handles)
 }

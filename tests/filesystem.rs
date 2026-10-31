@@ -2920,3 +2920,996 @@ fn same_item_is_skipped_or_kept_but_never_replaced_or_merged_into_itself() {
     assert_eq!(fs::read(&file).unwrap(), b"only copy");
     assert_eq!(fs::read(nested.join("inner.txt")).unwrap(), b"inner");
 }
+
+/// Stand-in for the Recycle Bin: moves items into a fixture folder and records each batch.
+struct FakeBin {
+    root: PathBuf,
+    calls: std::cell::RefCell<Vec<Vec<PathBuf>>>,
+    /// Fails the call with this index after moving its first item.
+    fail_call: Option<usize>,
+}
+
+impl FakeBin {
+    fn new(root: PathBuf) -> Self {
+        Self {
+            root,
+            calls: Default::default(),
+            fail_call: None,
+        }
+    }
+
+    fn recycle(&self, items: &[PathBuf]) -> Result<(), String> {
+        let call = self.calls.borrow().len();
+        self.calls.borrow_mut().push(items.to_vec());
+        for (index, item) in items.iter().enumerate() {
+            if self.fail_call == Some(call) && index > 0 {
+                return Err("Synthetic recycle failure".into());
+            }
+            let name = item.file_name().unwrap().to_string_lossy();
+            let target = self.root.join(format!("{call}-{index}-{name}"));
+            fs::rename(item, &target).map_err(|e| format!("Fake recycle: {e}"))?;
+        }
+        Ok(())
+    }
+
+    fn calls(&self) -> Vec<Vec<PathBuf>> {
+        self.calls.borrow().clone()
+    }
+}
+
+/// Every path under `root`, root included, for fixture ownership.
+fn tree(root: &std::path::Path) -> Vec<PathBuf> {
+    let mut paths = vec![root.to_path_buf()];
+    if root.is_dir() {
+        for entry in fs::read_dir(root).unwrap() {
+            paths.extend(tree(&entry.unwrap().path()));
+        }
+    }
+    paths
+}
+
+/// Relative names and bytes (None for folders) of a file or folder tree.
+fn contents(root: &std::path::Path) -> std::collections::BTreeMap<PathBuf, Option<Vec<u8>>> {
+    tree(root)
+        .into_iter()
+        .map(|path| {
+            let data = path.is_file().then(|| fs::read(&path).unwrap());
+            (path.strip_prefix(root).unwrap().to_path_buf(), data)
+        })
+        .collect()
+}
+
+fn plan_across(
+    scope: &Scope,
+    id: u64,
+    sources: &[PathBuf],
+    destination: &std::path::Path,
+    policy: ConflictPolicy,
+    recycle_bin: bool,
+) -> Result<files::Plan, String> {
+    files::plan_with_options(
+        scope,
+        id,
+        Operation::Move,
+        sources,
+        Some(destination),
+        policy,
+        files::PlanOptions {
+            force_cross_volume: true,
+            recycle_bin: Some(recycle_bin),
+            ..Default::default()
+        },
+        &AtomicBool::new(false),
+    )
+}
+
+fn no_copy_hook(_: &std::path::Path, _: &std::path::Path) {}
+
+#[test]
+fn cross_volume_move_copies_verifies_then_recycles_each_source_as_one_item() {
+    let mut fixture = Fixture::new("across-tree");
+    fixture.directory("Source");
+    let folder = fixture.directory("Source\\Tree");
+    let first = fixture.file("Source\\Tree\\a.txt", "Dovolená a".as_bytes());
+    fixture.directory("Source\\Tree\\Nested");
+    let large: Vec<u8> = (0..200_000u32).map(|value| (value % 251) as u8).collect();
+    let second = fixture.file("Source\\Tree\\Nested\\b.bin", &large);
+    let single = fixture.file("Source\\single.txt", b"single file");
+    for (path, seconds) in [
+        (&first, 1_000_000_000),
+        (&second, 1_100_000_000),
+        (&single, 1_200_000_000),
+    ] {
+        set_modified(path, seconds);
+    }
+    let destination = fixture.directory("Destination");
+    let bin = FakeBin::new(fixture.directory("Bin"));
+    let journal_path = fixture.directory("Journal");
+    let journal = tomas_commander::journal::Journal::new(journal_path.clone());
+    let scope = fixture.scope();
+    let canonical = destination.canonicalize().unwrap();
+    let expected = [contents(&folder), contents(&single)];
+    let sources = vec![folder.clone(), single.clone()];
+
+    let plan = plan_across(
+        &scope,
+        1,
+        &sources,
+        &destination,
+        ConflictPolicy::Skip,
+        true,
+    )
+    .unwrap();
+    assert_eq!(
+        plan.move_strategy(),
+        Some(files::MoveStrategy::CrossVolume {
+            recycle_originals: true
+        })
+    );
+    assert!(!plan.conflicts().any());
+    let recycle = |items: &[PathBuf]| {
+        // Originals leave only after their copies exist with identical bytes.
+        for item in items {
+            assert_eq!(
+                contents(item),
+                contents(&canonical.join(item.file_name().unwrap())),
+                "Verified copy must exist before recycling {}",
+                item.display()
+            );
+        }
+        bin.recycle(items)
+    };
+    let hooks = files::Hooks {
+        recycle: &recycle,
+        copied: &no_copy_hook,
+    };
+    let outcome = journal.execute_with(&scope, &plan, true, &AtomicBool::new(false), &hooks);
+    fixture.own(&outcome.created);
+    fixture.own(&tree(&bin.root));
+    let mut records: Vec<PathBuf> = fs::read_dir(&journal_path)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    assert!(outcome.error.is_none(), "{outcome:?}");
+    let canonical_sources: Vec<PathBuf> = sources
+        .iter()
+        .map(|path| plan_source(&plan, path))
+        .collect();
+    assert_eq!(
+        bin.calls(),
+        vec![
+            vec![canonical_sources[0].clone()],
+            vec![canonical_sources[1].clone()]
+        ],
+        "One Recycle Bin item per top-level source."
+    );
+    assert_eq!(outcome.recycled, canonical_sources);
+    assert!(outcome.kept.is_empty() && outcome.incomplete.is_empty());
+    assert_eq!(
+        outcome.summary().as_deref(),
+        Some("5 moved across drives (verified), originals in Recycle Bin")
+    );
+    assert!(!folder.exists() && !single.exists());
+    assert_eq!(contents(&destination.join("Tree")), expected[0]);
+    assert_eq!(contents(&destination.join("single.txt")), expected[1]);
+    assert_eq!(contents(&bin.root.join("0-0-Tree")), expected[0]);
+    for (copy, seconds) in [
+        ("Tree\\a.txt", 1_000_000_000),
+        ("Tree\\Nested\\b.bin", 1_100_000_000),
+        ("single.txt", 1_200_000_000),
+    ] {
+        assert_eq!(
+            modified(&destination.join(copy)),
+            UNIX_EPOCH + std::time::Duration::from_secs(seconds),
+            "{copy} keeps its modification time"
+        );
+    }
+    let record = records
+        .iter()
+        .find(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "operation")
+        })
+        .unwrap();
+    let text = fs::read_to_string(record).unwrap();
+    for expected in [
+        "operation=Move\n",
+        "strategy=cross-volume-copy-verify-recycle\n",
+        "\nrecycled=",
+    ] {
+        assert!(text.contains(expected), "{expected:?} missing in {text}");
+    }
+    assert!(text.ends_with("finished\n"));
+
+    // Without the seam the same volume keeps the rename path: same file identity, no copy.
+    let renamed = fixture.file("Source\\renamed.txt", b"rename me");
+    let identity = tomas_commander::platform::path_identity(&renamed).unwrap();
+    let plan = files::plan_with_policy(
+        &scope,
+        2,
+        Operation::Move,
+        std::slice::from_ref(&renamed),
+        Some(&destination),
+        ConflictPolicy::Skip,
+        &AtomicBool::new(false),
+    )
+    .unwrap();
+    assert_eq!(plan.move_strategy(), Some(files::MoveStrategy::SameVolume));
+    let refuse = |_: &[PathBuf]| -> Result<(), String> { Err("Rename must not recycle.".into()) };
+    let outcome = journal.execute_with(
+        &scope,
+        &plan,
+        true,
+        &AtomicBool::new(false),
+        &files::Hooks {
+            recycle: &refuse,
+            copied: &no_copy_hook,
+        },
+    );
+    fixture.own(&outcome.created);
+    assert!(outcome.error.is_none(), "{outcome:?}");
+    assert_eq!(outcome.summary(), None);
+    assert_eq!(
+        tomas_commander::platform::path_identity(&destination.join("renamed.txt")).unwrap(),
+        identity
+    );
+    let record = fs::read_dir(&journal_path)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| !records.contains(path) && path.extension().is_some_and(|e| e == "operation"))
+        .unwrap();
+    assert!(
+        fs::read_to_string(&record)
+            .unwrap()
+            .contains("strategy=same-volume-rename\n")
+    );
+    records.push(record);
+    records.push(journal_path.join("journal.lock"));
+    fixture.own(&records);
+}
+
+fn plan_source(plan: &files::Plan, path: &std::path::Path) -> PathBuf {
+    plan.sources()
+        .iter()
+        .find(|source| source.file_name() == path.file_name())
+        .unwrap()
+        .clone()
+}
+
+#[test]
+fn cross_volume_checksum_mismatch_stops_before_recycling_and_keeps_the_source() {
+    let mut fixture = Fixture::new("across-mismatch");
+    let source = fixture.directory("Source");
+    fixture.file("Source\\good.txt", b"good bytes");
+    fixture.file("Source\\bad.txt", b"bytes to corrupt");
+    let destination = fixture.directory("Destination");
+    let bin = FakeBin::new(fixture.directory("Bin"));
+    let scope = fixture.scope();
+    let before = hash_inventory(&source);
+    let plan = plan_across(
+        &scope,
+        1,
+        std::slice::from_ref(&source),
+        &destination,
+        ConflictPolicy::Skip,
+        true,
+    )
+    .unwrap();
+    let recycle = |items: &[PathBuf]| bin.recycle(items);
+    let corrupt = |_: &std::path::Path, target: &std::path::Path| {
+        if target.ends_with("bad.txt") {
+            use std::io::Write;
+            let mut file = fs::OpenOptions::new().write(true).open(target).unwrap();
+            file.write_all(b"X").unwrap();
+        }
+    };
+    let outcome = files::execute_with(
+        &scope,
+        &plan,
+        true,
+        &AtomicBool::new(false),
+        &files::Hooks {
+            recycle: &recycle,
+            copied: &corrupt,
+        },
+    );
+    fixture.own(&outcome.created);
+    let error = outcome.error.clone().unwrap();
+    let bad = destination.canonicalize().unwrap().join("Source\\bad.txt");
+    assert!(error.contains("Copy verification failed"), "{error}");
+    assert!(error.contains(&files::display_path(&bad)), "{error}");
+    assert!(
+        outcome.created.contains(&bad),
+        "The bad destination is reported."
+    );
+    assert!(
+        bin.calls().is_empty(),
+        "Nothing is recycled after a mismatch."
+    );
+    assert!(outcome.recycled.is_empty());
+    assert_eq!(fs::read(&bad).unwrap(), b"Xytes to corrupt");
+    assert_eq!(hash_inventory(&source), before, "The source is untouched.");
+}
+
+#[test]
+fn cross_volume_source_changed_during_the_copy_keeps_the_original() {
+    let mut fixture = Fixture::new("across-changed");
+    fixture.directory("Source");
+    let edited = fixture.directory("Source\\Edited");
+    let note = fixture.file("Source\\Edited\\note.txt", b"original note");
+    fixture.file("Source\\Edited\\other.txt", b"other");
+    let grown = fixture.directory("Source\\Grown");
+    fixture.file("Source\\Grown\\first.txt", b"first");
+    let late = fixture.root.join("Source\\Grown\\late.txt");
+    fixture.own(std::slice::from_ref(&late));
+    let destination = fixture.directory("Destination");
+    let bin = FakeBin::new(fixture.directory("Bin"));
+    let scope = fixture.scope();
+    let canonical = destination.canonicalize().unwrap();
+    let recycle = |items: &[PathBuf]| bin.recycle(items);
+    for (id, source, expected) in [(1, &edited, "note.txt"), (2, &grown, "Grown")] {
+        let plan = plan_across(
+            &scope,
+            id,
+            std::slice::from_ref(source),
+            &destination,
+            ConflictPolicy::Skip,
+            true,
+        )
+        .unwrap();
+        let change = |source: &std::path::Path, _: &std::path::Path| {
+            if source.ends_with("note.txt") {
+                fs::write(source, b"edited during the copy").unwrap();
+            }
+            if source.ends_with("first.txt") {
+                fs::write(&late, b"added during the copy").unwrap();
+            }
+        };
+        let outcome = files::execute_with(
+            &scope,
+            &plan,
+            true,
+            &AtomicBool::new(false),
+            &files::Hooks {
+                recycle: &recycle,
+                copied: &change,
+            },
+        );
+        fixture.own(&outcome.created);
+        let error = outcome.error.clone().unwrap();
+        assert!(error.contains("changed during the copy"), "{error}");
+        assert!(error.contains(expected), "{error}");
+        assert!(error.contains("The original was kept"), "{error}");
+        assert_eq!(outcome.kept, vec![plan.sources()[0].clone()]);
+        assert!(outcome.recycled.is_empty() && bin.calls().is_empty());
+        assert!(source.is_dir(), "The changed original stays in place.");
+        let name = source.file_name().unwrap();
+        assert!(canonical.join(name).is_dir(), "The verified copy remains.");
+    }
+    assert_eq!(fs::read(&note).unwrap(), b"edited during the copy");
+    assert_eq!(
+        fs::read(canonical.join("Edited\\note.txt")).unwrap(),
+        b"original note"
+    );
+    assert!(late.exists());
+
+    // A verified copy that disappears before recycling also keeps the original.
+    let pair = fixture.directory("Source\\Pair");
+    fixture.file("Source\\Pair\\a.txt", b"pair a");
+    fixture.file("Source\\Pair\\b.txt", b"pair b");
+    let plan = plan_across(
+        &scope,
+        3,
+        std::slice::from_ref(&pair),
+        &destination,
+        ConflictPolicy::Skip,
+        true,
+    )
+    .unwrap();
+    let removed = canonical.join("Pair\\a.txt");
+    let remove = |_: &std::path::Path, target: &std::path::Path| {
+        if target.ends_with("b.txt") {
+            fs::remove_file(&removed).unwrap();
+        }
+    };
+    let outcome = files::execute_with(
+        &scope,
+        &plan,
+        true,
+        &AtomicBool::new(false),
+        &files::Hooks {
+            recycle: &recycle,
+            copied: &remove,
+        },
+    );
+    fixture.own(&outcome.created);
+    let error = outcome.error.clone().unwrap();
+    assert!(
+        error.contains("Verified copy changed before recycling"),
+        "{error}"
+    );
+    assert!(error.contains("The original was kept"), "{error}");
+    assert!(bin.calls().is_empty());
+    assert_eq!(fs::read(pair.join("a.txt")).unwrap(), b"pair a");
+}
+
+#[test]
+fn cross_volume_skip_and_replace_older_leave_skipped_sources_and_remove_only_emptied_folders() {
+    let mut fixture = Fixture::new("across-merge");
+    fixture.directory("Source");
+    let docs = fixture.directory("Source\\Docs");
+    let older = fixture.file("Source\\Docs\\a.txt", b"source a older");
+    fixture.file("Source\\Docs\\new.txt", b"source new");
+    fixture.directory("Source\\Docs\\Sub");
+    let newer = fixture.file("Source\\Docs\\Sub\\b.txt", b"source b newer");
+    fixture.file("Source\\Docs\\Sub\\c.txt", b"source c");
+    fixture.directory("Source\\Docs\\Deep");
+    fixture.file("Source\\Docs\\Deep\\d.txt", b"source d");
+    let destination = fixture.directory("Destination");
+    fixture.directory("Destination\\Docs");
+    let existing_a = fixture.file("Destination\\Docs\\a.txt", b"existing a newer");
+    fixture.directory("Destination\\Docs\\Sub");
+    let existing_b = fixture.file("Destination\\Docs\\Sub\\b.txt", b"existing b older");
+    set_modified(&older, 1_000_000_000);
+    set_modified(&existing_a, 1_100_000_000);
+    set_modified(&newer, 1_200_000_000);
+    set_modified(&existing_b, 1_000_000_000);
+    let bin = FakeBin::new(fixture.directory("Bin"));
+    let scope = fixture.scope();
+    let target = destination.canonicalize().unwrap().join("Docs");
+    let recycle = |items: &[PathBuf]| bin.recycle(items);
+    let hooks = files::Hooks {
+        recycle: &recycle,
+        copied: &no_copy_hook,
+    };
+    let plan = plan_across(
+        &scope,
+        1,
+        std::slice::from_ref(&docs),
+        &destination,
+        ConflictPolicy::ReplaceOlder,
+        true,
+    )
+    .unwrap();
+    assert_eq!(
+        plan.conflict_rows(),
+        [
+            "Merge folder: Docs",
+            "Merge folder: Docs\\Sub",
+            "Skip: Docs\\a.txt (source older or same)",
+            "Replace: Docs\\Sub\\b.txt (source newer)",
+        ]
+    );
+    let outcome = files::execute_with(&scope, &plan, true, &AtomicBool::new(false), &hooks);
+    fixture.own(&outcome.created);
+    fixture.own(&tree(&bin.root));
+    assert!(outcome.error.is_none(), "{outcome:?}");
+    let source = docs.canonicalize().unwrap();
+    assert_eq!(outcome.skipped, vec![source.join("a.txt")]);
+    assert_eq!(outcome.replaced, vec![target.join("Sub\\b.txt")]);
+    assert_eq!(
+        bin.calls(),
+        vec![
+            vec![target.join("Sub\\b.txt")],
+            vec![
+                source.join("Deep"),
+                source.join("new.txt"),
+                source.join("Sub\\b.txt"),
+                source.join("Sub\\c.txt"),
+            ],
+        ],
+        "The replaced destination, then one batch of moved units."
+    );
+    assert_eq!(outcome.recycled, bin.calls()[1]);
+    assert_eq!(
+        outcome.summary().as_deref(),
+        Some(
+            "4 moved across drives (verified), 1 replaced (originals in Recycle Bin), 2 folders merged, 1 skipped, originals in Recycle Bin"
+        )
+    );
+    assert_eq!(
+        fs::read(&older).unwrap(),
+        b"source a older",
+        "Skipped stays."
+    );
+    assert!(
+        !docs.join("Sub").exists(),
+        "The emptied merged folder is removed."
+    );
+    assert!(!docs.join("Deep").exists() && !docs.join("new.txt").exists());
+    assert_eq!(
+        fs::read_dir(&docs).unwrap().count(),
+        1,
+        "The source folder holding a skipped item is kept."
+    );
+    for (name, data) in [
+        ("a.txt", b"existing a newer".as_slice()),
+        ("new.txt", b"source new".as_slice()),
+        ("Sub\\b.txt", b"source b newer".as_slice()),
+        ("Sub\\c.txt", b"source c".as_slice()),
+        ("Deep\\d.txt", b"source d".as_slice()),
+    ] {
+        assert_eq!(fs::read(target.join(name)).unwrap(), data, "{name}");
+    }
+    assert_eq!(
+        fs::read(bin.root.join("0-0-b.txt")).unwrap(),
+        b"existing b older"
+    );
+
+    fixture.directory("Later");
+    let later = fixture.directory("Later\\Docs");
+    let kept = fixture.file("Later\\Docs\\a.txt", b"later a");
+    fixture.file("Later\\Docs\\e.txt", b"later e");
+    fixture.directory("Later\\Docs\\Sub");
+    fixture.file("Later\\Docs\\Sub\\f.txt", b"later f");
+    let plan = plan_across(
+        &scope,
+        2,
+        std::slice::from_ref(&later),
+        &destination,
+        ConflictPolicy::Skip,
+        true,
+    )
+    .unwrap();
+    let outcome = files::execute_with(&scope, &plan, true, &AtomicBool::new(false), &hooks);
+    fixture.own(&outcome.created);
+    fixture.own(&tree(&bin.root));
+    assert!(outcome.error.is_none(), "{outcome:?}");
+    assert_eq!(fs::read(&kept).unwrap(), b"later a");
+    assert!(!later.join("e.txt").exists() && !later.join("Sub").exists());
+    assert_eq!(fs::read(target.join("e.txt")).unwrap(), b"later e");
+    assert_eq!(fs::read(target.join("Sub\\f.txt")).unwrap(), b"later f");
+    assert_eq!(fs::read(target.join("a.txt")).unwrap(), b"existing a newer");
+    assert_eq!(
+        outcome.summary().as_deref(),
+        Some(
+            "2 moved across drives (verified), 2 folders merged, 1 skipped, originals in Recycle Bin"
+        )
+    );
+}
+
+#[test]
+fn cross_volume_keep_both_renames_and_merges_then_recycles_whole_sources() {
+    let mut fixture = Fixture::new("across-keep");
+    fixture.directory("Source");
+    let note = fixture.file("Source\\note.txt", b"moved note");
+    let folder = fixture.directory("Source\\Folder");
+    fixture.file("Source\\Folder\\inner.txt", b"moved inner");
+    let destination = fixture.directory("Destination");
+    fixture.file("Destination\\note.txt", b"existing note");
+    fixture.directory("Destination\\Folder");
+    fixture.file("Destination\\Folder\\inner.txt", b"existing inner");
+    let bin = FakeBin::new(fixture.directory("Bin"));
+    let scope = fixture.scope();
+    let before = hash_inventory(&destination);
+    let plan = plan_across(
+        &scope,
+        1,
+        &[note.clone(), folder.clone()],
+        &destination,
+        ConflictPolicy::KeepBoth,
+        true,
+    )
+    .unwrap();
+    assert_eq!(plan.conflicts().rename, 2);
+    let recycle = |items: &[PathBuf]| bin.recycle(items);
+    let outcome = files::execute_with(
+        &scope,
+        &plan,
+        true,
+        &AtomicBool::new(false),
+        &files::Hooks {
+            recycle: &recycle,
+            copied: &no_copy_hook,
+        },
+    );
+    fixture.own(&outcome.created);
+    fixture.own(&tree(&bin.root));
+    assert!(outcome.error.is_none(), "{outcome:?}");
+    assert_eq!(
+        bin.calls(),
+        vec![
+            vec![plan.sources()[0].clone()],
+            vec![plan.sources()[1].clone()]
+        ],
+        "Nothing was skipped, so each source is one Recycle Bin item."
+    );
+    assert!(!note.exists() && !folder.exists());
+    assert_eq!(
+        fs::read(destination.join("note (2).txt")).unwrap(),
+        b"moved note"
+    );
+    assert_eq!(
+        fs::read(destination.join("Folder\\inner (2).txt")).unwrap(),
+        b"moved inner"
+    );
+    let after = hash_inventory(&destination);
+    for (name, state) in &before {
+        assert_eq!(after.get(name), Some(state), "{name} is untouched");
+    }
+    assert_eq!(
+        outcome.summary().as_deref(),
+        Some("2 moved across drives (verified), 1 folder merged, originals in Recycle Bin")
+    );
+}
+
+#[test]
+fn cross_volume_without_recycle_bin_copies_verifies_and_keeps_originals() {
+    let mut fixture = Fixture::new("across-nobin");
+    fixture.directory("Source");
+    let first = fixture.file("Source\\first.txt", b"first");
+    let folder = fixture.directory("Source\\Folder");
+    fixture.file("Source\\Folder\\inner.txt", b"inner");
+    let destination = fixture.directory("Destination");
+    let journal_path = fixture.directory("Journal");
+    let journal = tomas_commander::journal::Journal::new(journal_path.clone());
+    let scope = fixture.scope();
+    let before = hash_inventory(&fixture.root.join("Source"));
+    let sources = vec![first.clone(), folder.clone()];
+    let plan = plan_across(
+        &scope,
+        1,
+        &sources,
+        &destination,
+        ConflictPolicy::Skip,
+        false,
+    )
+    .unwrap();
+    assert_eq!(
+        plan.move_strategy(),
+        Some(files::MoveStrategy::CrossVolume {
+            recycle_originals: false
+        })
+    );
+    let calls = std::cell::Cell::new(0);
+    let recycle = |_: &[PathBuf]| -> Result<(), String> {
+        calls.set(calls.get() + 1);
+        Err("No Recycle Bin on this drive.".into())
+    };
+    let outcome = journal.execute_with(
+        &scope,
+        &plan,
+        true,
+        &AtomicBool::new(false),
+        &files::Hooks {
+            recycle: &recycle,
+            copied: &no_copy_hook,
+        },
+    );
+    fixture.own(&outcome.created);
+    let mut records: Vec<PathBuf> = fs::read_dir(&journal_path)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    assert!(outcome.error.is_none(), "{outcome:?}");
+    assert_eq!(calls.get(), 0, "Originals are never sent anywhere.");
+    assert_eq!(outcome.kept, plan.sources());
+    assert!(outcome.recycled.is_empty());
+    assert_eq!(
+        outcome.summary().as_deref(),
+        Some("3 copied across drives (verified), originals kept")
+    );
+    assert_eq!(hash_inventory(&fixture.root.join("Source")), before);
+    assert_eq!(fs::read(destination.join("first.txt")).unwrap(), b"first");
+    assert_eq!(
+        fs::read(destination.join("Folder\\inner.txt")).unwrap(),
+        b"inner"
+    );
+    let record = records
+        .iter()
+        .find(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "operation")
+        })
+        .unwrap();
+    let text = fs::read_to_string(record).unwrap();
+    for expected in ["strategy=cross-volume-copy-verify-keep\n", "\nkept="] {
+        assert!(text.contains(expected), "{expected:?} missing in {text}");
+    }
+    records.retain(|path| {
+        path.extension()
+            .is_some_and(|extension| extension == "operation")
+    });
+    records.push(journal_path.join("journal.lock"));
+    fixture.own(&records);
+
+    // The real probe answers for a fixed local drive without touching anything.
+    let probed = files::plan_with_options(
+        &scope,
+        2,
+        Operation::Move,
+        std::slice::from_ref(&first),
+        Some(&destination),
+        ConflictPolicy::KeepBoth,
+        files::PlanOptions {
+            force_cross_volume: true,
+            ..Default::default()
+        },
+        &AtomicBool::new(false),
+    )
+    .unwrap();
+    assert_eq!(
+        probed.move_strategy(),
+        Some(files::MoveStrategy::CrossVolume {
+            recycle_originals: tomas_commander::platform::recycle_bin_available(&first).unwrap()
+        })
+    );
+}
+
+#[test]
+fn cross_volume_cancellation_never_removes_originals_not_yet_recycled() {
+    let mut fixture = Fixture::new("across-cancel");
+    fixture.directory("Source");
+    let first = fixture.file("Source\\first.txt", b"first source");
+    let second = fixture.file("Source\\second.txt", &vec![0x5a; 300_000]);
+    let destination = fixture.directory("Destination");
+    let bin = FakeBin::new(fixture.directory("Bin"));
+    let scope = fixture.scope();
+    let plan = plan_across(
+        &scope,
+        1,
+        &[first.clone(), second.clone()],
+        &destination,
+        ConflictPolicy::Skip,
+        true,
+    )
+    .unwrap();
+    let cancelled = AtomicBool::new(false);
+    let recycle = |items: &[PathBuf]| bin.recycle(items);
+    let cancel = |source: &std::path::Path, _: &std::path::Path| {
+        if source.ends_with("second.txt") {
+            cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    };
+    let outcome = files::execute_with(
+        &scope,
+        &plan,
+        true,
+        &cancelled,
+        &files::Hooks {
+            recycle: &recycle,
+            copied: &cancel,
+        },
+    );
+    fixture.own(&outcome.created);
+    fixture.own(&tree(&bin.root));
+    assert!(outcome.error.is_none(), "{outcome:?}");
+    assert!(outcome.cancelled);
+    assert_eq!(outcome.recycled, vec![plan.sources()[0].clone()]);
+    assert_eq!(bin.calls().len(), 1, "Only the verified first source left.");
+    assert_eq!(fs::read(&second).unwrap(), vec![0x5a; 300_000]);
+    assert!(!first.exists());
+    assert_eq!(outcome.incomplete, vec![plan.sources()[1].clone()]);
+    assert!(
+        outcome
+            .created
+            .contains(&destination.canonicalize().unwrap().join("second.txt")),
+        "The unverified partial copy is reported."
+    );
+}
+
+#[test]
+fn cross_volume_recycle_failure_reports_exactly_which_originals_were_kept() {
+    let mut fixture = Fixture::new("across-recycle-fail");
+    fixture.directory("Source");
+    let docs = fixture.directory("Source\\Docs");
+    fixture.file("Source\\Docs\\keep.txt", b"skipped source");
+    fixture.file("Source\\Docs\\x.txt", b"x");
+    fixture.file("Source\\Docs\\y.txt", b"y");
+    let destination = fixture.directory("Destination");
+    fixture.directory("Destination\\Docs");
+    fixture.file("Destination\\Docs\\keep.txt", b"existing keep");
+    let mut bin = FakeBin::new(fixture.directory("Bin"));
+    bin.fail_call = Some(0);
+    let scope = fixture.scope();
+    let plan = plan_across(
+        &scope,
+        1,
+        std::slice::from_ref(&docs),
+        &destination,
+        ConflictPolicy::Skip,
+        true,
+    )
+    .unwrap();
+    let recycle = |items: &[PathBuf]| bin.recycle(items);
+    let outcome = files::execute_with(
+        &scope,
+        &plan,
+        true,
+        &AtomicBool::new(false),
+        &files::Hooks {
+            recycle: &recycle,
+            copied: &no_copy_hook,
+        },
+    );
+    fixture.own(&outcome.created);
+    fixture.own(&tree(&bin.root));
+    let error = outcome.error.clone().unwrap();
+    assert!(
+        error.contains("Recycling originals failed; 1 original was kept"),
+        "{error}"
+    );
+    assert!(error.contains("Synthetic recycle failure"), "{error}");
+    let source = docs.canonicalize().unwrap();
+    assert_eq!(outcome.recycled, vec![source.join("x.txt")]);
+    assert_eq!(outcome.kept, vec![source.join("y.txt")]);
+    assert_eq!(fs::read(docs.join("y.txt")).unwrap(), b"y");
+    assert_eq!(fs::read(docs.join("keep.txt")).unwrap(), b"skipped source");
+    for name in ["x.txt", "y.txt"] {
+        assert!(
+            destination.join("Docs").join(name).is_file(),
+            "{name} copy remains"
+        );
+    }
+    assert!(
+        outcome
+            .summary()
+            .unwrap()
+            .ends_with("originals in Recycle Bin, 1 original kept")
+    );
+}
+
+#[test]
+fn command_moves_stay_on_one_drive() {
+    use tomas_commander::commands;
+    let mut fixture = Fixture::new("cmd-one-drive");
+    let left = fixture.directory("Left");
+    fixture.directory("Left\\Penta");
+    let right = fixture.directory("Right");
+    let destination = fixture.directory("Right\\Kosik");
+    fixture.file("Left\\Penta\\hackathon-prezentace.pptx", b"one");
+    let scope = fixture.scope();
+    let roots = [left, right];
+    let cancel = AtomicBool::new(false);
+    let intent = commands::Intent::parse(r#"{"status":"ready","action":"move","source":{"status":"ready","terms":[["Penta"],["hackathon"]],"folders":[],"file_types":["document"]},"destination":["Kosik"]}"#).unwrap();
+    let resolution = commands::resolve(&scope, &roots, &intent, &cancel).unwrap();
+    let chosen = resolution
+        .destinations()
+        .iter()
+        .position(|item| item.path() == fs::canonicalize(&destination).unwrap())
+        .unwrap();
+    let before = hash_inventory(&fixture.root);
+    let plan = resolution
+        .plan(&scope, 1, 0, Some(chosen), &cancel)
+        .unwrap();
+    assert_eq!(plan.move_strategy(), Some(files::MoveStrategy::SameVolume));
+    for recycle_bin in [None, Some(true), Some(false)] {
+        let error = resolution
+            .plan_with_options(
+                &scope,
+                2,
+                0,
+                Some(chosen),
+                files::PlanOptions {
+                    force_cross_volume: true,
+                    recycle_bin,
+                    ..Default::default()
+                },
+                &cancel,
+            )
+            .unwrap_err();
+        assert!(
+            error.contains("AI command moves stay on one drive"),
+            "{error}"
+        );
+    }
+    assert_eq!(hash_inventory(&fixture.root), before);
+}
+
+#[test]
+#[ignore = "Native Recycle Bin cross-volume move with exact synthetic-item recovery; run explicitly"]
+fn cross_volume_move_recycles_only_the_owned_original_and_restores_it() {
+    let mut fixture = Fixture::new("across-recycle");
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let parent = fixture.directory("Source");
+    let name = format!("tc-owned-across-{nonce}");
+    let source = fixture.directory(&format!("Source\\{name}"));
+    let inner = fixture.file(
+        &format!("Source\\{name}\\inner.txt"),
+        b"restore this fixture only",
+    );
+    let destination = fixture.directory("Destination");
+    let scope = fixture.scope();
+    let plan = plan_across(
+        &scope,
+        1,
+        std::slice::from_ref(&source),
+        &destination,
+        ConflictPolicy::Skip,
+        true,
+    )
+    .unwrap();
+    let outcome = files::execute(&scope, &plan, true, &AtomicBool::new(false));
+    fixture.own(&outcome.created);
+    assert!(outcome.error.is_none(), "{outcome:?}");
+    assert_eq!(outcome.recycled, plan.sources());
+    assert!(!source.exists());
+    assert_eq!(
+        fs::read(destination.join(&name).join("inner.txt")).unwrap(),
+        b"restore this fixture only"
+    );
+    let parent = parent.display().to_string().replace('\'', "''");
+    let script = format!(
+        r#"
+$ErrorActionPreference='Stop'
+$shell=New-Object -ComObject Shell.Application
+$matches=@($shell.Namespace(10).Items() | Where-Object {{ $_.ExtendedProperty('System.Recycle.DeletedFrom') -eq '{parent}' -and $_.Name -eq '{name}' }})
+if($matches.Count -ne 1) {{ throw "Expected exactly one owned moved original; found $($matches.Count)." }}
+$matches[0].InvokeVerb('undelete')
+"#
+    );
+    let status = Command::new("powershell.exe")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .status()
+        .unwrap();
+    assert!(
+        status.success(),
+        "Exact moved-original restoration failed; no other Recycle Bin item was touched."
+    );
+    for _ in 0..60 {
+        if inner.exists() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert_eq!(fs::read(&inner).unwrap(), b"restore this fixture only");
+}
+
+#[test]
+#[ignore = "Needs TC_SECOND_VOLUME_ROOT on another volume than the temp folder; run explicitly"]
+fn real_second_volume_move_is_planned_and_executed_across_drives() {
+    let other = PathBuf::from(
+        std::env::var_os("TC_SECOND_VOLUME_ROOT").expect("Set TC_SECOND_VOLUME_ROOT"),
+    );
+    let mut fixture = Fixture::new("across-real");
+    let source = fixture.directory("Source");
+    fixture.file("Source\\a.txt", "skutečný přesun".as_bytes());
+    let bin = FakeBin::new(fixture.directory("Bin"));
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let destination = other.join(format!(
+        "tomascommander-across-real-{}-{nonce}",
+        std::process::id()
+    ));
+    fs::create_dir(&destination).unwrap();
+    fixture.own(std::slice::from_ref(&destination));
+    let expected = contents(&source);
+    let scope = Scope::unrestricted();
+    let plan = files::plan_with_policy(
+        &scope,
+        1,
+        Operation::Move,
+        std::slice::from_ref(&source),
+        Some(&destination),
+        ConflictPolicy::Skip,
+        &AtomicBool::new(false),
+    )
+    .unwrap();
+    println!("Strategy: {:?}", plan.move_strategy());
+    assert!(
+        plan.move_strategy()
+            .is_some_and(files::MoveStrategy::cross_volume),
+        "Different volumes must not use the rename path."
+    );
+    let recycle = |items: &[PathBuf]| bin.recycle(items);
+    let outcome = files::execute_with(
+        &scope,
+        &plan,
+        true,
+        &AtomicBool::new(false),
+        &files::Hooks {
+            recycle: &recycle,
+            copied: &no_copy_hook,
+        },
+    );
+    fixture.own(&outcome.created);
+    fixture.own(&tree(&bin.root));
+    assert!(outcome.error.is_none(), "{outcome:?}");
+    assert_eq!(contents(&destination.join("Source")), expected);
+    assert!(!source.exists());
+}

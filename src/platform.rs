@@ -863,12 +863,23 @@ pub fn move_verified(
     unsafe {
         (*information).Anonymous.ReplaceIfExists = false;
         (*information).RootDirectory = HANDLE::default();
-        (*information).FileNameLength = u32::try_from(name_bytes).map_err(|_| "Move filename exceeds Windows limits.")?;
-        std::ptr::copy_nonoverlapping(name.as_ptr(), std::ptr::addr_of_mut!((*information).FileName).cast::<u16>(), name.len());
-        SetFileInformationByHandle(HANDLE(source_handle.as_raw_handle()), FileRenameInfo, information.cast(), length)
-    }.map_err(|e| {
+        (*information).FileNameLength =
+            u32::try_from(name_bytes).map_err(|_| "Move filename exceeds Windows limits.")?;
+        std::ptr::copy_nonoverlapping(
+            name.as_ptr(),
+            std::ptr::addr_of_mut!((*information).FileName).cast::<u16>(),
+            name.len(),
+        );
+        SetFileInformationByHandle(
+            HANDLE(source_handle.as_raw_handle()),
+            FileRenameInfo,
+            information.cast(),
+            length,
+        )
+    }
+    .map_err(|e| {
         format!(
-            "Move approved handle {} -> {} without replacement: {e}. Cross-volume moves are not supported.",
+            "Move approved handle {} -> {} without replacement: {e}",
             crate::files::display_path(source),
             crate::files::display_path(target)
         )
@@ -880,8 +891,13 @@ pub fn move_no_replace(_source: &Path, _target: &Path) -> FileResult<()> {
     Err("Non-overwriting native moves currently require Windows.".into())
 }
 
-#[cfg(windows)]
 pub fn recycle(path: &Path) -> FileResult<()> {
+    recycle_many(&[path.to_owned()])
+}
+
+/// Sends every item to the Recycle Bin in one Windows operation; never deletes permanently.
+#[cfg(windows)]
+pub fn recycle_many(paths: &[std::path::PathBuf]) -> FileResult<()> {
     use windows::{
         Win32::System::Com::{
             CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx,
@@ -900,7 +916,22 @@ pub fn recycle(path: &Path) -> FileResult<()> {
             unsafe { CoUninitialize() };
         }
     }
-    let value = wide(&shell_path(path)?)?;
+    let Some(first) = paths.first() else {
+        return Ok(());
+    };
+    let names = paths
+        .iter()
+        .map(|path| wide(&shell_path(path)?))
+        .collect::<FileResult<Vec<_>>>()?;
+    let label = if paths.len() == 1 {
+        crate::files::display_path(first)
+    } else {
+        format!(
+            "{} items from {}",
+            paths.len(),
+            crate::files::display_path(first.parent().unwrap_or(first))
+        )
+    };
     unsafe {
         CoInitializeEx(None, COINIT_APARTMENTTHREADED)
             .ok()
@@ -909,13 +940,6 @@ pub fn recycle(path: &Path) -> FileResult<()> {
         let operation: IFileOperation =
             CoCreateInstance(&FileOperation, None, CLSCTX_INPROC_SERVER)
                 .map_err(|e| format!("Create Windows recycle operation: {e}"))?;
-        let item: IShellItem =
-            SHCreateItemFromParsingName(PCWSTR(value.as_ptr()), None).map_err(|e| {
-                format!(
-                    "Resolve recycle target {}: {e}",
-                    crate::files::display_path(path)
-                )
-            })?;
         operation
             .SetOperationFlags(
                 FOF_ALLOWUNDO
@@ -928,12 +952,21 @@ pub fn recycle(path: &Path) -> FileResult<()> {
             )
             .map_err(|e| format!("Configure recycle-only operation: {e}"))?;
         let guard: IFileOperationProgressSink = recycle_guard::RecycleOnly.into();
-        operation
-            .DeleteItem(&item, &guard)
-            .map_err(|e| format!("Queue recycle: {e}"))?;
+        for (path, value) in paths.iter().zip(&names) {
+            let item: IShellItem = SHCreateItemFromParsingName(PCWSTR(value.as_ptr()), None)
+                .map_err(|e| {
+                    format!(
+                        "Resolve recycle target {}: {e}",
+                        crate::files::display_path(path)
+                    )
+                })?;
+            operation
+                .DeleteItem(&item, &guard)
+                .map_err(|e| format!("Queue recycle: {e}"))?;
+        }
         operation
             .PerformOperations()
-            .map_err(|e| format!("Recycle {}: {e}", crate::files::display_path(path)))?;
+            .map_err(|e| format!("Recycle {label}: {e}"))?;
         if operation
             .GetAnyOperationsAborted()
             .map_err(|e| format!("Read recycling outcome: {e}"))?
@@ -1090,8 +1123,63 @@ mod recycle_guard {
 }
 
 #[cfg(not(windows))]
-pub fn recycle(_path: &Path) -> FileResult<()> {
+pub fn recycle_many(_paths: &[std::path::PathBuf]) -> FileResult<()> {
     Err("Recycle Bin support currently requires Windows; permanent deletion is never used.".into())
+}
+
+/// Folded root of the volume holding `path` (`C:\`, a mount folder or `\\server\share\`).
+#[cfg(windows)]
+pub fn volume_root(path: &Path) -> FileResult<String> {
+    use windows::{Win32::Storage::FileSystem::GetVolumePathNameW, core::PCWSTR};
+    let value = wide(path)?;
+    let mut root = vec![0u16; value.len().max(260) + 1];
+    unsafe { GetVolumePathNameW(PCWSTR(value.as_ptr()), &mut root) }
+        .map_err(|e| format!("Read volume of {}: {e}", crate::files::display_path(path)))?;
+    let length = root
+        .iter()
+        .position(|unit| *unit == 0)
+        .unwrap_or(root.len());
+    let root = std::path::PathBuf::from(String::from_utf16_lossy(&root[..length]));
+    Ok(crate::files::display_path(&root).to_lowercase())
+}
+
+/// Whether Windows can recycle items from this path's drive. Only fixed local drives have a
+/// Recycle Bin; removable, network, optical and RAM drives would delete permanently.
+#[cfg(windows)]
+pub fn recycle_bin_available(path: &Path) -> FileResult<bool> {
+    use windows::{Win32::Storage::FileSystem::GetDriveTypeW, core::PCWSTR};
+    const DRIVE_FIXED: u32 = 3;
+    let root = volume_root(path)?;
+    let value = wide(Path::new(&root))?;
+    Ok(unsafe { GetDriveTypeW(PCWSTR(value.as_ptr())) } == DRIVE_FIXED)
+}
+
+#[cfg(not(windows))]
+pub fn recycle_bin_available(_path: &Path) -> FileResult<bool> {
+    Ok(false)
+}
+
+#[cfg(all(test, windows))]
+mod volume_tests {
+    use super::*;
+
+    #[test]
+    fn volume_root_and_recycle_probe_agree_for_plain_and_canonical_paths() {
+        let temp = std::env::temp_dir();
+        let canonical = std::fs::canonicalize(&temp).unwrap();
+        let root = volume_root(&temp).unwrap();
+        assert_eq!(volume_root(&canonical).unwrap(), root);
+        assert!(root.ends_with('\\'), "{root}");
+        assert!(
+            crate::files::display_path(&canonical)
+                .to_lowercase()
+                .starts_with(&root),
+            "{root}"
+        );
+        let available = recycle_bin_available(&canonical).unwrap();
+        println!("Recycle Bin probe for {root}: {available}");
+        assert_eq!(recycle_bin_available(&temp).unwrap(), available);
+    }
 }
 
 pub fn open_vscode(path: &Path) -> FileResult<()> {

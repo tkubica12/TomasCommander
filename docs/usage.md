@@ -40,6 +40,19 @@ folder moves its contents and removes emptied source folders; folders that
 still hold skipped items stay. Copies keep the source's modification time.
 Operations lists replaced (original in Recycle Bin), merged and skipped paths.
 AI commands still refuse any existing destination.
+Move between different drives (for example C: to a USB disk or D:) cannot rename,
+so it copies, verifies and then recycles: each file is copied with its
+modification time, re-read and compared by CRC-32, and only after a whole
+selected item is verified and rechecked unchanged does its original go to the
+Recycle Bin (one entry per selected item; if conflicts skipped some files, only
+the moved files go and emptied folders are removed, skipped files stay). The
+review says **Across drives: copy, verify, then send originals to the Recycle
+Bin**; Details shows the strategy. Removable and network drives have no Recycle
+Bin, so the review says the originals are kept, and the Move only copies and
+verifies. A verification mismatch, a source changed during the copy, a failed
+Recycle Bin hand-off or cancellation stops before recycling the affected
+original; Operations reports what was copied, recycled and kept. Originals are
+never deleted permanently. AI commands move only within one drive.
 Prompt editors keep their existing submit/newline shortcuts; they are not
 confirmation dialogs.
 Ctrl+Shift+N creates a new folder, Ctrl+Shift+E renames the focused item,
@@ -62,6 +75,7 @@ only that item's path. The `..` navigation row has no such action.
 
 Drag a row or selected group to the opposite pane/folder. Move is the default;
 hold Ctrl at release for Copy. Drops prepare a plan, not an immediate effect.
+A drag to another drive prepares the same reviewed copy-verify-recycle Move.
 Dragging any selected file (including its selection checkbox) carries the entire
 selected group, including selected files hidden by the filter. An unselected
 file is dragged alone.

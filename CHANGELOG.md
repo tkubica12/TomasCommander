@@ -11,11 +11,21 @@
   removes only emptied source folders. Keep both picks the first free
   `name (2).ext` case-insensitively.
 - Replacement never overwrites in place: originals go to the Recycle Bin after
-  a staged, verified copy or a verified same-volume move. Validation fails if
+  a staged, verified copy or a verified move. Validation fails if
   any conflict changed after review; receipts record the policy, resolutions and
   replaced/merged/skipped paths.
 - Copy now preserves each file's modification time. AI commands and ZIP flows
   keep refusing existing destinations.
+- Move across drives (panes, shortcuts and drag-and-drop): copy, verify each
+  file's CRC-32 by re-reading it, recheck the sources, then send each original
+  to the Recycle Bin as one item (or only the moved files when conflicts skipped
+  some; emptied folders are removed). The review adds "Across drives: copy,
+  verify, then send originals to the Recycle Bin"; Details shows the strategy.
+  Removable and network drives have no Recycle Bin, so originals are kept.
+  Mismatches, changed sources, Recycle Bin failures and cancellation keep the
+  affected originals; Operations reports e.g. "5 moved across drives (verified),
+  2 skipped, originals in Recycle Bin". No permanent-delete fallback; AI command
+  moves stay on one drive.
 
 ## v0.6.0 - 2026-10-31
 

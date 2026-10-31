@@ -10,7 +10,8 @@ local within the two pane roots; paths/candidates/contents are not transmitted.
 Ambiguity asks for a choice. Unsupported/malformed outputs fail explicitly.
 
 Supported pilot intents find, copy, move or recycle one file. They never grant
-overwrite, merge, permanent deletion or effect approval. A successful intent
+overwrite, merge, permanent deletion or effect approval, and a move stays on one
+drive: cross-drive moves are refused at planning. A successful intent
 builds the existing immutable exact-path review; Cancel has no file effect.
 Execution still needs explicit confirmation and revalidated snapshots.
 

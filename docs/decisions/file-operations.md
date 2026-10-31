@@ -40,7 +40,7 @@ Archive only reviewed/reconciled records deliberately.
 | Operation | Contract |
 |---|---|
 | Copy | New files/folders are created exclusively. Existing destinations follow the reviewed conflict policy (below); nothing is overwritten in place. Bounded streaming, length checks and flush. Sources remain. Preserves each copied file's modification time; does not preserve creation time, full ACLs or alternate streams. |
-| Move | Identity-verified handle rename with pinned ancestors and replacement disabled. Merged folders move their children individually; emptied source folders are then removed only if empty. No cross-volume copy/delete fallback. |
+| Move | Same volume (equal volume serial and volume root of the real, resolved paths, so mapped/subst drives compare by their actual volume): identity-verified handle rename with pinned ancestors and replacement disabled; merged folders move their children individually and emptied source folders are then removed only if empty. Different volumes: copy, verify, recycle (below). No permanent-delete fallback. |
 | Recycle | Windows IFileOperation recycling with an abort when recycling is not advertised. No application permanent-delete fallback. |
 | Rename / New folder | Same-folder exact plan; validated Windows names; no collisions, case-only rename, merge or replay. New folder is empty. |
 | Source Save | Frozen original/UTF-8 bytes; BOM/LF/CRLF preservation; invalid JSON, readonly/mixed encoding and stale content fail. Protected staging, byte verification and ReplaceFileW replace only the approved original. |
@@ -66,10 +66,11 @@ is skipped (Skip), given a new name (Keep both) or refused (Replace). Replacemen
 never truncates or overwrites data in place: Copy streams into a uniquely named
 `.tomas-commander-*.stage` file beside the target, flushes and verifies its
 length, rechecks the planned destination fingerprint, sends the old file to the
-Recycle Bin and publishes the staged file with a no-replace rename. Move checks
-the same volume and the destination fingerprint, recycles the old file and then
-performs the verified handle rename. Any failure stops the operation and leaves
-the staging file and the recycled original in place for inspection.
+Recycle Bin and publishes the staged file with a no-replace rename. A same-volume
+Move checks the destination fingerprint, recycles the old file and then
+performs the verified handle rename; a cross-volume Move replaces exactly like
+Copy. Any failure stops the operation and leaves the staging file and the
+recycled original in place for inspection.
 
 The plan's identity includes the fingerprint of every existing destination it
 merges into, replaces or skips. Changed, removed or newly appearing conflicts
@@ -78,6 +79,43 @@ records the policy, each node's resolution (create/merge/replace/skip/rename),
 conflict fingerprints and staging paths; receipts list replaced, merged and
 skipped paths. AI commands and other non-interactive callers keep the legacy
 fail-on-conflict policy; there is no overwrite through AI.
+
+## Cross-volume Move
+
+Planning records the Move strategy in the plan and journal snapshot
+(`strategy=same-volume-rename`, `cross-volume-copy-verify-recycle` or
+`cross-volume-copy-verify-keep`); validation fails if it changes. Conflict
+policies apply exactly as for Copy. For each selected top-level item:
+
+1. Copy every file through the Copy path (exclusive creation or staging,
+   length check, flush, modification time) while computing its CRC-32; close it,
+   re-read the destination and compare. A mismatch stops the Move, keeps the
+   source and reports the bad destination.
+2. After the whole item is copied and verified, recheck every source
+   fingerprint and folder membership against the plan. A change stops before
+   recycling; the original and its verified copy both remain and are reported.
+3. Without skipped descendants, send the item to the Recycle Bin as one entry.
+   Otherwise send only the moved units in one Windows IFileOperation batch, then
+   remove emptied merged source folders with `remove_dir` (which fails on
+   non-empty folders). Skipped items stay untouched.
+
+Recycling reuses the recycle-only guard that aborts when Windows does not
+advertise recycling (no bin, item too large, bin disabled). There is no
+permanent-delete fallback. Planning probes the source drive: only fixed local
+drives have a Recycle Bin, so removable, network, optical and RAM drives (and
+an unanswered probe) plan `cross-volume-copy-verify-keep` and the review states
+that originals are kept. If recycling fails at execution, the operation stops,
+reads back each original and reports exactly which were recycled and which were
+kept. Cancellation never recycles an original whose item was not fully copied,
+verified and rechecked. Receipts add `recycled=` and `kept=` paths. AI command
+moves refuse different volumes at planning.
+
+Verification re-reads through the Windows file cache; it detects copy-path
+corruption, not later media failure. Like Copy, a cross-volume Move keeps
+modification times but not creation times, ACLs or alternate streams. Source
+deletion is not atomic with the copy; the recheck (and a final check that every
+copy is still present) narrows, but does not eliminate, the window for
+concurrent changes.
 
 Copy pins ancestors/source identity and denies source writes/deletion during
 execution. Move rechecks the opened identity/type/size/times. These are not
@@ -101,3 +139,8 @@ Real Recycle Bin recovery is opt-in and must identify the exact owned fixture.
 Never empty the Recycle Bin or touch unrelated items. Automated conflict tests
 cover planning, validation and non-replacing execution; the replacement test that
 recycles and restores its own synthetic originals is ignored by default.
+Cross-volume tests force the strategy on one volume and inject a recycler that
+moves items into a fixture folder, plus a post-copy hook for corruption,
+source-change and cancellation cases (`#[doc(hidden)]` seams). The real
+Recycle Bin and real second-volume (`TC_SECOND_VOLUME_ROOT`) tests are ignored by
+default.

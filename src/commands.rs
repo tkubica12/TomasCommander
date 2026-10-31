@@ -132,6 +132,27 @@ impl Resolution {
         destination: Option<usize>,
         cancelled: &AtomicBool,
     ) -> FileResult<Plan> {
+        self.plan_with_options(
+            scope,
+            id,
+            source,
+            destination,
+            files::PlanOptions::default(),
+            cancelled,
+        )
+    }
+
+    /// `plan` with test seams; AI commands always refuse existing targets and other drives.
+    #[doc(hidden)]
+    pub fn plan_with_options(
+        &self,
+        scope: &Scope,
+        id: u64,
+        source: usize,
+        destination: Option<usize>,
+        options: files::PlanOptions,
+        cancelled: &AtomicBool,
+    ) -> FileResult<Plan> {
         if cancelled.load(Ordering::Acquire) {
             return Err("Command planning cancelled; no effects.".into());
         }
@@ -159,7 +180,19 @@ impl Resolution {
             }
             None
         };
-        files::plan_cancellable(scope, id, operation, &[source], target, cancelled)
+        files::plan_with_options(
+            scope,
+            id,
+            operation,
+            &[source],
+            target,
+            files::ConflictPolicy::Fail,
+            files::PlanOptions {
+                same_volume_only: true,
+                ..options
+            },
+            cancelled,
+        )
     }
 }
 
