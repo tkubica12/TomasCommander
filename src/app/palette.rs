@@ -44,6 +44,12 @@ pub(super) enum Command {
     Accent,
     Foundry,
     Answers,
+    NewTab,
+    CloseTab,
+    NextTab,
+    PreviousTab,
+    Back,
+    Forward,
 }
 
 impl Command {
@@ -91,6 +97,12 @@ impl Command {
             Self::Accent => "/accent",
             Self::Foundry => "/foundry",
             Self::Answers => "/answers",
+            Self::NewTab => "/new-tab",
+            Self::CloseTab => "/close-tab",
+            Self::NextTab => "/next-tab",
+            Self::PreviousTab => "/previous-tab",
+            Self::Back => "/back",
+            Self::Forward => "/forward",
         }
     }
 }
@@ -164,7 +176,7 @@ pub(super) fn palette_submission(
     }
 }
 
-pub(super) const COMMANDS: [(Command, &str, &str); 42] = [
+pub(super) const COMMANDS: [(Command, &str, &str); 48] = [
     (
         Command::Rename,
         "Rename focused file / folder",
@@ -212,6 +224,20 @@ pub(super) const COMMANDS: [(Command, &str, &str); 42] = [
         "Undo parent navigation",
         "Ctrl Right",
     ),
+    (
+        Command::Back,
+        "Back / previous folder in this tab",
+        "Alt Left / Mouse back",
+    ),
+    (
+        Command::Forward,
+        "Forward / next folder in this tab",
+        "Alt Right / Mouse forward",
+    ),
+    (Command::NewTab, "New tab / current folder", "Ctrl T"),
+    (Command::CloseTab, "Close tab", "Ctrl W"),
+    (Command::NextTab, "Next tab", "Ctrl Tab"),
+    (Command::PreviousTab, "Previous tab", "Ctrl Shift Tab"),
     (Command::JumpUp, "Jump up ten rows", "Page Up / Ctrl Up"),
     (
         Command::JumpDown,

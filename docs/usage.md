@@ -99,6 +99,66 @@ ZIP-to-ZIP transfers are unsupported.
 Saved places are available in the left rail and Alt+Up popup. Edit changes the
 display name; Delete removes only its bookmark.
 
+### Tabs and folder history
+
+Each pane holds one or more tabs; exactly one is active. Ctrl+T (`/new-tab`)
+opens the current folder in a new tab right of the active one and switches to
+it. Ctrl+W (`/close-tab`) closes the active tab and activates its right
+neighbour (or the new last tab); the last tab cannot be closed. Ctrl+Tab and
+Ctrl+Shift+Tab (`/next-tab`, `/previous-tab`) cycle with wrap-around. These
+chords also work while typing in the pane filter; plain Tab still switches
+panes. They apply to the active file pane, not to a reading pane.
+
+Every tab keeps its own folder, sort column and direction, filter text, focused
+item, selection, Ctrl+Left/Right parent returns and Back/Forward history.
+Inactive tabs keep no listing, scan or folder watcher: switching to a tab loads
+its folder like Refresh (folder sizes come from the shared cache when still
+valid). Folders are checked in the background, so a slow or offline network
+folder never freezes the window. If the folder has disappeared or cannot be
+reached, the tab shows its nearest existing parent instead and the status bar
+says `Folder X is not available; showing Y.`; without any existing parent (for
+example an unplugged drive) the pane shows the usual folder-read error.
+Selected items that no longer exist are dropped.
+
+With two or more tabs, a single strip at the top of the pane header shows each
+folder name (the drive, such as `D:\`, for roots); hover shows the full path.
+The active tab uses the accent colour. Click a tab to activate it, middle-click
+it or use its `×` to close it, and `+` for a new tab. Tabs shrink in narrow
+panes and the strip scrolls sideways when they still do not fit. With one tab
+the pane looks as before. Dropping files on a tab prepares the usual reviewed
+Copy/Move plan into that tab's folder.
+
+A tab browsing a ZIP shows the ZIP name. New, close and switch commands first
+close that ZIP view; returning to the tab shows the folder containing the ZIP
+with the ZIP focused. Back/Forward are not available inside a ZIP view.
+
+Alt+Left / Alt+Right (`/back`, `/forward`), the mouse side buttons over a pane,
+or the header's `‹` `›` buttons move through the active tab's folder history.
+Every navigation (Enter, Backspace, Ctrl+Left/Right, breadcrumbs, typed paths,
+saved places, drive choice, Recent and search results) records the folder it
+leaves and clears Forward; Back and Forward move between the two lists without
+clearing them. Refresh and operation updates record nothing, and opening the
+folder already shown is not recorded twice. Each direction keeps 50 folders.
+Back and Forward open the remembered folder without checking it first; one
+that no longer exists or cannot be reached falls back in the background to its
+nearest existing parent with the same status message, and that parent takes
+its place in the history. Typed paths, Enter and other ordinary navigation
+still report an unavailable folder as an error.
+Ctrl+Left/Ctrl+Right keep their parent/return behaviour; going to the parent is
+also an ordinary history step.
+
+Open tab folders and the active tab of each pane are saved when Commander
+closes (and with any other settings change) and restored at the next launch.
+No saved folder is checked before the window opens: each pane's active tab
+loads in the background and falls back to its nearest existing parent like a
+switched-to tab, and inactive tabs are checked only when activated, so an
+unreachable network folder never delays startup. `--root` opens one tab per
+pane at that folder for that run and neither restores nor overwrites the saved
+tabs. In fixture mode (`--fixture-root`) every saved tab is checked at launch
+and only folders inside the fixture are restored (a pane without any opens the
+fixture root). Fixture runs restore and save tabs only with an explicit
+`--settings` file, so they never replace the tabs in your default preferences.
+
 ### Undo
 
 Ctrl+Shift+U or `/undo` prepares the inverse of the most recent operation that
@@ -293,8 +353,9 @@ replaces it or the application closes.
 `/search query` prefills it without sending anything to a provider.
 There is no separate AI-search toolbar button.
 
-Preferences: `%LOCALAPPDATA%\TomasCommander\preferences.txt`. v1-v4 remain
-readable; v5 adds watched Recent folders. Appearance, zoom, favorites/names and
+Preferences: `%LOCALAPPDATA%\TomasCommander\preferences.txt`. v1-v5 remain
+readable; v5 added watched Recent folders and v6 adds each pane's tab folders
+and active tab (`tabs=` line). Appearance, zoom, favorites/names, tabs and
 Recent folder settings persist. Activity is stored separately in
 `recent-activity.json` beside preferences; legacy Recent entries migrate using
 known modification times, not invented opening times. Operations use a durable

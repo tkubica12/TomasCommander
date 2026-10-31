@@ -174,6 +174,11 @@ impl Ledger {
                     | Command::Answers
                     | Command::Activity
                     | Command::Balance
+                    // Tab commands close the ZIP view first (see `leave_tab`).
+                    | Command::NewTab
+                    | Command::CloseTab
+                    | Command::NextTab
+                    | Command::PreviousTab
             ) {
                 self.fail("This command requires a regular filesystem pane; close ZIP or Tab to the other pane.");
                 return;
@@ -338,6 +343,14 @@ impl Ledger {
             }
             Command::Parent => self.parent(self.active),
             Command::ReturnInside => self.return_inside(self.active),
+            Command::Back | Command::Forward => {
+                self.step_history(self.active, matches!(command, Command::Forward));
+            }
+            Command::NewTab => self.new_tab(self.active),
+            Command::CloseTab => self.close_tab(self.active, self.panes[self.active].tab),
+            Command::NextTab | Command::PreviousTab => {
+                self.cycle_tab(self.active, matches!(command, Command::NextTab));
+            }
             Command::JumpUp | Command::JumpDown => {
                 self.panes[self.active].jump(matches!(command, Command::JumpDown));
                 self.file_focus_requested = true;

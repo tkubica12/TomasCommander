@@ -143,6 +143,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         std::env::current_dir().map_err(|e| format!("Read working directory: {e}"))?;
     let mut fixture = None;
     let mut settings = None;
+    let mut root_argument = false;
     #[cfg(feature = "native-desktop-tests")]
     let mut desktop_metrics = None;
     #[cfg(feature = "native-search-tests")]
@@ -165,7 +166,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             #[cfg(feature = "native-answer-tests")]
             Some("--answer-ui-test") => answer_ui_test = true,
             Some("--root") => {
-                initial = PathBuf::from(arguments.next().ok_or("--root requires a path")?)
+                initial = PathBuf::from(arguments.next().ok_or("--root requires a path")?);
+                root_argument = true;
             }
             Some("--fixture-root") => {
                 let root = PathBuf::from(arguments.next().ok_or("--fixture-root requires a path")?);
@@ -196,6 +198,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let desktop_metrics = desktop_metrics
         .map(|path| desktop_metrics::Metrics::new(&path, started))
         .transpose()?;
+    let persist_tabs = app::persist_tabs(root_argument, fixture.is_some(), settings.is_some());
     let scope = match fixture {
         Some(root) => Scope::fixture(&root)?,
         None => Scope::unrestricted(),
@@ -231,7 +234,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         "Tomas Commander",
         options,
         Box::new(move |creation| {
-            let ledger = app::Ledger::new(creation, initial, scope, settings, started);
+            // --root runs and fixture runs on the default settings file open one tab per pane
+            // at the launch folder; saved tabs are neither restored nor overwritten.
+            let ledger =
+                app::Ledger::new(creation, initial, scope, settings, started, persist_tabs);
             #[cfg(feature = "native-desktop-tests")]
             let ledger = {
                 let mut ledger = ledger;

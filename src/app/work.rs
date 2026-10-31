@@ -3,6 +3,9 @@ use super::*;
 pub(super) struct ScanRequest {
     pub(super) path: PathBuf,
     pub(super) generation: u64,
+    /// Reopening a remembered folder (tab activation, Back/Forward, launch): the worker falls
+    /// back to the nearest existing ancestor when the folder is missing or unreachable.
+    pub(super) fallback: bool,
 }
 pub(super) struct ScanResult {
     pub(super) pane: usize,
@@ -10,7 +13,8 @@ pub(super) struct ScanResult {
     pub(super) content: ScanContent,
 }
 pub(super) enum ScanContent {
-    Listing(FileResult<Listing>),
+    /// The listing and, after a fallback, the requested folder that was not available.
+    Listing(FileResult<(Listing, Option<PathBuf>)>),
     Aggregate {
         path: PathBuf,
         result: FileResult<files::DirectoryStats>,
@@ -20,6 +24,31 @@ pub(super) struct ScanWorker {
     pub(super) sender: SyncSender<ScanRequest>,
     pub(super) generation: Arc<AtomicU64>,
     pub(super) pending: Option<ScanRequest>,
+    /// Whether the latest request falls back to an existing ancestor.
+    pub(super) fallback: bool,
+}
+
+impl ScanWorker {
+    /// Queues a scan of `path`; results of earlier requests become stale.
+    pub(super) fn request(&mut self, path: PathBuf, fallback: bool) {
+        let generation = self.generation.fetch_add(1, Ordering::Relaxed) + 1;
+        self.fallback = fallback;
+        self.pending = Some(ScanRequest {
+            path,
+            generation,
+            fallback,
+        });
+    }
+
+    pub(super) fn current(&self, generation: u64) -> bool {
+        self.generation.load(Ordering::Relaxed) == generation
+    }
+
+    /// Whether reloading `path` in `pane` keeps the fallback: the pane is still loading that
+    /// remembered folder (for example when an operation refreshes both panes meanwhile).
+    pub(super) fn reload_falls_back(&self, pane: &Pane, path: &std::path::Path) -> bool {
+        self.fallback && pane.busy && pane.path == path
+    }
 }
 
 pub(super) enum Change {
@@ -458,7 +487,7 @@ impl Ledger {
         }
         let mut aggregate_changed = [false; 2];
         while let Ok(result) = self.scan_results.try_recv() {
-            if self.scans[result.pane].generation.load(Ordering::Relaxed) != result.generation {
+            if !self.scans[result.pane].current(result.generation) {
                 continue;
             }
             let pane = &mut self.panes[result.pane];
@@ -476,30 +505,19 @@ impl Ledger {
             };
             pane.busy = false;
             match listing {
-                Ok(listing) => {
-                    pane.path = listing.path;
-                    pane.path_text = files::display_path(&pane.path);
-                    pane.replace_entries(listing.entries);
-                    let paths: BTreeSet<_> = pane
-                        .entries
-                        .iter()
-                        .map(|entry| entry.path.clone())
-                        .collect();
-                    pane.selected.retain(|path| paths.contains(path));
-                    pane.rebuild();
-                    pane.anchor = pane.focus_position();
-                    pane.warning = if listing.warnings.is_empty() {
-                        None
-                    } else {
-                        Some(listing.warnings.join("\n"))
-                    };
+                Ok((listing, missing)) => {
+                    let note = pane.show_listing(listing, missing);
                     self.status = format!("{} items / ready", pane.entries.len());
                     if result.pane == self.active {
                         self.file_focus_requested = true;
                     }
+                    if let Some(note) = note {
+                        self.log(note);
+                    }
                 }
                 Err(error) => {
                     pane.pending_aggregates.clear();
+                    pane.restore_scroll = None;
                     pane.warning = Some(error.clone());
                     self.fail(error);
                 }
@@ -764,6 +782,8 @@ impl Ledger {
 
     fn poll_preferences_save(&mut self, ctx: &egui::Context) {
         if self.save_pending && self.preferences_writable {
+            // Every save carries the current tab folders.
+            self.sync_tab_preferences();
             match self.work.try_send(Work::Save(self.preferences.clone())) {
                 Ok(()) => {
                     self.save_pending = false;
@@ -776,9 +796,14 @@ impl Ledger {
                     self.fail("Preferences worker disconnected.");
                 }
             }
-            if self.close_after_save && !self.save_pending && self.saves_in_flight == 0 {
-                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-            }
+        }
+        // A close deferred for saving resumes once the last save has finished.
+        if self.close_after_save
+            && !(self.save_pending && self.preferences_writable)
+            && self.saves_in_flight == 0
+        {
+            self.close_after_save = false;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
     }
 }

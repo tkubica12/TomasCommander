@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+- Pane tabs: Ctrl+T opens the current folder in a new tab, Ctrl+W closes the
+  active tab (never the last one), Ctrl+Tab / Ctrl+Shift+Tab cycle tabs; also
+  `/new-tab`, `/close-tab`, `/next-tab`, `/previous-tab`. Each tab keeps its
+  folder, sort, filter, focus, selection and history; only the active tab of a
+  pane is loaded. With two or more tabs a compact strip appears at the top of
+  the pane header (click, middle-click or `×` to close, `+`, drop files on a
+  tab). Tab folders and the active tab are saved in preferences v6 (v1-v5 stay
+  readable) and restored at launch. Folders are checked in the background, so
+  an offline network folder never freezes the window; a missing or unreachable
+  one falls back to its nearest existing parent with a status message. `--root`
+  runs and `--fixture-root` runs without `--settings` neither restore nor
+  overwrite saved tabs.
+- Folder history per tab: Alt+Left / Alt+Right, mouse side buttons, the
+  header's `‹` `›` buttons, `/back` and `/forward`. Up to 50 folders each way;
+  a missing folder falls back to its nearest existing parent, which replaces
+  it in the history.
+- Closing right after a settings change now closes once the save finishes
+  instead of leaving the window open.
 - Reviewed Undo: Ctrl+Shift+U or `/undo` prepares the inverse of the latest
   undoable operation as an exact plan ("Undo Move: 3 items back to D:\x") with
   every path and Recycle Bin restore under Details; Enter confirms, Escape

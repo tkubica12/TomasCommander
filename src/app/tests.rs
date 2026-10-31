@@ -8,6 +8,7 @@ mod palette;
 mod pane;
 mod pane_ui;
 mod recent_rail;
+mod tabs;
 mod theme;
 mod work;
 

@@ -28,7 +28,7 @@ The binary is unsigned; this project does not provide code-signing or support.
 
 ```powershell
 .\tomas-commander.exe
-# Optional initial folder:
+# Optional initial folder (one tab per pane; saved tabs stay for later runs):
 .\tomas-commander.exe --root "C:\Projects"
 ```
 
@@ -36,6 +36,9 @@ The binary is unsigned; this project does not provide code-signing or support.
 
 - Two file panes, keyboard navigation, multi-selection, filtering, recursive
   filename search and sortable size/date columns.
+- Tabs in each pane (Ctrl+T, Ctrl+W, Ctrl+Tab) with their own folder, sort,
+  filter, focus and Back/Forward history (Alt+Left/Right or mouse side
+  buttons); tab folders are restored at the next launch.
 - Copy, move, Recycle Bin deletion, rename and new folder, with
   exact-path confirmation and durable operation receipts. Copy/Move conflicts
   offer Skip, Replace older, Replace all (originals to the Recycle Bin) or Keep
@@ -74,6 +77,9 @@ The binary is unsigned; this project does not provide code-signing or support.
 | Tab / arrows | Switch pane / navigate |
 | Enter / Backspace | Open / parent folder |
 | Ctrl+Left / Ctrl+Right | Parent / return after parent navigation |
+| Alt+Left / Alt+Right or mouse back / forward | Back / forward in the active tab's folder history |
+| Ctrl+T / Ctrl+W | New tab at the current folder / close tab |
+| Ctrl+Tab / Ctrl+Shift+Tab | Next / previous tab in the active pane |
 | PageUp / PageDown or Ctrl+Up / Ctrl+Down | Jump ten rows |
 | Space / Shift+arrows / Ctrl+A | Toggle / range / select all |
 | Ctrl+Enter | Toggle preview; a different file replaces it |

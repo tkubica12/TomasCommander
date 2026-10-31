@@ -62,6 +62,12 @@ pub(super) const FILE_NAME_FONT: egui::FontId = egui::FontId {
 const SCROLL_GUTTER: f32 = 12.0;
 pub const MIN_WINDOW_SIZE: [f32; 2] = [880.0, 560.0];
 
+/// Whether a run restores the saved tabs and saves its own: not with `--root`, and not for a
+/// `--fixture-root` run using the default settings file, whose real tabs must survive.
+pub fn persist_tabs(root_argument: bool, fixture: bool, settings_explicit: bool) -> bool {
+    !root_argument && (!fixture || settings_explicit)
+}
+
 pub struct Ledger {
     reader: crate::viewer_ui::ReaderPanel,
     archive: crate::viewer_ui::ReaderPanel,
@@ -88,6 +94,8 @@ pub struct Ledger {
     history_pending: bool,
     viewport_zoom: f32,
     preferences_writable: bool,
+    /// Whether tab folders are restored at launch and saved; see [`persist_tabs`].
+    persist_tabs: bool,
     save_pending: bool,
     saves_in_flight: usize,
     close_after_save: bool,

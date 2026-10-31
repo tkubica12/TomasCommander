@@ -869,6 +869,7 @@ fn actual_preferences_roundtrip_and_invalid_file_preservation() {
         favorite_names: Default::default(),
         recent_documents: Vec::new(),
         recent_roots: Some(vec![fixture.root.clone()]),
+        tabs: Default::default(),
     };
     let favorite = preferences.favorites[0].clone();
     preferences
@@ -1029,8 +1030,217 @@ fn recent_documents_are_bounded_deduplicated_and_old_preferences_load() {
     assert!(
         fs::read_to_string(settings)
             .unwrap()
-            .starts_with("TomasCommander preferences v5\n")
+            .starts_with("TomasCommander preferences v6\n")
     );
+}
+
+#[test]
+fn pane_tabs_preferences_v6_roundtrip_and_v5_migration() {
+    use tomas_commander::preferences::PaneTabs;
+    let mut fixture = Fixture::new("tab-preferences");
+    let left = fixture.directory("Left");
+    let right = fixture.directory("Pravý panel");
+    let settings = fixture.file(
+        "preferences.txt",
+        b"TomasCommander preferences v5\ndark=false\naccent=1\nzoom=1.25\nrecent_roots=[]\n",
+    );
+    let migrated = Preferences::load(&settings).unwrap();
+    assert_eq!(migrated.tabs, [None, None]);
+    assert!(!migrated.dark);
+    assert_eq!(migrated.recent_roots, Some(Vec::new()));
+    let mut preferences = migrated.clone();
+    preferences.tabs = [
+        Some(PaneTabs {
+            folders: vec![left.clone(), right.clone(), fixture.root.clone()],
+            active: 1,
+        }),
+        None,
+    ];
+    preferences.save(&settings).unwrap();
+    let text = fs::read_to_string(&settings).unwrap();
+    assert!(
+        text.starts_with("TomasCommander preferences v6\n"),
+        "{text}"
+    );
+    assert_eq!(text.matches("tabs=").count(), 1, "{text}");
+    let loaded = Preferences::load(&settings).unwrap();
+    assert_eq!(loaded.tabs, preferences.tabs);
+    assert!(!loaded.dark);
+    assert_eq!(loaded.accent, 1);
+    assert_eq!(loaded.recent_roots, Some(Vec::new()));
+    let mut cleared = loaded.clone();
+    cleared.tabs = [None, None];
+    cleared.save(&settings).unwrap();
+    assert!(!fs::read_to_string(&settings).unwrap().contains("tabs="));
+    assert_eq!(Preferences::load(&settings).unwrap().tabs, [None, None]);
+
+    let header = "TomasCommander preferences v6\n";
+    let folder = serde_json::to_string(&left).unwrap();
+    for invalid in [
+        "tabs=[{\"folders\":[],\"active\":0},null]".to_owned(),
+        format!("tabs=[{{\"folders\":[{folder}],\"active\":1}},null]"),
+        "tabs=[{\"folders\":[\"relative\"],\"active\":0},null]".to_owned(),
+        format!("tabs=[{{\"folders\":[{folder}],\"active\":0,\"extra\":1}},null]"),
+        "tabs=[null,null]\ntabs=[null,null]".to_owned(),
+        "tabs=not json".to_owned(),
+    ] {
+        fs::write(&settings, format!("{header}{invalid}\n")).unwrap();
+        assert!(Preferences::load(&settings).is_err(), "{invalid}");
+    }
+    let too_many = Preferences {
+        tabs: [
+            Some(PaneTabs {
+                folders: vec![left.clone(); PaneTabs::MAX + 1],
+                active: 0,
+            }),
+            None,
+        ],
+        ..Preferences::default()
+    };
+    fs::write(&settings, header).unwrap();
+    assert!(too_many.save(&settings).is_err());
+    assert_eq!(fs::read_to_string(&settings).unwrap(), header);
+}
+
+#[test]
+fn pane_tabs_restore_nearest_existing_folder_inside_fixture_boundary() {
+    use tomas_commander::preferences::PaneTabs;
+    let mut fixture = Fixture::new("tab-restore");
+    let inside = fixture.directory("Inside");
+    let kept = fixture.directory("Inside\\Kept");
+    let outside = fixture.directory("Outside");
+    let scope = Scope::fixture(&inside).unwrap();
+    let resolved_inside = scope.resolve(&inside).unwrap();
+    let resolved_kept = scope.resolve(&kept).unwrap();
+    let saved = PaneTabs {
+        folders: vec![
+            outside.clone(),
+            kept.join("Removed").join("Deeper"),
+            kept.clone(),
+            inside.join("Gone"),
+        ],
+        active: 0,
+    };
+    let restored = saved.restore_in(&scope).unwrap();
+    assert_eq!(
+        restored.folders,
+        vec![
+            resolved_kept.clone(),
+            resolved_kept.clone(),
+            resolved_inside.clone()
+        ]
+    );
+    // The active tab was outside the boundary and dropped; the first kept tab is active.
+    assert_eq!(restored.active, 0);
+    let active_kept = PaneTabs {
+        active: 2,
+        ..saved.clone()
+    };
+    assert_eq!(active_kept.restore_in(&scope).unwrap().active, 1);
+    let active_dropped_after_kept = PaneTabs {
+        folders: vec![kept.clone(), outside.clone()],
+        active: 1,
+    };
+    assert_eq!(
+        active_dropped_after_kept.restore_in(&scope).unwrap(),
+        PaneTabs {
+            folders: vec![resolved_kept.clone()],
+            active: 0,
+        }
+    );
+    assert_eq!(
+        PaneTabs {
+            folders: vec![outside.clone(), fixture.root.join("Missing")],
+            active: 1,
+        }
+        .restore_in(&scope),
+        None
+    );
+    // Without a fixture boundary nothing is checked at launch: folders stay verbatim (not even
+    // canonicalized), and the scan worker falls back when a tab loads, so a missing or offline
+    // folder - active or not - cannot delay startup.
+    let unrestricted = PaneTabs {
+        folders: vec![
+            PathBuf::from(r"\\offline.invalid\share\project"),
+            outside.join("Missing").join("Deeper"),
+            outside.join("..").join("Outside"),
+        ],
+        active: 1,
+    };
+    assert_eq!(
+        unrestricted.restore_in(&Scope::unrestricted()),
+        Some(unrestricted.clone())
+    );
+    let file = fixture.file("Inside\\file.txt", b"not a folder");
+    assert_eq!(
+        PaneTabs {
+            folders: vec![file],
+            active: 0,
+        }
+        .restore_in(&scope)
+        .unwrap()
+        .folders,
+        vec![resolved_inside]
+    );
+    assert_eq!(
+        PaneTabs::persistable(vec![PathBuf::from("relative"), kept.clone()], 0),
+        Some(PaneTabs {
+            folders: vec![kept],
+            active: 0,
+        })
+    );
+    assert_eq!(
+        PaneTabs::persistable(vec![PathBuf::from("relative")], 0),
+        None
+    );
+}
+
+#[test]
+fn remembered_folder_listing_falls_back_to_nearest_existing_ancestor_inside_scope() {
+    let mut fixture = Fixture::new("listing-fallback");
+    let inside = fixture.directory("Inside");
+    let kept = fixture.directory("Inside\\Kept");
+    let lonely = fixture.directory("Inside\\Lonely");
+    fixture.file("Inside\\Kept\\note.txt", b"note");
+    let scope = Scope::fixture(&inside).unwrap();
+    let resolved_inside = scope.resolve(&inside).unwrap();
+    let resolved_kept = scope.resolve(&kept).unwrap();
+
+    let (listing, missing) = files::list_directory_or_ancestor(&scope, &kept, || false).unwrap();
+    assert_eq!((listing.path, missing), (resolved_kept.clone(), None));
+
+    // A deleted tab or history folder (stored canonical) shows its nearest existing ancestor.
+    let gone = resolved_kept.join("Removed").join("Deeper");
+    let (listing, missing) = files::list_directory_or_ancestor(&scope, &gone, || false).unwrap();
+    assert_eq!(listing.path, resolved_kept);
+    assert_eq!(missing, Some(gone.clone()));
+    assert_eq!(listing.entries.len(), 1);
+    // Ordinary navigation keeps its error, and a superseded scan tries no ancestor.
+    assert!(files::list_directory_cancellable(&scope, &gone, || false).is_err());
+    assert!(files::list_directory_or_ancestor(&scope, &gone, || true).is_err());
+
+    // A file where the folder was.
+    let replaced = fixture.file("Inside\\Kept\\Replaced", b"file");
+    let (listing, missing) =
+        files::list_directory_or_ancestor(&scope, &replaced, || false).unwrap();
+    assert_eq!((listing.path, missing), (resolved_kept, Some(replaced)));
+
+    let (listing, missing) =
+        files::list_directory_or_ancestor(&Scope::unrestricted(), &inside.join("Missing"), || {
+            false
+        })
+        .unwrap();
+    assert_eq!(listing.path, resolved_inside);
+    assert_eq!(missing, Some(inside.join("Missing")));
+
+    // Without an existing folder inside the scope the original error stays; the existing
+    // parent outside the fixture is never listed.
+    let narrow = Scope::fixture(&lonely).unwrap();
+    let resolved_lonely = narrow.resolve(&lonely).unwrap();
+    fs::remove_dir(&lonely).unwrap();
+    let requested = resolved_lonely.join("Child");
+    let error = files::list_directory_or_ancestor(&narrow, &requested, || false).unwrap_err();
+    assert!(error.contains(&files::display_path(&requested)), "{error}");
 }
 
 #[test]

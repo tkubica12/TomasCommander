@@ -15,6 +15,8 @@ pub struct Preferences {
     pub favorite_names: std::collections::BTreeMap<PathBuf, String>,
     pub recent_documents: Vec<PathBuf>,
     pub recent_roots: Option<Vec<PathBuf>>,
+    /// Saved tab folders of the left and right pane; `None` opens the launch folder.
+    pub tabs: [Option<PaneTabs>; 2],
 }
 
 impl Default for Preferences {
@@ -27,8 +29,103 @@ impl Default for Preferences {
             favorite_names: Default::default(),
             recent_documents: Vec::new(),
             recent_roots: None,
+            tabs: [None, None],
         }
     }
+}
+
+/// One pane's tab folders, left to right, and the active tab.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PaneTabs {
+    pub folders: Vec<PathBuf>,
+    pub active: usize,
+}
+
+impl PaneTabs {
+    pub const MAX: usize = 32;
+
+    /// Keeps persistable folders (absolute Unicode paths), remapping the active tab.
+    pub fn persistable(folders: Vec<PathBuf>, active: usize) -> Option<Self> {
+        Self::select(folders.into_iter(), active, |folder| {
+            (folder.is_absolute() && folder.to_str().is_some()).then_some(folder)
+        })
+    }
+
+    /// Replaces each folder with its nearest existing ancestor accepted by `resolve`
+    /// and drops folders without one. `None` when no tab survives.
+    pub fn restore(&self, resolve: impl Fn(&Path) -> Option<PathBuf>) -> Option<Self> {
+        Self::select(self.folders.iter(), self.active, |folder| {
+            nearest_folder(folder, &resolve)
+        })
+    }
+
+    /// The tabs to reopen at launch. With a fixture boundary every folder is checked like
+    /// [`Self::restore`], limited to existing folders inside the fixture. Otherwise no
+    /// filesystem access happens: absolute folders are kept verbatim and the scan worker falls
+    /// back to the nearest existing ancestor when a tab's folder loads, so an unreachable network
+    /// folder cannot delay launch.
+    pub fn restore_in(&self, scope: &crate::files::Scope) -> Option<Self> {
+        if scope.root().is_some() {
+            return self.restore(|path| existing_folder(scope, path));
+        }
+        Self::persistable(self.folders.clone(), self.active)
+    }
+
+    fn select<T>(
+        folders: impl Iterator<Item = T>,
+        active: usize,
+        mut keep: impl FnMut(T) -> Option<PathBuf>,
+    ) -> Option<Self> {
+        let mut kept = Vec::new();
+        let mut selected = 0;
+        for (index, folder) in folders.enumerate() {
+            if kept.len() == Self::MAX {
+                break;
+            }
+            if let Some(folder) = keep(folder) {
+                // A dropped active tab falls back to the nearest kept tab on its left.
+                if index <= active {
+                    selected = kept.len();
+                }
+                kept.push(folder);
+            }
+        }
+        (!kept.is_empty()).then_some(Self {
+            folders: kept,
+            active: selected,
+        })
+    }
+
+    fn validate(&self) -> FileResult<()> {
+        if self.folders.is_empty()
+            || self.folders.len() > Self::MAX
+            || self.active >= self.folders.len()
+            || self
+                .folders
+                .iter()
+                .any(|folder| !folder.is_absolute() || folder.to_str().is_none())
+        {
+            return Err(format!(
+                "Pane tabs need 1 to {} absolute folders and a valid active tab.",
+                Self::MAX
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// The resolved folder when `path` is an existing directory inside `scope`.
+pub fn existing_folder(scope: &crate::files::Scope, path: &Path) -> Option<PathBuf> {
+    scope
+        .resolve(path)
+        .ok()
+        .filter(|resolved| resolved.is_dir())
+}
+
+/// The first of `path` and its ancestors accepted by `resolve`.
+pub fn nearest_folder(path: &Path, resolve: impl Fn(&Path) -> Option<PathBuf>) -> Option<PathBuf> {
+    path.ancestors().find_map(resolve)
 }
 
 impl Preferences {
@@ -95,6 +192,7 @@ impl Preferences {
                     | "TomasCommander preferences v3"
                     | "TomasCommander preferences v4"
                     | "TomasCommander preferences v5"
+                    | "TomasCommander preferences v6"
             )
         ) {
             return Err(
@@ -102,6 +200,7 @@ impl Preferences {
             );
         }
         let mut preferences = Self::default();
+        let mut tabs_seen = false;
         for line in lines {
             if let Some(value) = line.strip_prefix("dark=") {
                 preferences.dark = match value {
@@ -137,6 +236,17 @@ impl Preferences {
                     .map_err(|error| format!("Invalid Recent roots: {error}"))?;
                 validate_recent_roots(&roots)?;
                 preferences.recent_roots = Some(roots);
+            } else if let Some(value) = line.strip_prefix("tabs=") {
+                if tabs_seen {
+                    return Err("Duplicate pane tab configuration.".into());
+                }
+                tabs_seen = true;
+                let tabs: [Option<PaneTabs>; 2] = serde_json::from_str(value)
+                    .map_err(|error| format!("Invalid pane tabs: {error}"))?;
+                for pane in tabs.iter().flatten() {
+                    pane.validate()?;
+                }
+                preferences.tabs = tabs;
             } else if let Some(value) = line.strip_prefix("recent=") {
                 let path = PathBuf::from(value);
                 if !document_path(&path) || preferences.recent_documents.len() >= Self::MAX_RECENT {
@@ -169,7 +279,7 @@ impl Preferences {
             .as_nanos();
         let temporary = parent.join(format!("preferences-{nonce}.tmp"));
         let mut text = format!(
-            "TomasCommander preferences v5\ndark={}\naccent={}\nzoom={}\n",
+            "TomasCommander preferences v6\ndark={}\naccent={}\nzoom={}\n",
             self.dark, self.accent, self.zoom
         );
         if let Some(roots) = &self.recent_roots {
@@ -178,6 +288,16 @@ impl Preferences {
                 "recent_roots={}\n",
                 serde_json::to_string(roots)
                     .map_err(|error| format!("Encode Recent roots: {error}"))?
+            ));
+        }
+        if self.tabs.iter().any(Option::is_some) {
+            for pane in self.tabs.iter().flatten() {
+                pane.validate()?;
+            }
+            text.push_str(&format!(
+                "tabs={}\n",
+                serde_json::to_string(&self.tabs)
+                    .map_err(|error| format!("Encode pane tabs: {error}"))?
             ));
         }
         for (field, paths) in [

@@ -1,3 +1,4 @@
+use super::keyboard::side_button_history;
 use super::*;
 
 pub(crate) fn reveal_row(offset: f32, position: usize, viewport_height: f32) -> f32 {
@@ -49,6 +50,225 @@ pub(super) struct RowColumns {
     pub(super) name: egui::Rect,
     pub(super) size: egui::Rect,
     pub(super) age: egui::Rect,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum TabAction {
+    Activate(usize),
+    Close(usize),
+    New,
+}
+
+pub(super) struct TabLabel {
+    pub(super) name: String,
+    pub(super) hover: String,
+    /// Folder targeted by drops on this label; `None` while the tab shows a ZIP.
+    pub(super) drop: Option<PathBuf>,
+}
+
+impl TabLabel {
+    pub(super) fn folder(path: &std::path::Path) -> Self {
+        Self {
+            name: folder_label(path),
+            hover: files::display_path(path),
+            drop: Some(path.to_owned()),
+        }
+    }
+}
+
+pub(super) struct TabStrip {
+    pub(super) action: Option<TabAction>,
+    // Geometry is read by the layout tests.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(super) rect: egui::Rect,
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(super) tabs: Vec<egui::Rect>,
+}
+
+const TAB_HEIGHT: f32 = 20.0;
+const TAB_CLOSE_WIDTH: f32 = 16.0;
+const TAB_GAP: f32 = 2.0;
+
+/// One compact row of tabs with close buttons and "+". Hidden (`None`) for a single tab.
+/// Tabs shrink to fit the pane and scroll horizontally beyond that, so the strip never
+/// widens the pane.
+pub(super) fn tab_strip(
+    ui: &mut egui::Ui,
+    pane: usize,
+    labels: &[TabLabel],
+    active: usize,
+    accent: Color32,
+) -> Option<TabStrip> {
+    if labels.len() < 2 {
+        return None;
+    }
+    let font = egui::TextStyle::Small.resolve(ui.style());
+    let width = ui.available_width().max(1.0);
+    let plus_width = TAB_HEIGHT + 2.0;
+    let strip_width = (width - plus_width - TAB_GAP).max(0.0);
+    let slot = (strip_width / labels.len() as f32 - TAB_CLOSE_WIDTH - TAB_GAP).clamp(28.0, 150.0);
+    let id = Id::new(("tab-strip", pane));
+    let reveal = ui.data_mut(|data| {
+        let previous = data.get_temp::<usize>(id);
+        data.insert_temp(id, active);
+        previous != Some(active)
+    });
+    let mut action = None;
+    let mut tabs = Vec::new();
+    let response = ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing = Vec2::new(TAB_GAP, 0.0);
+        ui.spacing_mut().scroll.floating = true;
+        egui::ScrollArea::horizontal()
+            .id_salt(id)
+            .max_width(strip_width)
+            .min_scrolled_width(0.0)
+            .auto_shrink([true, true])
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    for (index, label) in labels.iter().enumerate() {
+                        let selected = index == active;
+                        let natural = ui
+                            .painter()
+                            .layout_no_wrap(label.name.clone(), font.clone(), Color32::WHITE)
+                            .size()
+                            .x
+                            + 12.0;
+                        let (rect, _) = ui.allocate_exact_size(
+                            Vec2::new(natural.min(slot) + TAB_CLOSE_WIDTH, TAB_HEIGHT),
+                            egui::Sense::hover(),
+                        );
+                        let close_rect = egui::Rect::from_min_max(
+                            egui::pos2(rect.right() - TAB_CLOSE_WIDTH, rect.top()),
+                            rect.max,
+                        );
+                        let name_rect = rect.with_max_x(close_rect.left());
+                        let tab = ui
+                            .interact(name_rect, id.with(("tab", index)), egui::Sense::click())
+                            .on_hover_text(label.hover.as_str());
+                        let close = ui
+                            .interact(close_rect, id.with(("close", index)), egui::Sense::click())
+                            .on_hover_text("Close tab / Ctrl W / middle-click");
+                        tab.widget_info(|| {
+                            egui::WidgetInfo::selected(
+                                egui::WidgetType::Button,
+                                ui.is_enabled(),
+                                selected,
+                                format!("Tab {}", label.name),
+                            )
+                        });
+                        close.widget_info(|| {
+                            egui::WidgetInfo::labeled(
+                                egui::WidgetType::Button,
+                                ui.is_enabled(),
+                                format!("Close tab {}", label.name),
+                            )
+                        });
+                        let visuals = ui.visuals();
+                        let fill = if selected {
+                            tint(visuals.panel_fill, accent, 40)
+                        } else if tab.hovered() || close.hovered() {
+                            visuals.faint_bg_color
+                        } else {
+                            visuals.extreme_bg_color
+                        };
+                        let painter = ui.painter().with_clip_rect(rect.intersect(ui.clip_rect()));
+                        painter.rect_filled(rect, 2.0, fill);
+                        if selected {
+                            painter.hline(
+                                rect.x_range(),
+                                rect.bottom() - 1.0,
+                                Stroke::new(2.0, accent),
+                            );
+                        }
+                        let color = if selected {
+                            accent
+                        } else {
+                            visuals.text_color()
+                        };
+                        let mut job = egui::text::LayoutJob::simple_singleline(
+                            label.name.clone(),
+                            font.clone(),
+                            color,
+                        );
+                        job.wrap = egui::text::TextWrapping::truncate_at_width(
+                            (name_rect.width() - 8.0).max(0.0),
+                        );
+                        let galley = painter.layout_job(job);
+                        painter.galley(
+                            egui::pos2(
+                                name_rect.left() + 6.0,
+                                name_rect.center().y - galley.size().y / 2.0,
+                            ),
+                            galley,
+                            color,
+                        );
+                        painter.text(
+                            close_rect.center(),
+                            egui::Align2::CENTER_CENTER,
+                            "\u{d7}",
+                            font.clone(),
+                            if close.hovered() {
+                                visuals.text_color()
+                            } else {
+                                visuals.weak_text_color()
+                            },
+                        );
+                        if let Some(folder) = &label.drop {
+                            register_drop_zone(
+                                ui.ctx(),
+                                rect.intersect(ui.clip_rect()),
+                                DropLocation::Folder(folder.clone()),
+                                1,
+                            );
+                        }
+                        if tab.clicked() {
+                            action = Some(TabAction::Activate(index));
+                        }
+                        if close.clicked()
+                            || tab.clicked_by(egui::PointerButton::Middle)
+                            || close.clicked_by(egui::PointerButton::Middle)
+                        {
+                            action = Some(TabAction::Close(index));
+                        }
+                        if selected && reveal {
+                            tab.scroll_to_me(None);
+                        }
+                        tabs.push(rect);
+                    }
+                });
+            });
+        let (rect, plus) =
+            ui.allocate_exact_size(Vec2::new(plus_width, TAB_HEIGHT), egui::Sense::click());
+        let plus = plus.on_hover_text("New tab / Ctrl T");
+        plus.widget_info(|| {
+            egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), "New tab")
+        });
+        let visuals = ui.visuals();
+        ui.painter().rect_filled(
+            rect,
+            2.0,
+            if plus.hovered() {
+                visuals.faint_bg_color
+            } else {
+                visuals.extreme_bg_color
+            },
+        );
+        ui.painter().text(
+            rect.center(),
+            egui::Align2::CENTER_CENTER,
+            "+",
+            font.clone(),
+            visuals.text_color(),
+        );
+        if plus.clicked() {
+            action = Some(TabAction::New);
+        }
+    });
+    Some(TabStrip {
+        action,
+        rect: response.response.rect,
+        tabs,
+    })
 }
 
 impl RowColumns {
@@ -103,6 +323,7 @@ impl Ledger {
             self.reader_pane_ui(ui, index);
             return;
         }
+        let mut history_step = side_button_history(ui.ctx(), ui.max_rect());
         if ui.input(|input| {
             input.pointer.any_pressed()
                 && input
@@ -149,10 +370,25 @@ impl Ledger {
             }
         }
         selection_footer(ui, index, pane, active, accent, muted, border);
+        let tab_labels = (pane.tabs.len() > 1).then(|| {
+            (0..pane.tabs.len())
+                .map(|tab| TabLabel::folder(pane.tab_path(tab)))
+                .collect::<Vec<_>>()
+        });
+        let current_tab = pane.tab;
+        let can_back = !pane.history.back.is_empty();
+        let can_forward = !pane.history.forward.is_empty();
+        let mut tab_action = None;
         let heading = egui::Frame::new()
             .fill(stripe)
             .inner_margin(egui::Margin::symmetric(12, 9))
             .show(ui, |ui| {
+                if let Some(labels) = &tab_labels
+                    && let Some(strip) = tab_strip(ui, index, labels, current_tab, accent)
+                {
+                    tab_action = strip.action;
+                    ui.add_space(6.0);
+                }
                 ui.horizontal_wrapped(|ui| {
                     ui.label(
                         RichText::new(if index == 0 {
@@ -168,7 +404,8 @@ impl Ledger {
                             ui.visuals().weak_text_color()
                         }),
                     );
-                    let layout = if ui.available_width() < 100.0 {
+                    let narrow = ui.available_width() < 100.0;
+                    let layout = if narrow {
                         egui::Layout::left_to_right(egui::Align::Center).with_main_wrap(true)
                     } else {
                         egui::Layout::right_to_left(egui::Align::Center)
@@ -179,6 +416,24 @@ impl Ledger {
                             .small_button("..")
                             .on_hover_text("Parent folder / choose drive at root / Backspace")
                             .clicked();
+                        let mut buttons = [
+                            (true, can_forward, "\u{203a}", "Forward / Alt Right"),
+                            (false, can_back, "\u{2039}", "Back / Alt Left"),
+                        ];
+                        if narrow {
+                            buttons.reverse();
+                        }
+                        for (forward, enabled, glyph, label) in buttons {
+                            let response = ui
+                                .add_enabled(enabled, egui::Button::new(glyph).small())
+                                .on_hover_text(label);
+                            ui.ctx().accesskit_node_builder(response.id, |node| {
+                                node.set_label(label);
+                            });
+                            if response.clicked() {
+                                history_step = Some(forward);
+                            }
+                        }
                     });
                 })
             });
@@ -643,6 +898,19 @@ impl Ledger {
                 0,
             );
         }
+        if let Some(action) = tab_action {
+            self.apply_tab_action(index, action);
+            return;
+        }
+        if let Some(forward) = history_step
+            && editable
+            && ui.is_enabled()
+        {
+            self.active = index;
+            self.rail_index = None;
+            self.step_history(index, forward);
+            return;
+        }
         if let Some((pending_pane, path, started)) = &self.inline_pending
             && *pending_pane == index
             && ui.input(|input| input.time) - started
@@ -705,6 +973,32 @@ impl Ledger {
             self.active = index;
             self.rail_index = None;
         }
+        let pane = &self.panes[index];
+        let tab_labels = (pane.tabs.len() > 1).then(|| {
+            let (archive, _) = self.archive.archive_location();
+            (0..pane.tabs.len())
+                .map(|tab| {
+                    if tab == pane.tab {
+                        TabLabel {
+                            name: folder_label(&archive),
+                            hover: files::display_path(&archive),
+                            drop: None,
+                        }
+                    } else {
+                        TabLabel::folder(pane.tab_path(tab))
+                    }
+                })
+                .collect::<Vec<_>>()
+        });
+        let current_tab = pane.tab;
+        let accent = self.accent();
+        let tab_action = tab_labels.and_then(|labels| {
+            egui::Frame::new()
+                .inner_margin(egui::Margin::symmetric(12, 6))
+                .show(ui, |ui| tab_strip(ui, index, &labels, current_tab, accent))
+                .inner
+                .and_then(|strip| strip.action)
+        });
         let (close, extract) = self.archive.show_archive(ui, self.active == index);
         if close {
             self.archive.close();
@@ -737,6 +1031,9 @@ impl Ledger {
                 DropLocation::Zip { archive, prefix },
                 0,
             );
+        }
+        if let Some(action) = tab_action {
+            self.apply_tab_action(index, action);
         }
     }
 

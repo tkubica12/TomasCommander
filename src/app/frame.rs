@@ -214,11 +214,12 @@ impl Ledger {
         {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             self.log("Recent settings are still being validated. Close again after they finish.");
-        } else if ctx.input(|input| input.viewport().close_requested())
-            && ((self.save_pending && self.preferences_writable) || self.saves_in_flight > 0)
-        {
-            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            self.close_after_save = true;
+        } else if ctx.input(|input| input.viewport().close_requested()) {
+            self.sync_tab_preferences();
+            if (self.save_pending && self.preferences_writable) || self.saves_in_flight > 0 {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                self.close_after_save = true;
+            }
         }
     }
 

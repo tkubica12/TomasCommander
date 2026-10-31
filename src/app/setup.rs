@@ -7,11 +7,24 @@ impl Ledger {
         scope: Scope,
         settings: PathBuf,
         started: Instant,
+        restore_tabs: bool,
     ) -> Self {
         let (preferences, error, preferences_writable) = match Preferences::load(&settings) {
             Ok(preferences) => (preferences, None, true),
             Err(error) => (Preferences::default(), Some(error), false),
         };
+        // Fixture runs restore only existing folders inside the fixture. Otherwise saved folders
+        // are not touched here: the scan worker falls back to the nearest existing ancestor when
+        // a tab loads. Panes without any saved tab open the launch folder.
+        let panes = preferences.tabs.clone().map(|saved| {
+            match saved
+                .filter(|_| restore_tabs)
+                .and_then(|saved| saved.restore_in(&scope))
+            {
+                Some(tabs) => Pane::with_tabs(tabs.folders, tabs.active),
+                None => Pane::new(initial.clone()),
+            }
+        });
         let (scan_tx, scan_results) = mpsc::sync_channel(8);
         let aggregate_cache = Arc::new(tomas_commander::directory_cache::DirectoryCache::default());
         let (cache_sender, cache_changes) = mpsc::sync_channel(8);
@@ -32,6 +45,7 @@ impl Ledger {
                 sender,
                 generation,
                 pending: None,
+                fallback: false,
             });
         }
         let (work, jobs) = mpsc::sync_channel::<Work>(4);
@@ -74,7 +88,7 @@ impl Ledger {
             file_agent: crate::file_agent_ui::FileAgentPanel::new(),
             answers: crate::answers_ui::AnswerPanel::new(),
             command_dialog: None,
-            panes: [Pane::new(initial.clone()), Pane::new(initial.clone())],
+            panes,
             path_edits: [false; 2],
             active: 0,
             scope,
@@ -90,6 +104,7 @@ impl Ledger {
             history_pending: false,
             viewport_zoom: creation.egui_ctx.zoom_factor(),
             preferences_writable,
+            persist_tabs: restore_tabs,
             save_pending: false,
             saves_in_flight: 0,
             close_after_save: false,
@@ -143,7 +158,7 @@ impl Ledger {
             desktop_metrics: None,
         };
         if app.preferences.favorites.is_empty() {
-            app.preferences.favorites.push(initial.clone());
+            app.preferences.favorites.push(initial);
         }
         #[cfg(windows)]
         app.load_windows_fonts(&creation.egui_ctx);
@@ -152,8 +167,9 @@ impl Ledger {
             .egui_ctx
             .options_mut(|options| options.zoom_with_keyboard = false);
         creation.egui_ctx.set_zoom_factor(app.preferences.zoom);
-        app.navigate(0, initial.clone());
-        app.navigate(1, initial);
+        for index in 0..2 {
+            app.load_active_tab(index);
+        }
         app
     }
 
@@ -234,15 +250,19 @@ fn spawn_scan_worker(
             if current.load(Ordering::Relaxed) != request.generation {
                 continue;
             }
-            let listing = files::list_directory_cancellable(&scope, &request.path, || {
-                current.load(Ordering::Relaxed) != request.generation
-            });
-            if current.load(Ordering::Relaxed) != request.generation {
+            let stale = || current.load(Ordering::Relaxed) != request.generation;
+            let listing = if request.fallback {
+                files::list_directory_or_ancestor(&scope, &request.path, stale)
+            } else {
+                files::list_directory_cancellable(&scope, &request.path, stale)
+                    .map(|listing| (listing, None))
+            };
+            if stale() {
                 continue;
             }
             let directories: Vec<_> = listing
                 .as_ref()
-                .map(|listing| {
+                .map(|(listing, _)| {
                     listing
                         .entries
                         .iter()

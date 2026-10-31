@@ -167,6 +167,22 @@ impl Ledger {
             self.file_focus_requested = true;
             return;
         }
+        // Tab and history chords also work from the active pane's filter field.
+        let filter = Id::new(("filter", self.active));
+        if self.reader.target != Some(self.active)
+            && (!editing || ctx.memory(|memory| memory.has_focus(filter)))
+            && let Some(command) =
+                consume_tab_command(ctx, self.archive.target != Some(self.active))
+        {
+            ctx.memory_mut(|memory| {
+                memory.surrender_focus(filter);
+                memory.move_focus(egui::FocusDirection::None);
+            });
+            self.rail_index = None;
+            self.dispatch(command);
+            self.file_focus_requested = true;
+            return;
+        }
         if editing {
             return;
         }
@@ -460,6 +476,57 @@ pub(super) const FILE_PANE_CHORDS: [(Key, Command); 5] = [
     (Key::F, Command::Search),
     (Key::D, Command::Recycle),
 ];
+
+/// Tab chords, matched exactly (no extra Shift or Alt) so plain Tab keeps switching panes.
+pub(super) const TAB_CHORDS: [(Modifiers, Key, Command); 4] = [
+    (
+        Modifiers {
+            ctrl: true,
+            shift: true,
+            ..Modifiers::NONE
+        },
+        Key::Tab,
+        Command::PreviousTab,
+    ),
+    (Modifiers::CTRL, Key::Tab, Command::NextTab),
+    (Modifiers::CTRL, Key::T, Command::NewTab),
+    (Modifiers::CTRL, Key::W, Command::CloseTab),
+];
+
+/// Folder history chords.
+pub(super) const HISTORY_CHORDS: [(Modifiers, Key, Command); 2] = [
+    (Modifiers::ALT, Key::ArrowLeft, Command::Back),
+    (Modifiers::ALT, Key::ArrowRight, Command::Forward),
+];
+
+/// Consumes one tab chord, or a history chord when `history` is allowed (file panes).
+pub(super) fn consume_tab_command(ctx: &egui::Context, history: bool) -> Option<Command> {
+    TAB_CHORDS
+        .into_iter()
+        .chain(HISTORY_CHORDS.into_iter().filter(|_| history))
+        .find_map(|(modifiers, key, command)| {
+            consume_prompt_key(ctx, modifiers, key).then_some(command)
+        })
+}
+
+/// Mouse side buttons over `rect`: `Some(false)` for Back, `Some(true)` for Forward.
+pub(super) fn side_button_history(ctx: &egui::Context, rect: egui::Rect) -> Option<bool> {
+    ctx.input(|input| {
+        if !input
+            .pointer
+            .interact_pos()
+            .is_some_and(|position| rect.contains(position))
+        {
+            None
+        } else if input.pointer.button_pressed(egui::PointerButton::Extra1) {
+            Some(false)
+        } else if input.pointer.button_pressed(egui::PointerButton::Extra2) {
+            Some(true)
+        } else {
+            None
+        }
+    })
+}
 
 // egui 0.36 text editors expose ValuePattern but do not process SetValue.
 pub(crate) fn accessible_text_value(ctx: &egui::Context, id: Id, text: &mut String) -> bool {

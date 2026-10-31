@@ -196,14 +196,18 @@ impl Scope {
     }
 
     pub fn resolve(&self, path: &Path) -> FileResult<PathBuf> {
-        let resolved = fs::canonicalize(path).map_err(|e| io_error("Resolve", path, e))?;
+        self.resolve_folder(path).map_err(|failure| failure.message)
+    }
+
+    fn resolve_folder(&self, path: &Path) -> Result<PathBuf, ListFailure> {
+        let resolved = fs::canonicalize(path).map_err(|e| ListFailure::io("Resolve", path, e))?;
         if let Some(root) = &self.root
             && !resolved.starts_with(root)
         {
-            return Err(format!(
-                "Outside the fixture boundary: {}",
-                display_path(path)
-            ));
+            return Err(ListFailure {
+                message: format!("Outside the fixture boundary: {}", display_path(path)),
+                unavailable: true,
+            });
         }
         Ok(resolved)
     }
@@ -240,12 +244,70 @@ pub fn list_directory_cancellable(
     path: &Path,
     stale: impl Fn() -> bool,
 ) -> FileResult<Listing> {
-    let path = scope.resolve(path)?;
+    read_listing(scope, path, &stale).map_err(|failure| failure.message)
+}
+
+/// [`list_directory_cancellable`] for reopening a remembered folder (an activated tab, a
+/// Back/Forward step or a restored tab). When `path` no longer exists or cannot be reached
+/// (deleted, unplugged drive, offline share), lists its nearest listable ancestor inside the
+/// scope instead and also returns `path`; ancestors of a fixture root are never tried. Denied
+/// access keeps its error. Each attempt may wait for a network timeout, so call it on a worker.
+pub fn list_directory_or_ancestor(
+    scope: &Scope,
+    path: &Path,
+    stale: impl Fn() -> bool,
+) -> FileResult<(Listing, Option<PathBuf>)> {
+    let failure = match read_listing(scope, path, &stale) {
+        Ok(listing) => return Ok((listing, None)),
+        Err(failure) => failure,
+    };
+    if failure.unavailable {
+        for ancestor in path.ancestors().skip(1) {
+            if stale()
+                || scope
+                    .root()
+                    .is_some_and(|root| root != ancestor && root.starts_with(ancestor))
+            {
+                break;
+            }
+            if let Ok(listing) = read_listing(scope, ancestor, &stale) {
+                return Ok((listing, Some(path.to_owned())));
+            }
+        }
+    }
+    Err(failure.message)
+}
+
+/// A failed folder listing. `unavailable` when the folder is missing or unreachable rather than
+/// access-denied or superseded.
+struct ListFailure {
+    message: String,
+    unavailable: bool,
+}
+
+impl ListFailure {
+    fn io(action: &str, path: &Path, error: std::io::Error) -> Self {
+        Self {
+            unavailable: error.kind() != std::io::ErrorKind::PermissionDenied,
+            message: io_error(action, path, error),
+        }
+    }
+}
+
+fn read_listing(
+    scope: &Scope,
+    path: &Path,
+    stale: &impl Fn() -> bool,
+) -> Result<Listing, ListFailure> {
+    let path = scope.resolve_folder(path)?;
     let mut entries = Vec::new();
     let mut warnings = Vec::new();
-    for result in fs::read_dir(&path).map_err(|e| io_error("Read folder", &path, e))? {
+    for result in fs::read_dir(&path).map_err(|e| ListFailure::io("Read folder", &path, e))? {
         if stale() {
-            return Err("Directory scan was superseded.".into());
+            return Err(ListFailure {
+                message: "Directory scan was superseded.".into(),
+                unavailable: false,
+            });
         }
         match result {
             Ok(item) => match fs::symlink_metadata(item.path()) {
