@@ -363,7 +363,8 @@ impl Ledger {
         let editable = self.plan.is_none()
             && self.error.is_none()
             && !self.palette
-            && self.command_dialog.is_none();
+            && self.command_dialog.is_none()
+            && self.proposal_review.is_none();
         if editable {
             accessible_text_value(ui.ctx(), Id::new(("path", index)), &mut pane.path_text);
             if accessible_text_value(ui.ctx(), Id::new(("filter", index)), &mut pane.filter) {

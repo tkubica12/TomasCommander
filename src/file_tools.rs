@@ -106,7 +106,7 @@ fn validate_path_syntax(path: &Path) -> ai::Result<()> {
     Ok(())
 }
 
-fn protected(path: &Path) -> bool {
+pub(crate) fn protected(path: &Path) -> bool {
     path.components().any(|part| {
         let name = part.as_os_str().to_string_lossy().to_ascii_lowercase();
         matches!(
@@ -349,6 +349,10 @@ impl Tools {
             cache: RefCell::default(),
             extractions: Cell::new(0),
         })
+    }
+
+    pub fn settings(&self) -> &Settings {
+        &self.settings
     }
 
     fn resolve(&self, path: &Path) -> ai::Result<(PathBuf, File, bool, Vec<File>)> {
@@ -916,7 +920,8 @@ pub fn tool_definitions() -> Vec<Value> {
         "parameters":{"type":"object","properties":{"path":{"type":"string"},"offset":{"type":"integer","minimum":0},
             "length":{"type":"integer","minimum":1,"maximum":6000},
             "version_id":{"type":["integer","null"],"minimum":1,"maximum":1000}},"required":["path","offset","length","version_id"],
-            "additionalProperties":false},"strict":true}))).collect()
+            "additionalProperties":false},"strict":true})))
+        .chain(std::iter::once(crate::proposal::tool_definition())).collect()
 }
 
 #[cfg(all(test, windows))]

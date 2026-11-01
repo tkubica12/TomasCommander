@@ -117,7 +117,7 @@ impl NavVia {
 }
 
 /// Modal dialogs tracked for `dialog` events, in [`Ledger::usage_open_dialogs`] order.
-pub(super) const DIALOG_NAMES: [&str; 25] = [
+pub(super) const DIALOG_NAMES: [&str; 26] = [
     "drive_picker",
     "place_name",
     "settings",
@@ -143,6 +143,7 @@ pub(super) const DIALOG_NAMES: [&str; 25] = [
     "foundry",
     "answers",
     "usage_insights",
+    "ai_proposal",
 ];
 
 /// One pane's filter "session": from the first typed character until cleared or left.
@@ -234,6 +235,10 @@ impl PendingOperation {
                 detail: Some(plan.label().to_owned()),
                 ..Self::named("undo", plan.rows().len(), None)
             },
+            Change::UndoBatch(plan) => Self {
+                detail: Some(plan.label().to_owned()),
+                ..Self::named("undo", plan.len(), None)
+            },
         }
     }
 }
@@ -259,7 +264,7 @@ pub(super) fn change_name(change: &Change) -> &'static str {
         Change::Save(_) => "review_save",
         Change::Archive(_) => "review_zip",
         Change::Name(_) => "review_rename",
-        Change::Undo(_) => "review_undo",
+        Change::Undo(_) | Change::UndoBatch(_) => "review_undo",
     }
 }
 
@@ -973,7 +978,10 @@ impl Ledger {
             matches!(self.change_plan, Some(Change::Save(_))),
             matches!(self.change_plan, Some(Change::Archive(_))),
             matches!(self.change_plan, Some(Change::Name(_))),
-            matches!(self.change_plan, Some(Change::Undo(_))),
+            matches!(
+                self.change_plan,
+                Some(Change::Undo(_) | Change::UndoBatch(_))
+            ),
             plan == Some(Operation::Copy),
             plan == Some(Operation::Move),
             plan == Some(Operation::Recycle),
@@ -982,6 +990,7 @@ impl Ledger {
             self.ai.open,
             self.answers.open,
             self.usage.insights.is_some(),
+            self.proposal_review.is_some(),
         ]
     }
 

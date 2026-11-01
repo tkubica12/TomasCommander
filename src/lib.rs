@@ -16,6 +16,7 @@ pub mod pdf;
 mod pdf_text;
 pub mod platform;
 pub mod preferences;
+pub mod proposal;
 pub mod recent;
 pub mod search;
 pub mod text_preview;

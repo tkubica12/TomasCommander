@@ -58,6 +58,7 @@ pub(super) enum Change {
     Archive(tomas_commander::archive_changes::Plan),
     Name(tomas_commander::naming::Plan),
     Undo(tomas_commander::undo::Plan),
+    UndoBatch(tomas_commander::undo::BatchPlan),
 }
 impl Change {
     pub(super) fn id(&self) -> u64 {
@@ -66,6 +67,7 @@ impl Change {
             Self::Archive(plan) => plan.id,
             Self::Name(plan) => plan.id,
             Self::Undo(plan) => plan.id,
+            Self::UndoBatch(plan) => plan.id,
         }
     }
     pub(super) fn label(&self) -> &'static str {
@@ -74,12 +76,14 @@ impl Change {
             Self::Archive(plan) => plan.label,
             Self::Name(plan) => plan.label(),
             Self::Undo(plan) => plan.label(),
+            Self::UndoBatch(plan) => plan.label(),
         }
     }
     /// Review heading, e.g. "Undo Move: 3 items back to D:\x".
     pub(super) fn heading(&self) -> String {
         match self {
             Self::Undo(plan) => plan.heading(),
+            Self::UndoBatch(plan) => plan.heading(),
             _ => self.label().to_owned(),
         }
     }
@@ -93,6 +97,11 @@ impl Change {
                 plan.heading(),
                 plan.undoes()
             ),
+            Self::UndoBatch(plan) => format!(
+                "{}\nUndoes the operations of batch {} newest first. Each operation's inverse is prepared and rechecked just before it runs; the batch stops at the first change, leaving earlier operations as they are.",
+                plan.heading(),
+                plan.batch()
+            ),
         }
     }
     pub(super) fn confirm_label(&self) -> &'static str {
@@ -101,6 +110,7 @@ impl Change {
             Self::Archive(_) => "Confirm",
             Self::Name(_) => "Rename",
             Self::Undo(_) => "Undo",
+            Self::UndoBatch(_) => "Undo batch",
         }
     }
 
@@ -118,6 +128,11 @@ impl Change {
                 ui.label("No overwrite.");
             }
             Self::Undo(plan) => {
+                for line in plan.effect_lines() {
+                    ui.add(egui::Label::new(line).wrap());
+                }
+            }
+            Self::UndoBatch(plan) => {
                 for line in plan.effect_lines() {
                     ui.add(egui::Label::new(line).wrap());
                 }
@@ -165,6 +180,20 @@ impl Change {
                         }
                     });
             }
+            if let Self::UndoBatch(plan) = self {
+                let rows = plan.rows();
+                egui::ScrollArea::both()
+                    .id_salt("undo-batch-rows")
+                    .max_height(180.0)
+                    .show_rows(ui, ROW_HEIGHT, rows.len(), |ui, range| {
+                        for row in &rows[range] {
+                            ui.add(
+                                egui::Label::new(row.as_str())
+                                    .wrap_mode(egui::TextWrapMode::Extend),
+                            );
+                        }
+                    });
+            }
         });
     }
 }
@@ -175,6 +204,12 @@ pub(super) enum Work {
         id: u64,
         key: Option<String>,
     },
+    PrepareUndoBatch {
+        id: u64,
+        batch: String,
+    },
+    /// Checks every selected AI step, then runs them one by one if all checks pass.
+    Batch(Box<tomas_commander::proposal::Batch>),
     History,
     PrepareName {
         id: u64,
@@ -261,6 +296,15 @@ pub(super) enum Work {
 pub(super) enum WorkResult {
     NamePrepared(FileResult<tomas_commander::naming::Plan>),
     UndoPrepared(FileResult<tomas_commander::undo::Plan>),
+    UndoBatchPrepared(FileResult<tomas_commander::undo::BatchPlan>),
+    /// The dry run of an AI batch: Ok means its steps now run; Err lists every problem.
+    BatchChecked(Result<(), Vec<String>>),
+    BatchStep {
+        index: usize,
+        total: usize,
+        outcome: Outcome,
+    },
+    BatchFinished(tomas_commander::proposal::Report),
     History(FileResult<Vec<tomas_commander::undo::Entry>>),
     Changed {
         outcome: Outcome,
@@ -324,6 +368,43 @@ pub(super) fn prepare_name_work(
     }
 }
 
+/// Runs an approved AI batch on the file worker: a dry run of every step first (nothing runs
+/// if any check fails), then each step in order. Progress goes to `send`; the final result is
+/// returned.
+pub(super) fn batch_work(
+    scope: &Scope,
+    journal: &tomas_commander::journal::Journal,
+    batch: &tomas_commander::proposal::Batch,
+    cancel: &AtomicBool,
+    hooks: &files::Hooks,
+    send: &mut dyn FnMut(WorkResult),
+) -> WorkResult {
+    use tomas_commander::proposal;
+    if let Err(problems) = journal
+        .initialize()
+        .map_err(|error| vec![error])
+        .and_then(|()| proposal::dry_run(scope, batch, cancel))
+    {
+        return WorkResult::BatchChecked(Err(problems));
+    }
+    send(WorkResult::BatchChecked(Ok(())));
+    let total = batch.steps.len();
+    WorkResult::BatchFinished(proposal::execute(
+        scope,
+        journal,
+        batch,
+        cancel,
+        hooks,
+        &mut |index, outcome| {
+            send(WorkResult::BatchStep {
+                index,
+                total,
+                outcome,
+            })
+        },
+    ))
+}
+
 /// Prepares (never executes) an inverse plan for review.
 pub(super) fn prepare_undo_work(
     scope: &Scope,
@@ -383,6 +464,7 @@ impl Ledger {
         self.usage_operation_finished(&outcome);
         self.operation_busy = false;
         self.history = None;
+        self.last_batch = None;
         if let Err(error) = self.recent.record_many(
             outcome.created.iter().chain(&outcome.completed).cloned(),
             activity,
@@ -673,6 +755,27 @@ impl Ledger {
                         Err(error) => self.fail(error),
                     }
                 }
+                WorkResult::UndoBatchPrepared(result) => {
+                    self.operation_busy = false;
+                    if self.cancellation.load(Ordering::Acquire) {
+                        self.log("Batch undo planning cancelled; no effects.");
+                        continue;
+                    }
+                    match result {
+                        Ok(plan) => {
+                            self.change_plan = Some(Change::UndoBatch(plan));
+                            self.approval_focus = true;
+                        }
+                        Err(error) => self.fail(error),
+                    }
+                }
+                WorkResult::BatchChecked(result) => self.batch_checked(result),
+                WorkResult::BatchStep {
+                    index,
+                    total,
+                    outcome,
+                } => self.batch_step(index, total, outcome),
+                WorkResult::BatchFinished(report) => self.finish_batch(report),
                 WorkResult::History(result) => {
                     self.history_pending = false;
                     match result {

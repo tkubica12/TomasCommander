@@ -394,6 +394,42 @@ replaces it or the application closes.
 `/search query` prefills it without sending anything to a provider.
 There is no separate AI-search toolbar button.
 
+### AI change proposals
+
+Ask with a request to change files, for example *Utřiď Downloads podle typu do
+podsložek*, *přejmenuj fotky v D:\Foto\2026 podle data ve formátu
+YYYY-MM-DD_nazev*, *přesuň všechny faktury z Downloads do
+Documents\Faktury\2026* or *smaž staré instalačky z Downloads*. The read-only
+harness looks only at what it needs and proposes changes; it never changes
+anything itself. When it is done the bell shows **Proposal ready: N changes**;
+click it to open the review (it never opens by itself while you work).
+
+The review shows the assistant's summary and the changes grouped into New
+folders, Moves, Copies, Renames and Deletes (Recycle Bin), each as
+`before → after`, relative to the common folder when that is shorter. Hover a
+row for its reason; Details lists every exact path and reason. Everything
+except deletes starts checked; **deletes start unchecked**, are marked DELETE
+and must be checked one by one. Unchecking a new folder also unchecks the
+changes that need it; they stay disabled with *needs unchecked new folder ...*
+until the folder is checked again, which restores them.
+
+Run has the initial focus. Arrows and Tab move between rows and buttons, Space
+toggles the focused row, **Enter runs only while Run (Run selected (N)) has
+focus**, a held Enter never runs, and Escape cancels. Cancel changes nothing
+and the bell reopens the proposal. Run first checks every selected change
+against the current files; if anything changed (for example a target now
+exists) the problems are listed in the review and nothing starts. Otherwise the
+changes run in order, each as a normal operation planned again just before it
+runs: no overwrite (an existing target stops the batch), moves across drives
+copy, verify and recycle as usual, and deletes go to the Recycle Bin. The batch
+stops at the first failing step, **Cancel work** stops it between steps, and
+completed steps stay done. Operations lists each step as done, failed (with the
+error), cancelled or not run, groups the batch's records, and offers Undo for a
+single step or **Undo batch**, a reviewed undo of every step newest first.
+If the assistant's proposal itself is invalid (for example an unknown file or a
+name that already exists), nothing changes and **Continue** lets it fix the
+listed problems. See [AI change proposals](decisions/ai-changes.md).
+
 Preferences: `%LOCALAPPDATA%\TomasCommander\preferences.txt`. v1-v6 remain
 readable; v5 added watched Recent folders, v6 each pane's tab folders and
 active tab (`tabs=` line) and v7 the usage-log switch (`usage_log=`, on when
@@ -416,8 +452,10 @@ No configured roots means no access. Favorites alone never expand authority.
 Each segment has ten model calls / two minutes; no lifetime spending cap is
 configured. Usage is recorded without document contents; old pilot counters stay.
 Text, DOCX and PPTX extraction are supported; other binary formats fail explicitly.
-Model output never approves or executes filesystem effects.
+Model output never approves or executes filesystem effects: change proposals
+run only the steps you select and approve.
 See [AI runtime](decisions/ai-runtime.md),
 [AI search](decisions/ai-search.md),
+[AI change proposals](decisions/ai-changes.md),
 [commands](decisions/command-execution.md) and
 [connected answers](decisions/connected-answers.md).

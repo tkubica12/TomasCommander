@@ -66,6 +66,13 @@ The binary is unsigned; this project does not provide code-signing or support.
   GitHub Copilot App, when installed. The read-only `/ai-search` file harness
   reads text, DOCX/PPTX, XLSX/XLSM cell values and PDF text (scanned pages via
   Windows OCR) inside approved roots.
+- AI change proposals: ask to sort, rename, move, copy or delete files and the
+  harness proposes up to 500 changes without touching anything. The bell shows
+  *Proposal ready: N changes*; the review groups new folders, moves, copies,
+  renames and deletes (deletes start unchecked). You select and approve; every
+  selected step is checked first, then runs as a normal journaled operation
+  with no overwrite, deletes go to the Recycle Bin, and Operations offers Undo
+  per step or for the whole batch.
 - Light/dark mode, four accent choices, proportional UI zoom and internal
   drag-and-drop: Move by default, Ctrl for Copy.
 - Native Windows dragging of real files to external applications, offering Copy
@@ -117,6 +124,9 @@ AI submission closes Ask and runs in the background, leaving both file panes
 usable. The header bell opens progress, partial results or the latest answer;
 an unread badge appears on completion without interrupting work. One AI task
 runs at a time. Hide keeps it running; Cancel/Escape stops it. Continue is explicit.
+A change request ends with *Proposal ready: N changes*; the bell opens its
+review, where Space toggles the focused row and Enter runs only from the
+focused Run button.
 The workspace rail starts collapsed; expand it with `>` or toggle it with
 Ctrl+Shift+H. See [release notes](CHANGELOG.md) for version history.
 
@@ -141,8 +151,8 @@ Preferences, saved-location names and appearance persist in
 
 Confirmations are safeguards, not a guarantee against data loss. Ordinary file
 operations never overwrite in place: Copy/Move replacement sends the existing
-file to the Recycle Bin and is chosen explicitly in the review; AI commands and
-ZIP flows do not overwrite or merge existing destinations. Cancellation can
+file to the Recycle Bin and is chosen explicitly in the review; AI commands, AI
+change proposals and ZIP flows do not overwrite or merge existing destinations. Cancellation can
 leave partial outputs or staging files; inspect **Operations** before retrying.
 Copy and moves across drives preserve modification times but not creation
 times, all Windows metadata, ACLs or alternate streams. Moves between drives are
@@ -178,6 +188,10 @@ two minutes per segment, explicit continuation and no lifetime spending cap.
 It uses the standard Responses tool loop with explicit medium reasoning, not
 subagents. Batched candidate globs can search approved roots and file types in
 one call, filter names/folder paths, and avoid opening unrelated file metadata.
+AI change proposals never change files by themselves: only the steps you check
+and approve run, each re-checked and stopped on any conflict; a batch is not
+atomic, so a failure leaves earlier steps done (and undoable). A proposal can
+still be wrong; review it. See [AI change proposals](docs/decisions/ai-changes.md).
 Prompt-only interpretation/file-command pilots still require your own
 explicit configuration, consent and existing Azure CLI sign-in. They have
 durable attempt limits and no automatic retries. Connected WebIQ answers have
@@ -221,6 +235,7 @@ not evidence that the full suite is consistently green.
 [Usage and format limits](docs/usage.md) ·
 [Architecture](docs/decisions/desktop-shell.md) ·
 [File-operation policy](docs/decisions/file-operations.md) ·
+[AI change proposals](docs/decisions/ai-changes.md) ·
 [Usage log](docs/decisions/usage-log.md) ·
 [Roadmap](docs/roadmap.md) · [Release notes](CHANGELOG.md)
 

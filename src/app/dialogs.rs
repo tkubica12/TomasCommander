@@ -75,6 +75,7 @@ impl Ledger {
             || self.operations_dialog(ctx)
             || self.usage_insights_dialog(ctx)
             || self.open_with_dialog(ctx)
+            || self.proposal_dialog(ctx)
         {
             return;
         }
@@ -253,7 +254,25 @@ impl Ledger {
                 ui.set_width(620.0);
                 ui.heading("Operations");
                 ui.label("Exact results, errors and partial paths. Undo prepares a reviewed plan; nothing is undone automatically.");
-                if let Some(outcome) = &self.last_outcome {
+                if let Some(report) = &self.last_batch {
+                    ui.label(RichText::new(report.summary()).strong());
+                    egui::ScrollArea::vertical()
+                        .id_salt("batch-steps")
+                        .max_height(170.0)
+                        .show(ui, |ui| {
+                            for row in report.rows() {
+                                let failed = row.contains(". FAILED: ")
+                                    || row.starts_with("   ERROR: ");
+                                let label = egui::Label::new(if failed {
+                                    RichText::new(row).color(ui.visuals().error_fg_color)
+                                } else {
+                                    RichText::new(row)
+                                })
+                                .wrap();
+                                ui.add(label);
+                            }
+                        });
+                } else if let Some(outcome) = &self.last_outcome {
                     ui.label(format!("Operation #{}", outcome.id));
                     if let Some(summary) = outcome.summary() {
                         ui.label(summary);
@@ -319,11 +338,14 @@ impl Ledger {
             });
             if close || modal.should_close() {
                 self.operations_open = false;
-            } else if let Some(key) = undo {
+            } else if let Some(choice) = undo {
                 self.usage.outcome("operations", "confirmed");
                 self.usage.last_command = "/undo";
                 self.operations_open = false;
-                self.prepare_undo(Some(key));
+                match choice {
+                    HistoryChoice::Undo(key) => self.prepare_undo(Some(key)),
+                    HistoryChoice::UndoBatch(batch) => self.prepare_undo_batch(batch),
+                }
             }
             return true;
         }
@@ -531,6 +553,9 @@ impl Ledger {
                                 }
                                 ui.label(RichText::new("Ctrl Enter / Escape").monospace());
                                 ui.label("Approve exact plan / Cancel");
+                                ui.end_row();
+                                ui.label(RichText::new("Ask: sort, rename, move...").monospace());
+                                ui.label("AI proposes changes; the bell opens the review. Arrows/Tab move, Space toggles, Enter on Run runs the checked ones. Deletes start unchecked.");
                                 ui.end_row();
                             });
                     });
@@ -828,45 +853,92 @@ impl Ledger {
     }
 }
 
-/// Recent operations with Undo or the short reason it is unavailable; returns the chosen key.
+/// What an Operations row asks to undo.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum HistoryChoice {
+    Undo(String),
+    UndoBatch(String),
+}
+
+/// Recent operations with Undo or the short reason it is unavailable; steps of one batch are
+/// grouped under a row offering Undo batch.
 pub(super) fn history_rows(
     ui: &mut egui::Ui,
     entries: &[tomas_commander::undo::Entry],
     enabled: bool,
-) -> Option<String> {
-    use tomas_commander::undo::Status;
+) -> Option<HistoryChoice> {
+    use tomas_commander::undo::{Entry, Status};
     if entries.is_empty() {
         ui.label("No recorded operations.");
         return None;
     }
     let mut chosen = None;
+    let row = |ui: &mut egui::Ui, entry: &Entry, chosen: &mut Option<HistoryChoice>| {
+        // Wrapping keeps long paths readable without a fixed column width.
+        ui.horizontal_wrapped(|ui| {
+            ui.label(entry.title());
+            match &entry.status {
+                Status::Undoable => {
+                    if ui
+                        .add_enabled(enabled, egui::Button::new("Undo"))
+                        .on_hover_text("Prepare a reviewed inverse plan")
+                        .on_disabled_hover_text("Finish pending work first")
+                        .clicked()
+                    {
+                        *chosen = Some(HistoryChoice::Undo(entry.key.clone()));
+                    }
+                }
+                Status::Undone => {
+                    ui.label(RichText::new("Undone").weak());
+                }
+                Status::Refused(reason) => {
+                    ui.label(RichText::new(reason).weak());
+                }
+            }
+        });
+    };
     egui::ScrollArea::vertical()
         .id_salt("operation-history")
         .max_height(ROW_HEIGHT * 7.0)
         .show(ui, |ui| {
-            for entry in entries {
-                // Wrapping keeps long paths readable without a fixed column width.
+            let mut index = 0;
+            while index < entries.len() {
+                let Some(batch) = &entries[index].batch else {
+                    row(ui, &entries[index], &mut chosen);
+                    index += 1;
+                    continue;
+                };
+                let group: Vec<&Entry> = entries[index..]
+                    .iter()
+                    .take_while(|entry| entry.batch.as_ref() == Some(batch))
+                    .collect();
                 ui.horizontal_wrapped(|ui| {
-                    ui.label(entry.title());
-                    match &entry.status {
-                        Status::Undoable => {
-                            if ui
-                                .add_enabled(enabled, egui::Button::new("Undo"))
-                                .on_hover_text("Prepare a reviewed inverse plan")
-                                .on_disabled_hover_text("Finish pending work first")
-                                .clicked()
-                            {
-                                chosen = Some(entry.key.clone());
-                            }
-                        }
-                        Status::Undone => {
-                            ui.label(RichText::new("Undone").weak());
-                        }
-                        Status::Refused(reason) => {
-                            ui.label(RichText::new(reason).weak());
-                        }
+                    ui.label(
+                        RichText::new(format!(
+                            "AI changes: {} {}",
+                            group.len(),
+                            if group.len() == 1 { "step" } else { "steps" }
+                        ))
+                        .strong(),
+                    );
+                    if group.iter().any(|entry| entry.status == Status::Undoable)
+                        && ui
+                            .add_enabled(enabled, egui::Button::new("Undo batch"))
+                            .on_hover_text(
+                                "Prepare a reviewed undo of every step of this batch, newest first",
+                            )
+                            .on_disabled_hover_text("Finish pending work first")
+                            .clicked()
+                    {
+                        chosen = Some(HistoryChoice::UndoBatch(batch.clone()));
                     }
                 });
+                ui.indent(("history-batch", index), |ui| {
+                    for entry in &group {
+                        row(ui, entry, &mut chosen);
+                    }
+                });
+                index += group.len();
             }
         });
     chosen

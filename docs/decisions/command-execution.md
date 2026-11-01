@@ -20,6 +20,11 @@ bound grant adds four exact CommandIntent attempts to the original five-attempt
 history, with a cumulative ceiling of nine; it does not reset history or enable
 general automation. No automatic retries/fallbacks.
 
+Free-text Ask prompts that ask to organize, rename, move, copy or delete files
+go to the read-only file harness instead, which can end with a reviewed
+multi-step proposal ([AI change proposals](ai-changes.md)); its selected steps
+use the same planners, Stop-on-conflict policy, workers and journal.
+
 Developer launchers are separate explicit commands. VS Code receives the folder
 as a lossless argument. Copilot App requests `copilot app` for that folder.
 Copilot CLI requests `copilot --yolo` through the Windows terminal host, which

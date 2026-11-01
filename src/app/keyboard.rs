@@ -36,6 +36,7 @@ impl Ledger {
             || self.drives_popup.is_some()
             || self.place_edit.is_some()
             || self.usage.insights.is_some()
+            || self.proposal_review.is_some()
         {
             return;
         }

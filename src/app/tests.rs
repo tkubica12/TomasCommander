@@ -7,6 +7,7 @@ mod keyboard;
 mod palette;
 mod pane;
 mod pane_ui;
+mod proposal;
 mod recent_rail;
 mod tabs;
 mod theme;

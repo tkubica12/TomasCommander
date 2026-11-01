@@ -763,6 +763,7 @@ fn operations_rows_offer_undo_only_when_undoable_and_show_short_reasons() {
         label: label.into(),
         age: Some(Duration::from_secs(120)),
         status,
+        batch: None,
     };
     let entries = vec![
         entry("4-1-0", "Move: 3 items to D:\\x", Status::Undoable),
@@ -839,7 +840,10 @@ fn operations_rows_offer_undo_only_when_undoable_and_show_short_reasons() {
             },
         )]
     };
-    assert_eq!(frame(click(), true).0.as_deref(), Some("4-1-0"));
+    assert_eq!(
+        frame(click(), true).0,
+        Some(HistoryChoice::Undo("4-1-0".into()))
+    );
     assert_eq!(frame(click(), false).0, None, "Busy work disables Undo.");
     let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
         assert!(history_rows(ui, &[], true).is_none());

@@ -6,12 +6,16 @@ The primary-deployment file harness is distinct from the older frozen pilots
 below. It uses the same verified identity/TLS transport, but explicitly approved
 roots and contents may be sent via read-only tools. It has ten model calls and
 a two-minute segment deadline, explicit continuation, no monetary/lifetime
-spending ceiling, and technical context/output limits. Roots/configuration are
+spending ceiling, and technical context/output limits (16,384 output tokens and
+a 512 KiB response per call). Roots/configuration are
 persisted separately. `ai-file-agent-usage.json` records cumulative attempts;
 `ai-file-agent-calls.jsonl` records request IDs and actual token usage without
 prompts, paths or contents. Old counters/grants are not reset. The existing
 `ai-budget.lock` serializes both routes; an uncertain lease remains blocking.
-No automatic retry, stronger-model fallback, shell or filesystem mutation.
+No automatic retry, stronger-model fallback, shell or model-driven filesystem
+mutation: the final `propose_changes` call only returns a validated proposal;
+the user selects and approves changes, which then run as ordinary journaled
+operations (see [AI change proposals](ai-changes.md)).
 All file reading and parsing, including PDF/XLSX extraction and local Windows
 OCR, runs inside the contained worker process (no extra process or network
 call); only the bounded tool results reach the model. Its job object also caps
@@ -89,6 +93,8 @@ An uncertain/terminated spending lease blocks further submissions until
 deliberate actual-state reconciliation. No price/spend guarantee is claimed.
 
 Search and file commands use local deterministic resolution after interpretation.
-Model output is untrusted and never approves a filesystem effect.
+Model output is untrusted and never approves or executes a filesystem effect;
+AI change proposals are validated locally and run only the steps the user
+selects and approves.
 Connected answers have a separate narrow source/stronger-model grant.
 These pilots are not broad production acceptance.

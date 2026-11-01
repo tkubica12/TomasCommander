@@ -135,6 +135,7 @@ impl eframe::App for Ledger {
             || self.file_agent.open
             || self.answers.open
             || self.usage.insights.is_some()
+            || self.proposal_review.is_some()
         {
             ui.disable();
         }
@@ -157,6 +158,11 @@ impl eframe::App for Ledger {
         if let Some(action) = self.file_agent.show(&ctx) {
             match action {
                 crate::file_agent_ui::Action::Settings => self.ai.open = true,
+                crate::file_agent_ui::Action::Review {
+                    proposal,
+                    settings,
+                    settings_path,
+                } => self.open_proposal(*proposal, *settings, settings_path),
                 crate::file_agent_ui::Action::Locate {
                     pane,
                     settings,
@@ -319,7 +325,8 @@ impl Ledger {
                     && !self.answers.open
                     && self.places_popup.is_none()
                     && self.drives_popup.is_none()
-                    && self.place_edit.is_none();
+                    && self.place_edit.is_none()
+                    && self.proposal_review.is_none();
                 if ui
                     .add_enabled(available, egui::Button::new("? Help"))
                     .clicked()
@@ -338,7 +345,11 @@ impl Ledger {
                         "Operations / running"
                     } else if self.last_outcome.as_ref().is_some_and(|o| {
                         o.error.is_some() || o.cancelled || !o.incomplete.is_empty()
-                    }) {
+                    }) || self
+                        .last_batch
+                        .as_ref()
+                        .is_some_and(|report| report.done() < report.steps.len())
+                    {
                         "Operations / attention"
                     } else {
                         "Operations"

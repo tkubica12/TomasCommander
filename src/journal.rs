@@ -13,6 +13,8 @@ const MAX_TOTAL_BYTES: u64 = 64 * 1024 * 1024;
 
 pub struct Journal {
     root: PathBuf,
+    /// Shared `batch=<key>` line added to every record this journal claims.
+    batch: Option<String>,
 }
 
 impl Journal {
@@ -119,7 +121,22 @@ impl Journal {
     }
 
     pub fn new(root: PathBuf) -> Self {
-        Self { root }
+        Self { root, batch: None }
+    }
+
+    /// The same journal, recording `batch=<key>` in each claimed record so Operations can group
+    /// the steps of one batch. Keys are ASCII letters, digits and dashes.
+    pub fn with_batch(&self, key: &str) -> FileResult<Self> {
+        if key.is_empty()
+            || key.len() > 128
+            || !key.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        {
+            return Err("Invalid batch key; no changes made.".into());
+        }
+        Ok(Self {
+            root: self.root.clone(),
+            batch: Some(key.to_owned()),
+        })
     }
 
     pub fn initialize(&self) -> FileResult<()> {
@@ -294,7 +311,12 @@ impl Journal {
                 )
             })?;
         // The start time bounds Recycle Bin matches for a later undo.
-        let snapshot = format!("{HEADER}{snapshot}started={}\n", crate::undo::now());
+        let batch = self
+            .batch
+            .as_ref()
+            .map(|key| format!("batch={key}\n"))
+            .unwrap_or_default();
+        let snapshot = format!("{HEADER}{snapshot}{batch}started={}\n", crate::undo::now());
         if snapshot.len() as u64 > MAX_RECORD_BYTES {
             return Err(
                 "Approved plan exceeds the durable journal limit; no mutation performed.".into(),

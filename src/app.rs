@@ -32,6 +32,7 @@ mod keyboard;
 mod palette;
 mod pane;
 mod pane_ui;
+mod proposal_dialog;
 mod recent_rail;
 mod search_dialog;
 mod setup;
@@ -43,8 +44,8 @@ mod work;
 
 pub use self::usage_ui::UsageLaunch;
 use self::{
-    command_dialog::*, dialogs::*, drag::*, palette::*, pane::*, recent_rail::*, search_dialog::*,
-    theme::*, usage_ui::*, work::*,
+    command_dialog::*, dialogs::*, drag::*, palette::*, pane::*, proposal_dialog::*,
+    recent_rail::*, search_dialog::*, theme::*, usage_ui::*, work::*,
 };
 pub(crate) use self::{
     dialogs::confirmation_buttons,
@@ -114,6 +115,10 @@ pub struct Ledger {
     review: Option<PlanReview>,
     next_id: u64,
     last_outcome: Option<Outcome>,
+    /// The latest AI change batch; shown in Operations until another operation finishes.
+    last_batch: Option<tomas_commander::proposal::Report>,
+    /// Review of an AI change proposal; nothing runs before its Run is approved.
+    proposal_review: Option<ProposalReview>,
     rail: Rail,
     rail_index: Option<usize>,
     recent: recent::Monitor,
@@ -209,6 +214,7 @@ impl Ledger {
             && self.place_edit.is_none()
             && !self.reader.dirty()
             && self.usage.insights.is_none()
+            && self.proposal_review.is_none()
     }
 
     fn fail(&mut self, message: impl Into<String>) {

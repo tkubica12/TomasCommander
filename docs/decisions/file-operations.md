@@ -79,7 +79,8 @@ fail validation with "Destination changed; create a new plan". The journal
 records the policy, each node's resolution (create/merge/replace/skip/rename),
 conflict fingerprints and staging paths; receipts list replaced, merged and
 skipped paths. AI commands and other non-interactive callers keep the legacy
-fail-on-conflict policy; there is no overwrite through AI.
+fail-on-conflict policy; there is no overwrite through AI. AI change proposals
+plan every approved step with that policy too.
 
 ## Cross-volume Move
 
@@ -213,6 +214,17 @@ redo. Under the journal lock a second undo of the same operation is refused
 once an earlier undo changed anything or was interrupted; an undo refused
 before any effect does not block a new reviewed plan. Operations shows
 *Undone*, *Partly undone* or the reason per record, also after a restart.
+
+**Batches.** Steps of an approved [AI change proposal](ai-changes.md) are
+ordinary records that also carry `batch=<key>` in their snapshot. Operations
+groups them and offers **Undo batch**: a reviewed plan listing every undoable
+step newest first (already undone steps and steps without effects are noted
+and skipped; a step that cannot be undone refuses the batch). Before approval
+only the cheap row checks run; after approval each step's inverse is prepared
+with full validation just before it runs, so a created folder is checked once
+the items moved into it are back. Each inverse is journaled with `undo_of`;
+the batch undo stops at the first refusal, failure or cancellation and reports
+the steps not undone.
 
 Limitations: changes that keep the same identity, size and modification time
 are not detected; recreated folders get new identities and times; a moved

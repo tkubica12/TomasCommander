@@ -18,8 +18,10 @@ device paths, traversal, streams and unknown reparse tags; known Cloud Files
 placeholders may hydrate when download permission is enabled.
 
 Tools: `list_directory`, case/diacritic-insensitive `glob`, literal `grep`,
-and `read_file` with character offsets. A null traversal path searches all approved
-roots in one call. Globs support one brace group such as `*.{pptx,pdf,html,htm}`
+and `read_file` with character offsets, plus the final-step `propose_changes`
+for organize/rename/move/copy/delete requests, which only returns a validated
+proposal for the user's review ([AI change proposals](ai-changes.md)). A null
+traversal path searches all approved roots in one call. Globs support one brace group such as `*.{pptx,pdf,html,htm}`
 and an optional literal full-path/name query. Filename/type/path filtering happens
 before unrelated file metadata is opened; directory containment is still checked
 before traversal. The model ranks these candidates before reading their content.
@@ -62,7 +64,8 @@ Known credential paths and obvious credential markers are excluded, not a
 guarantee that arbitrary documents contain no sensitive information.
 
 Each explicitly submitted segment permits at most ten model calls and two
-minutes including waiting. Capped runs keep partial results and offer Continue;
+minutes including waiting. Capped runs and rejected change proposals keep
+partial results and offer Continue;
 Ask hides on submission. One task runs in the background; the header bell shows
 progress and unread completion without interrupting file work. Hide keeps the
 task running; explicit Cancel/Escape and app shutdown cancel it.
@@ -76,7 +79,10 @@ the configured roots, with no monetary/lifetime request cap. A separate durable
 attempt counter and content-free usage log retain actual provider usage without
 resetting old pilot history. The shared spending lease serializes provider work;
 uncertain submissions block automatic retries. Technical context/output bounds
-remain. No shell, mutations, MCP connectors, model fallback or new provider.
+remain. No shell, MCP connectors, model fallback or new provider, and the model
+never changes files: a change request ends in a reviewed proposal whose
+selected steps run only after explicit approval, as ordinary journaled
+operations.
 The standard Responses loop explicitly sends `reasoning.effort=medium`, carries
 encrypted reasoning items and returns local results as `function_call_output`.
 There is no additional planner model or agent self-orchestration.

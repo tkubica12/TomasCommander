@@ -208,6 +208,10 @@ pub struct Report {
     pub ai_tasks: BTreeMap<String, Timing>,
     pub ai_prompts: Vec<(u64, String, String, u64)>,
     pub ai_opened: BTreeMap<u64, u64>,
+    /// Reviewed AI change proposals by outcome (`run`/`cancelled`).
+    pub ai_proposals: BTreeMap<String, u64>,
+    /// AI change batches by result (`completed`/`failed`/`cancelled`).
+    pub ai_batches: BTreeMap<String, Timing>,
     pub previews: BTreeMap<String, Timing>,
     pub preview_failures: u64,
     pub operations: BTreeMap<String, OperationStats>,
@@ -443,6 +447,20 @@ impl Report {
                 ));
             }
             "ai_result" => *self.ai_opened.entry(number(value, "rank")).or_default() += 1,
+            "ai_proposal" => bump(&mut self.ai_proposals, text(value, "outcome")),
+            "ai_batch" => {
+                let result = if value.get("failed_at").is_some_and(|step| !step.is_null()) {
+                    "failed"
+                } else if value.get("cancelled") == Some(&Json::Bool(true)) {
+                    "cancelled"
+                } else {
+                    "completed"
+                };
+                self.ai_batches
+                    .entry(result.to_owned())
+                    .or_default()
+                    .add(number(value, "duration_ms"));
+            }
             "preview" => {
                 if value.get("ok") == Some(&Json::Bool(false)) {
                     self.preview_failures += 1;
@@ -955,6 +973,12 @@ impl Report {
                     .join(", ")
             }
         );
+        let _ = writeln!(
+            out,
+            "Change proposals by outcome: {}.\n",
+            inline_counts(&self.ai_proposals).unwrap_or_else(|| "none".to_owned())
+        );
+        timing_table(out, "AI change batches", "Result", &self.ai_batches);
         let _ = writeln!(out, "### Latest prompts\n");
         table(
             out,
@@ -1322,6 +1346,29 @@ mod tests {
                 .with("error", None::<String>),
         ));
         lines.push(line(
+            150_000,
+            "a",
+            Event::new("ai_proposal")
+                .with(
+                    "ops",
+                    Value::Counts(vec![("new_folder".into(), 1), ("move".into(), 2)]),
+                )
+                .with("checked", 3)
+                .with("unchecked_deletes", 0)
+                .with("outcome", "run"),
+        ));
+        lines.push(line(
+            140_000,
+            "a",
+            Event::new("ai_batch")
+                .with("steps", 3)
+                .with("run", 2)
+                .with("done", 1)
+                .with("failed_at", 2)
+                .with("cancelled", false)
+                .with("duration_ms", 1200),
+        ));
+        lines.push(line(
             100_000,
             "a",
             Event::new("session_end")
@@ -1372,6 +1419,8 @@ mod tests {
             "a chain ending through a place is not a candidate"
         );
         assert_eq!(report.folders[r"E:\x"].visits, 1);
+        assert_eq!(report.ai_proposals["run"], 1);
+        assert_eq!(report.ai_batches["failed"].count, 1);
     }
 
     #[test]
@@ -1400,6 +1449,7 @@ mod tests {
             "### Filters",
             "## Recursive filename search",
             "## AI tasks",
+            "### AI change batches",
             "### Operations",
             "## Input summary",
             "## Raw data",

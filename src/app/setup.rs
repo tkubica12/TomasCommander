@@ -122,6 +122,8 @@ impl Ledger {
             review: None,
             next_id: 1,
             last_outcome: None,
+            last_batch: None,
+            proposal_review: None,
             rail: Rail::Recent,
             rail_index: None,
             recent,
@@ -414,12 +416,38 @@ fn spawn_file_worker(
                         Change::Undo(plan) => {
                             (plan.execute(&worker_scope, &journal, true, &cancel), false)
                         }
+                        Change::UndoBatch(plan) => {
+                            (plan.execute(&worker_scope, &journal, true, &cancel), false)
+                        }
                     };
                     WorkResult::Changed { outcome, editor }
                 }
                 Work::PrepareUndo { id, key } => {
                     prepare_undo_work(&worker_scope, &journal, id, key.as_deref(), &cancel)
                 }
+                Work::PrepareUndoBatch { id, batch } => {
+                    WorkResult::UndoBatchPrepared(journal.initialize().and_then(|()| {
+                        tomas_commander::undo::prepare_batch(
+                            &worker_scope,
+                            &journal,
+                            id,
+                            &batch,
+                            &cancel,
+                        )
+                    }))
+                }
+                Work::Batch(batch) => batch_work(
+                    &worker_scope,
+                    &journal,
+                    &batch,
+                    &cancel,
+                    &files::Hooks::default(),
+                    &mut |result| {
+                        if results.send(result).is_ok() {
+                            context.request_repaint();
+                        }
+                    },
+                ),
                 Work::History => history_work(&worker_scope, &journal, &cancel),
                 Work::PrepareArchive { id, request } => {
                     WorkResult::ArchivePrepared(journal.initialize().and_then(|()| {

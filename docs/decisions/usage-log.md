@@ -53,8 +53,10 @@ Every line is one JSON object:
 | `filter` | `pane`, `folder`, `query`, `matches`, `opened`, `outcome` (`opened`/`cleared`/`navigated`/`left`), `duration_ms` | once per filter session, when it ends |
 | `search` | `root`, `query`, `results`, `duration_ms`, `truncated`, `ai`, `outcome`, `opened_rank` | when a search's result is opened, a new search starts or the dialog closes |
 | `ask` | `text` (full), `outcome` (`command:/x`, `ai`, `no_match`, `invalid`, `cancelled`), `candidates` | Ask closes |
-| `ai_task` | `kind`, `prompt` (full), `outcome` (`completed`/`clarify`/`capped`/`failed`/`cancelled`/`not_started`), `calls`, `results`, `duration_ms`, `continuation` | an AI file task ends |
+| `ai_task` | `kind`, `prompt` (full), `outcome` (`completed`/`clarify`/`capped`/`failed`/`cancelled`/`not_started`/`proposal`/`proposal_rejected`), `calls`, `results`, `duration_ms`, `continuation` | an AI file task ends |
 | `ai_result` | `rank`, `preview`, `path` | an AI result is opened |
+| `ai_proposal` | `ops` (counts by kind: `new_folder`, `move`, `copy`, `rename`, `recycle`), `checked`, `unchecked_deletes`, `failed_checks`, `outcome` (`run`/`cancelled`), `open_ms` | the review of an AI change proposal closes |
+| `ai_batch` | `steps`, `run`, `done`, `failed_at` (1-based step or null), `cancelled`, `duration_ms` | an approved AI change batch finishes |
 | `dialog` | `name`, `outcome` (`confirmed`/`cancelled`/`closed`), `open_ms`, `extra` (for example `policy=Replace older changes=2`) | a tracked modal closes |
 | `operation` | `op`, `items`, `dest`, `strategy`, `policy`, `conflicts`, `detail` (ZIP or undo label), `duration_ms`, `completed`, `created`, `replaced`, `merged`, `skipped`, `recycled`, `kept`, `incomplete`, `cancelled`, `error` | an approved operation (including undo, save, rename, new folder, ZIP) finishes |
 | `preview` | `path`, `member`, `ext`, `kind`, `action` (`open`/`page`/`rotate`/`edit`), `open_ms`, `ok` | a reader load finishes |
@@ -126,7 +128,8 @@ and closing.
   cancellation, errors, slow folders/actions/frames, most visited folders and
   their routes, Places candidates (folders reached at least twice at the end of
   3+ navigation steps less than 15 s apart), tabs and history, filters,
-  recursive search, AI tasks, previews, operations, settings changes, input
+  recursive search, AI tasks (with change proposals and batches), previews,
+  operations, settings changes, input
   counters and a pointer to the raw JSONL files. Malformed lines are counted
   and skipped.
 

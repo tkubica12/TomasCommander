@@ -458,6 +458,8 @@ struct Record {
     damaged: bool,
     undo_of: Option<String>,
     undone: Option<Kind>,
+    /// Shared key of the batch this record belongs to (`batch=` line).
+    batch: Option<String>,
     destination: Option<PathBuf>,
     created: Vec<(PathBuf, Option<Mark>)>,
     moved: Vec<(PathBuf, PathBuf, Option<Mark>)>,
@@ -515,6 +517,7 @@ impl Record {
                 "started" => record.started = value.parse().ok(),
                 "undo_of" => record.undo_of = Some(value.to_owned()),
                 "undone_kind" => record.undone = Kind::parse(value),
+                "batch" => record.batch = Some(value.to_owned()),
                 "destination" if record.destination.is_none() => {
                     record.destination = journal::decode_path(value).ok();
                 }
@@ -708,6 +711,8 @@ pub struct Entry {
     pub label: String,
     pub age: Option<Duration>,
     pub status: Status,
+    /// Key of the batch (for example AI-proposed changes) this operation was a step of.
+    pub batch: Option<String>,
 }
 
 impl Entry {
@@ -816,6 +821,7 @@ pub fn history(
                 .started
                 .and_then(|started| now.duration_since(time(started)).ok()),
             status,
+            batch: record.batch.clone(),
         });
     }
     Ok(entries)
@@ -1208,6 +1214,199 @@ pub fn prepare_with(
         notes,
         partial: record.partly(),
     })
+}
+
+/// An undo of every operation recorded with one `batch=` key, in reverse order. Rows are checked
+/// cheaply here; each step's exact inverse is prepared and validated again just before it runs,
+/// because earlier undo steps change the state later ones are checked against (for example a
+/// created folder is only empty again after the items moved into it went back).
+#[derive(Debug)]
+pub struct BatchPlan {
+    pub id: u64,
+    batch: String,
+    /// Operation keys and labels, newest first (the undo order).
+    steps: Vec<(String, String)>,
+    notes: Vec<String>,
+}
+
+/// Prepares (never executes) an undo of the batch `batch`. Refuses the whole batch when any
+/// of its effective operations cannot be undone; each can still be undone on its own.
+pub fn prepare_batch(
+    scope: &Scope,
+    journal: &Journal,
+    id: u64,
+    batch: &str,
+    cancel: &AtomicBool,
+) -> FileResult<BatchPlan> {
+    let records = load(journal)?;
+    let links = links(&records);
+    let mut steps = Vec::new();
+    let mut notes = Vec::new();
+    let mut found = false;
+    for record in records
+        .iter()
+        .filter(|record| record.batch.as_deref() == Some(batch))
+    {
+        found = true;
+        if cancel.load(Ordering::Acquire) {
+            return Err("Undo planning was cancelled.".into());
+        }
+        match status(record, &links) {
+            Status::Undoable => {
+                if let Err(reason) = bind(scope, record, None, cancel) {
+                    return Err(format!(
+                        "Cannot undo the batch: {}: {reason}. Undo its steps one by one in Operations.",
+                        record.label()
+                    ));
+                }
+                steps.push((record.key.clone(), record.label()));
+            }
+            Status::Undone => notes.push(format!("Already undone: {}", record.label())),
+            Status::Refused(reason) if reason == "Nothing to undo" => {
+                notes.push(format!("Nothing to undo: {}", record.label()));
+            }
+            Status::Refused(reason) => {
+                return Err(format!(
+                    "Cannot undo the batch: {}: {reason}. Undo its steps one by one in Operations.",
+                    record.label()
+                ));
+            }
+        }
+    }
+    if !found {
+        return Err("Batch not found; its records may have been archived.".into());
+    }
+    if steps.is_empty() {
+        return Err("Nothing to undo in this batch.".into());
+    }
+    Ok(BatchPlan {
+        id,
+        batch: batch.to_owned(),
+        steps,
+        notes,
+    })
+}
+
+impl BatchPlan {
+    pub fn label(&self) -> &'static str {
+        "Undo batch"
+    }
+
+    /// "Undo batch: 5 operations in reverse order".
+    pub fn heading(&self) -> String {
+        format!(
+            "Undo batch: {} in reverse order",
+            match self.steps.len() {
+                1 => "1 operation".to_owned(),
+                count => format!("{count} operations"),
+            }
+        )
+    }
+
+    pub fn batch(&self) -> &str {
+        &self.batch
+    }
+
+    pub fn len(&self) -> usize {
+        self.steps.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.steps.is_empty()
+    }
+
+    pub fn effect_lines(&self) -> Vec<String> {
+        vec![
+            "Each operation is undone like a single Undo: items move back, unchanged results go to the Recycle Bin and recycled originals are restored.".into(),
+            "Each step is prepared and checked again just before it runs; the batch stops at the first change.".into(),
+            "Nothing is overwritten. This undo cannot be undone (no redo).".into(),
+        ]
+    }
+
+    /// The operations in undo order, then notes.
+    pub fn rows(&self) -> Vec<String> {
+        self.steps
+            .iter()
+            .enumerate()
+            .map(|(index, (_, label))| format!("{}. Undo {label}", index + 1))
+            .chain(self.notes.iter().cloned())
+            .collect()
+    }
+
+    pub fn execute(
+        &self,
+        scope: &Scope,
+        journal: &Journal,
+        approved: bool,
+        cancel: &AtomicBool,
+    ) -> Outcome {
+        self.execute_with(scope, journal, approved, cancel, &Hooks::default())
+    }
+
+    /// Undoes each operation in order with a freshly prepared, journaled inverse plan; stops at
+    /// the first refusal, failure or cancellation and reports what was not undone.
+    #[doc(hidden)]
+    pub fn execute_with(
+        &self,
+        scope: &Scope,
+        journal: &Journal,
+        approved: bool,
+        cancel: &AtomicBool,
+        hooks: &Hooks,
+    ) -> Outcome {
+        let mut total = Outcome {
+            id: self.id,
+            effects: Effects {
+                kind: Some(Kind::Undo),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        if !approved {
+            total.error = Some("Explicit undo approval is required; no changes made.".into());
+            return total;
+        }
+        let mut stopped = None;
+        for (index, (key, _)) in self.steps.iter().enumerate() {
+            if cancel.load(Ordering::Acquire) {
+                total.cancelled = true;
+                stopped = Some((index, "Cancelled before this operation.".to_owned()));
+                break;
+            }
+            let plan = match prepare_with(scope, journal, self.id, Some(key), cancel, hooks.bin) {
+                Ok(plan) => plan,
+                Err(error) => {
+                    stopped = Some((index, error));
+                    break;
+                }
+            };
+            let outcome = plan.execute_with(scope, journal, true, cancel, hooks);
+            total.completed.extend(outcome.completed);
+            total.created.extend(outcome.created);
+            total.incomplete.extend(outcome.incomplete);
+            total.cancelled |= outcome.cancelled;
+            if let Some(error) = outcome.error {
+                stopped = Some((index, error));
+                break;
+            }
+            if outcome.cancelled {
+                stopped = Some((index, "Cancelled during this operation.".to_owned()));
+                break;
+            }
+        }
+        if let Some((index, error)) = stopped {
+            let remaining: Vec<&str> = self.steps[index..]
+                .iter()
+                .map(|(_, label)| label.as_str())
+                .collect();
+            total.error = Some(format!(
+                "Batch undo stopped after {index} of {} operations: {error}\nNot (fully) undone: {}",
+                self.steps.len(),
+                remaining.join("; ")
+            ));
+        }
+        total
+    }
 }
 
 /// Effect seams for tests; `Hooks::default()` uses the real Recycle Bin.

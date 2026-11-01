@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+- AI change proposals. For Ask prompts such as "Utřiď Downloads podle typu do
+  podsložek" or "přesuň faktury z Downloads do Documents\Faktury\2026", the
+  read-only file harness may end with a new `propose_changes` tool call: up to
+  500 ordered new folder, move, copy, rename and recycle (Recycle Bin) steps
+  that reference real-file IDs from the run. The proposal is validated outside
+  the model (known and unchanged IDs, approved roots, Windows names,
+  case-insensitive target collisions, no overwrite, no folder into itself, one
+  change per item, refs defined before use, no protected credential paths); an
+  invalid proposal returns its problems and can be continued. The bell shows
+  "Proposal ready: N changes" and opens a review grouped into New folders,
+  Moves, Copies, Renames and Deletes; deletes start unchecked, unchecking a new
+  folder unchecks the changes that need it, and Enter runs only from the focused
+  Run button (held Enter never runs). Run first checks every selected step
+  against the current files and starts nothing if any check fails; then each
+  step runs in order as a normal operation (Stop-on-conflict policy), planned
+  again just before it runs and journaled with a shared `batch=` key. The batch
+  stops at the first failure and Cancel work stops it between steps; Operations
+  lists every step and offers per-step Undo plus a reviewed Undo batch.
+  `ai_proposal` and `ai_batch` usage events record counts and outcomes.
 - AI file harness reads PDF and XLSX/XLSM content. PDFs use the pure-Rust
   `lopdf` parser (new pinned dependency, default features off) in a
   panic-contained, time-bounded thread of the contained worker: `[page N]`

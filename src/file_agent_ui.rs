@@ -12,6 +12,7 @@ use tomas_commander::{
     file_agent::{self, Outcome, Request, State, Status},
     file_tools::{Observed, Settings},
     files::{self, Scope},
+    proposal::Proposal,
 };
 
 pub struct FileAgentPanel {
@@ -21,6 +22,7 @@ pub struct FileAgentPanel {
     current_folder: PathBuf,
     scope: Scope,
     settings: Option<Settings>,
+    settings_path: Option<PathBuf>,
     pending: Option<Receiver<ai::Result<Outcome>>>,
     progress: Option<Receiver<(String, State)>>,
     cancel: Arc<AtomicBool>,
@@ -33,6 +35,8 @@ pub struct FileAgentPanel {
     unread: bool,
     started: Option<std::time::Instant>,
     continuation: bool,
+    /// The latest proposal was handed to the batch runner; the bell no longer offers it.
+    proposal_used: bool,
     /// A finished (or refused) task for the usage log; taken by the application.
     pub finished: Option<TaskUsage>,
 }
@@ -57,6 +61,20 @@ pub enum Action {
         rank: usize,
     },
     Settings,
+    /// Open the review of a validated change proposal; nothing has changed yet.
+    Review {
+        proposal: Box<Proposal>,
+        settings: Box<Settings>,
+        settings_path: PathBuf,
+    },
+}
+
+/// Text for a run's change proposal, e.g. "Proposal ready: 12 changes".
+pub fn proposal_label(proposal: &Proposal) -> String {
+    match proposal.steps.len() {
+        1 => "Proposal ready: 1 change".to_owned(),
+        count => format!("Proposal ready: {count} changes"),
+    }
 }
 
 impl FileAgentPanel {
@@ -68,6 +86,7 @@ impl FileAgentPanel {
             current_folder: PathBuf::new(),
             scope: Scope::unrestricted(),
             settings: None,
+            settings_path: None,
             pending: None,
             progress: None,
             cancel: Arc::new(AtomicBool::new(false)),
@@ -80,6 +99,7 @@ impl FileAgentPanel {
             unread: false,
             started: None,
             continuation: false,
+            proposal_used: false,
             finished: None,
         }
     }
@@ -89,6 +109,22 @@ impl FileAgentPanel {
     }
     pub fn cancel(&self) {
         self.cancel.store(true, Ordering::Release);
+    }
+
+    /// The latest run's proposal while it has not been handed to the batch runner.
+    pub fn pending_proposal(&self) -> Option<&Proposal> {
+        if self.busy() || self.proposal_used {
+            return None;
+        }
+        self.outcome
+            .as_ref()
+            .filter(|outcome| matches!(outcome.status, Status::Proposal))
+            .and_then(|outcome| outcome.proposal.as_ref())
+    }
+
+    /// The reviewed proposal started running; it is not offered again.
+    pub fn proposal_started(&mut self) {
+        self.proposal_used = true;
     }
 
     pub fn hide(&mut self) {
@@ -102,21 +138,28 @@ impl FileAgentPanel {
         self.focus_prompt = false;
     }
 
-    fn notification_label(&self) -> &'static str {
+    fn notification_label(&self) -> String {
         if self.busy() {
-            "Notifications / AI running"
+            "Notifications / AI running".into()
+        } else if let Some(proposal) = self.pending_proposal() {
+            format!(
+                "Notifications / {}{}",
+                proposal_label(proposal),
+                if self.unread { " / unread" } else { "" }
+            )
         } else if self.unread {
-            "Notifications / 1 unread result"
+            "Notifications / 1 unread result".into()
         } else {
-            "Notifications"
+            "Notifications".into()
         }
     }
 
     pub fn notification_button(&mut self, ui: &mut egui::Ui) {
         let has_task = self.busy() || self.outcome.is_some();
         let response = crate::app::action_button(ui, "    ", "", has_task);
+        let label = self.notification_label();
         ui.ctx().accesskit_node_builder(response.id, |node| {
-            node.set_label(self.notification_label());
+            node.set_label(label);
         });
         let center = response.rect.center();
         let stroke = ui.style().interact(&response).fg_stroke;
@@ -168,6 +211,11 @@ impl FileAgentPanel {
             "No AI tasks".to_owned()
         } else if self.busy() {
             format!("{}\nOpen AI progress and partial results", self.status)
+        } else if let Some(proposal) = self.pending_proposal() {
+            format!(
+                "{}\nOpen the review; nothing changes before you approve",
+                proposal_label(proposal)
+            )
         } else {
             "Open the latest AI result".to_owned()
         });
@@ -186,6 +234,7 @@ impl FileAgentPanel {
         self.pane = pane;
         self.scope = scope;
         self.outcome = None;
+        self.proposal_used = false;
         self.snapshot = State::default();
         self.error = None;
         self.status.clear();
@@ -213,8 +262,8 @@ impl FileAgentPanel {
                     .outcome
                     .as_ref()
                     .ok_or("No run available to continue.")?;
-                if !matches!(outcome.status, Status::Capped) {
-                    return Err("Only a capped run can be continued.".into());
+                if !matches!(outcome.status, Status::Capped | Status::Rejected) {
+                    return Err("Only a capped run or a rejected proposal can be continued.".into());
                 }
                 if self.settings.as_ref() != Some(&settings) {
                     return Err("Access settings changed; start a new search.".into());
@@ -231,7 +280,7 @@ impl FileAgentPanel {
                 None
             };
             let request = Request {
-                settings_path,
+                settings_path: settings_path.clone(),
                 config_path: ai::config_path()?,
                 settings: settings.clone(),
                 current_folder: self.current_folder.clone(),
@@ -241,6 +290,7 @@ impl FileAgentPanel {
             };
             request.validate()?;
             self.settings = Some(settings);
+            self.settings_path = Some(settings_path);
             Ok(request)
         })();
         let request = match prepared {
@@ -260,6 +310,7 @@ impl FileAgentPanel {
         };
         self.started = Some(std::time::Instant::now());
         self.continuation = continuation;
+        self.proposal_used = false;
         if !continuation {
             self.outcome = None;
             self.snapshot = State::default();
@@ -339,6 +390,8 @@ impl FileAgentPanel {
                         Status::Capped => "capped",
                         Status::Failed => "failed",
                         Status::Cancelled => "cancelled",
+                        Status::Proposal => "proposal",
+                        Status::Rejected => "proposal_rejected",
                     },
                     calls: outcome.state.calls,
                     results: outcome.files.len(),
@@ -355,6 +408,18 @@ impl FileAgentPanel {
     pub fn show(&mut self, ctx: &egui::Context) -> Option<Action> {
         if !self.open {
             return None;
+        }
+        // Opening a task with an unreviewed proposal shows its review instead.
+        if let (Some(proposal), Some(settings), Some(settings_path)) =
+            (self.pending_proposal(), &self.settings, &self.settings_path)
+        {
+            let action = Action::Review {
+                proposal: Box::new(proposal.clone()),
+                settings: Box::new(settings.clone()),
+                settings_path: settings_path.clone(),
+            };
+            self.hide();
+            return Some(action);
         }
         if crate::app::consume_prompt_key(ctx, Modifiers::CTRL, Key::Space) {
             self.hide();
@@ -412,13 +477,14 @@ impl FileAgentPanel {
                     ui.label(&self.status);
                     cancel = ui.button("Cancel").on_hover_text("Escape").clicked();
                 }
-                if self
-                    .outcome
-                    .as_ref()
-                    .is_some_and(|outcome| matches!(outcome.status, Status::Capped))
-                {
+                if self.outcome.as_ref().is_some_and(|outcome| {
+                    matches!(outcome.status, Status::Capped | Status::Rejected)
+                }) {
                     resume = ui
                         .add_enabled(!busy, egui::Button::new("Continue"))
+                        .on_hover_text(
+                            "Send another bounded segment; a rejected proposal gets its problems back",
+                        )
                         .clicked();
                 }
             });
@@ -432,6 +498,17 @@ impl FileAgentPanel {
             if let Some(outcome) = &self.outcome {
                 if self.error.as_deref() != Some(outcome.summary.as_str()) {
                     ui.label(&outcome.summary);
+                }
+                if let Some(proposal) = &outcome.proposal
+                    && self.proposal_used
+                {
+                    ui.label(
+                        RichText::new(format!(
+                            "{} changes were reviewed; see Operations for what ran.",
+                            proposal.steps.len()
+                        ))
+                        .small(),
+                    );
                 }
                 ui.label(
                     RichText::new(format!(
@@ -631,6 +708,67 @@ mod tests {
             repeat: false,
             modifiers,
         }
+    }
+
+    #[test]
+    fn a_proposal_notifies_without_a_modal_and_opening_it_hands_over_the_review() {
+        use tomas_commander::proposal::{Kind, Proposal, Step};
+        let mut panel = panel();
+        panel.settings_path = Some(PathBuf::from(r"D:\synthetic\access.json"));
+        let (tx, rx) = mpsc::sync_channel(1);
+        panel.pending = Some(rx);
+        panel.hide();
+        let mut outcome = file_agent::outcome(
+            Status::Proposal,
+            "Sort Downloads".into(),
+            &panel.snapshot,
+            std::time::Instant::now(),
+        );
+        outcome.proposal = Some(Proposal {
+            summary: "Sort Downloads".into(),
+            steps: panel
+                .snapshot
+                .observed
+                .iter()
+                .map(|file| Step {
+                    kind: Kind::Recycle,
+                    source: Some(file.clone()),
+                    place: None,
+                    name: None,
+                    reason: "Synthetic".into(),
+                    target: file.path.clone(),
+                })
+                .collect(),
+        });
+        tx.send(Ok(outcome)).unwrap();
+        panel.poll();
+        assert!(!panel.open, "Completion never opens a modal.");
+        assert_eq!(
+            panel.notification_label(),
+            "Notifications / Proposal ready: 2 changes / unread"
+        );
+        assert_eq!(panel.finished.take().unwrap().outcome, "proposal");
+        let ctx = egui::Context::default();
+        panel.reveal();
+        let Some(Action::Review {
+            proposal,
+            settings_path,
+            ..
+        }) = frame(&mut panel, &ctx, vec![])
+        else {
+            panic!("Opening the task shows the review");
+        };
+        assert_eq!(proposal.steps.len(), 2);
+        assert_eq!(settings_path, PathBuf::from(r"D:\synthetic\access.json"));
+        assert!(!panel.open);
+        // Cancelling the review keeps the proposal; once it runs it is not offered again.
+        assert!(panel.pending_proposal().is_some());
+        panel.proposal_started();
+        assert!(panel.pending_proposal().is_none());
+        assert_eq!(panel.notification_label(), "Notifications");
+        panel.reveal();
+        assert!(frame(&mut panel, &ctx, vec![]).is_none());
+        assert!(panel.open, "The finished task shows its summary instead.");
     }
 
     #[test]

@@ -508,7 +508,8 @@ fn protect_request(request: &Internet, response_timeout_ms: u32) -> Result<()> {
     Ok(())
 }
 
-fn post(c: &Config, token: &Secret, body: &[u8]) -> Result<(Vec<u8>, String)> {
+/// `limit` bounds the response body; only the file harness exceeds `MAX_RESPONSE_BYTES`.
+fn post(c: &Config, token: &Secret, body: &[u8], limit: usize) -> Result<(Vec<u8>, String)> {
     unsafe {
         let session = Internet::new(WinHttpOpen(
             w!("TomasCommander/AI-01"),
@@ -608,7 +609,7 @@ fn post(c: &Config, token: &Secret, body: &[u8]) -> Result<(Vec<u8>, String)> {
             if count == 0 {
                 break;
             }
-            if bytes.len() + count as usize > MAX_RESPONSE_BYTES {
+            if bytes.len() + count as usize > limit {
                 return Err("Provider response byte ceiling exceeded.".into());
             }
             bytes.extend_from_slice(&chunk[..count as usize]);
@@ -814,7 +815,12 @@ pub(crate) fn execute_file_agent(
                 .0
                 .as_ref()
                 .ok_or("Verified agent identity unavailable.")?;
-            let (bytes, request_id) = post(&config, &verified.token.secret, body)
+            let (bytes, request_id) = post(
+                &config,
+                &verified.token.secret,
+                body,
+                crate::file_agent::MAX_RESPONSE,
+            )
             .map_err(|error| format!("{error} Uncertain spending lease retained; inspect ai-budget.lock before any new submission."))?;
             let parsed =
                 crate::file_agent::parse_response(&bytes, &config.model, &verified.version);
@@ -897,7 +903,7 @@ pub(super) fn execute(job: Job, cache: &mut AuthCache) -> Result<Completion> {
             .ok_or("Verified identity cache unavailable.")?
             .token
             .secret;
-        let (bytes, id) = post(&job.config, token, &body).map_err(|error|
+        let (bytes, id) = post(&job.config, token, &body, MAX_RESPONSE_BYTES).map_err(|error|
             format!("{error} Spending lease preserved; inspect ai-budget.lock before any further spending."))?;
         let provider_ms = provider_started.elapsed().as_millis() as u64;
         let local_started = Instant::now();

@@ -5577,3 +5577,418 @@ fn real_undo_restores_only_the_owned_recycled_items() {
     assert_eq!(fs::read_dir(&incoming).unwrap().count(), 1);
     fixture.own(&records_in(&journal_root));
 }
+
+fn ai_settings(
+    fixture: &mut Fixture,
+    root: &std::path::Path,
+) -> (tomas_commander::file_tools::Settings, PathBuf) {
+    use tomas_commander::{
+        ai,
+        file_tools::{Root, Settings},
+    };
+    let settings = Settings {
+        version: 1,
+        roots: vec![Root {
+            name: "Synthetic fixture".into(),
+            path: canonical(root),
+        }],
+        connection: ai::Config {
+            resource: "synthetic-foundry".into(),
+            resource_group: "synthetic".into(),
+            subscription: "00000000-0000-0000-0000-000000000001".into(),
+            tenant: "00000000-0000-0000-0000-000000000002".into(),
+            identity: "test@example.org".into(),
+            deployment: "synthetic-luna".into(),
+            model: "synthetic-luna".into(),
+            ..Default::default()
+        },
+        allow_content: true,
+        allow_cloud_download: true,
+    };
+    let path = fixture.root.join("ai-file-access.json");
+    settings.save(&path).unwrap();
+    fixture.own(std::slice::from_ref(&path));
+    (settings, path)
+}
+
+/// A validated proposal over real-file IDs observed exactly like the file agent does.
+fn ai_proposal(
+    settings: &tomas_commander::file_tools::Settings,
+    paths: &[&std::path::Path],
+    operations: impl FnOnce(&[u64]) -> serde_json::Value,
+) -> tomas_commander::proposal::Proposal {
+    let mut tools = tomas_commander::file_tools::Tools::new(settings.clone()).unwrap();
+    let ids: Vec<u64> = paths
+        .iter()
+        .map(|path| tools.observe(path, "test").unwrap()["id"].as_u64().unwrap())
+        .collect();
+    tomas_commander::proposal::validate(
+        &serde_json::json!({"summary":"Synthetic proposal","operations":operations(&ids)})
+            .to_string(),
+        &mut tools,
+    )
+    .unwrap()
+}
+
+#[test]
+fn ai_batch_runs_approved_steps_as_journaled_operations_and_undoes_a_step_or_the_batch() {
+    use tomas_commander::{journal::Journal, proposal, undo};
+    let mut fixture = Fixture::new("ai-batch");
+    let files_root = fixture.directory("Files");
+    let downloads = canonical(&fixture.directory("Files\\Downloads"));
+    let a = fixture.file("Files\\Downloads\\a.pdf", b"invoice a");
+    let b = fixture.file("Files\\Downloads\\b.pdf", b"invoice b");
+    let photo = fixture.file("Files\\Downloads\\photo.jpg", b"photo");
+    let setup = fixture.file("Files\\Downloads\\setup.exe", b"installer");
+    let notes = fixture.file("Files\\Downloads\\notes.txt", b"notes");
+    let archive = canonical(&fixture.directory("Files\\Archive"));
+    let journal_root = fixture.directory("Journal");
+    let journal = Journal::new(journal_root.clone());
+    journal.initialize().unwrap();
+    let bin = FakeBin::new(fixture.directory("Bin"));
+    let (settings, settings_path) = ai_settings(&mut fixture, &files_root);
+    let scope = fixture.scope();
+    let cancel = AtomicBool::new(false);
+    let before = hash_inventory(&downloads);
+    let proposal = ai_proposal(
+        &settings,
+        &[&downloads, &a, &b, &photo, &setup, &notes, &archive],
+        |ids| {
+            serde_json::json!([
+                {"op":"new_folder","parent":ids[0],"name":"PDF","reason":"PDFs"},
+                {"op":"move","source":ids[1],"destination":"f1","reason":"Invoice"},
+                {"op":"move","source":ids[2],"destination":"f1","reason":"Invoice"},
+                {"op":"rename","source":ids[3],"name":"2026-01-01_photo.jpg","reason":"Date"},
+                {"op":"recycle","source":ids[4],"reason":"Old installer"},
+                {"op":"copy","source":ids[5],"destination":ids[6],"reason":"Keep a copy"}
+            ])
+        },
+    );
+    let batch = proposal::Batch::new(&proposal, &[true; 6], 1, settings, settings_path).unwrap();
+    proposal::dry_run(&scope, &batch, &cancel).unwrap();
+    assert_eq!(
+        hash_inventory(&downloads),
+        before,
+        "The dry run has no effects."
+    );
+    assert!(record_texts(&journal_root).is_empty());
+    let recycle = |items: &[PathBuf]| bin.recycle(items);
+    let hooks = files::Hooks {
+        recycle: &recycle,
+        copied: &no_copy_hook,
+    };
+    let mut seen = Vec::new();
+    let report = proposal::execute(
+        &scope,
+        &journal,
+        &batch,
+        &cancel,
+        &hooks,
+        &mut |index, outcome| {
+            assert!(outcome.error.is_none(), "{outcome:?}");
+            seen.push(index);
+        },
+    );
+    assert_eq!(seen, [0, 1, 2, 3, 4, 5]);
+    assert_eq!(report.done(), 6, "{:?}", report.rows());
+    assert!(report.failed_at().is_none() && !report.cancelled);
+    assert_eq!(report.summary(), "AI changes: 6 of 6 steps done");
+    assert_eq!(fs::read(archive.join("notes.txt")).unwrap(), b"notes");
+    assert_eq!(
+        fs::read(&notes).unwrap(),
+        b"notes",
+        "Copy keeps the source."
+    );
+    let pdf = downloads.join("PDF");
+    assert_eq!(fs::read(pdf.join("a.pdf")).unwrap(), b"invoice a");
+    assert_eq!(fs::read(pdf.join("b.pdf")).unwrap(), b"invoice b");
+    assert_eq!(
+        fs::read(downloads.join("2026-01-01_photo.jpg")).unwrap(),
+        b"photo"
+    );
+    assert!(!a.exists() && !b.exists() && !photo.exists() && !setup.exists());
+    assert_eq!(
+        bin.calls(),
+        vec![vec![canonical(&downloads).join("setup.exe")]]
+    );
+    let texts = record_texts(&journal_root);
+    assert_eq!(texts.len(), 6);
+    let marker = format!("\nbatch={}\n", batch.key);
+    assert!(
+        texts
+            .iter()
+            .all(|text| text.contains(&marker) && text.ends_with("finished\n")),
+        "{texts:?}"
+    );
+    let history = undo::history(&scope, &journal, 20, &cancel).unwrap();
+    assert_eq!(history.len(), 6);
+    assert!(
+        history
+            .iter()
+            .all(|entry| entry.batch.as_deref() == Some(batch.key.as_str())
+                && entry.status == undo::Status::Undoable),
+        "{history:?}"
+    );
+
+    // One step on its own: the rename.
+    let undo_hooks = undo::Hooks {
+        recycle: &recycle,
+        bin: &bin,
+    };
+    let rename = history
+        .iter()
+        .find(|entry| entry.label.starts_with("Rename"))
+        .unwrap();
+    let plan = undo::prepare_with(&scope, &journal, 10, Some(&rename.key), &cancel, &bin).unwrap();
+    let outcome = plan.execute_with(&scope, &journal, true, &cancel, &undo_hooks);
+    assert!(outcome.error.is_none(), "{outcome:?}");
+    assert_eq!(fs::read(&photo).unwrap(), b"photo");
+
+    // The rest of the batch, newest first, in one reviewed plan.
+    let plan = undo::prepare_batch(&scope, &journal, 11, &batch.key, &cancel).unwrap();
+    assert_eq!(plan.len(), 5);
+    let rows = plan.rows();
+    assert!(rows[0].starts_with("1. Undo Copy"), "{rows:?}");
+    assert!(rows[1].starts_with("2. Undo Delete"), "{rows:?}");
+    assert!(rows[4].starts_with("5. Undo New folder"), "{rows:?}");
+    assert!(rows[5].starts_with("Already undone: Rename"), "{rows:?}");
+    assert!(
+        plan.execute_with(&scope, &journal, false, &cancel, &undo_hooks)
+            .error
+            .unwrap()
+            .contains("approval")
+    );
+    assert!(pdf.join("a.pdf").exists(), "Unapproved: no effects.");
+    let outcome = plan.execute_with(&scope, &journal, true, &cancel, &undo_hooks);
+    assert!(outcome.error.is_none(), "{outcome:?}");
+    assert!(
+        !pdf.exists(),
+        "The emptied new folder went to the Recycle Bin."
+    );
+    assert_eq!(hash_inventory(&downloads), before);
+    assert_eq!(
+        fs::read_dir(&archive).unwrap().count(),
+        0,
+        "The copy went to the Recycle Bin."
+    );
+    assert!(
+        undo::prepare_batch(&scope, &journal, 12, &batch.key, &cancel)
+            .unwrap_err()
+            .contains("Nothing to undo")
+    );
+    fixture.own(&tree(&bin.root));
+    fixture.own(&records_in(&journal_root));
+}
+
+#[test]
+fn ai_batch_stops_at_the_first_failing_step_when_a_conflict_appears_after_review() {
+    use tomas_commander::{journal::Journal, proposal};
+    let mut fixture = Fixture::new("ai-batch-conflict");
+    let files_root = fixture.directory("Files");
+    let downloads = canonical(&fixture.directory("Files\\Downloads"));
+    let docs = canonical(&fixture.directory("Files\\Docs"));
+    let a = fixture.file("Files\\Downloads\\a.txt", b"a");
+    let b = fixture.file("Files\\Downloads\\b.txt", b"b");
+    let c = fixture.file("Files\\Downloads\\c.txt", b"c");
+    let journal_root = fixture.directory("Journal");
+    let journal = Journal::new(journal_root.clone());
+    journal.initialize().unwrap();
+    let (settings, settings_path) = ai_settings(&mut fixture, &files_root);
+    let scope = fixture.scope();
+    let cancel = AtomicBool::new(false);
+    let proposal = ai_proposal(&settings, &[&downloads, &docs, &a, &b, &c], |ids| {
+        serde_json::json!([
+            {"op":"new_folder","parent":ids[0],"name":"Texts","reason":"Texts"},
+            {"op":"new_folder","parent":"f1","name":"2026","reason":"Year"},
+            {"op":"move","source":ids[2],"destination":"f2","reason":"Text"},
+            {"op":"move","source":ids[3],"destination":ids[1],"reason":"Document"},
+            {"op":"move","source":ids[4],"destination":"f2","reason":"Text"}
+        ])
+    });
+    let batch = proposal::Batch::new(&proposal, &[true; 5], 1, settings, settings_path).unwrap();
+    proposal::dry_run(&scope, &batch, &cancel).unwrap();
+    let report = proposal::execute(
+        &scope,
+        &journal,
+        &batch,
+        &cancel,
+        &files::Hooks::default(),
+        &mut |index, _| {
+            if index == 2 {
+                fs::write(docs.join("b.txt"), b"appeared after review").unwrap();
+            }
+        },
+    );
+    let states: Vec<_> = report.steps.iter().map(|step| step.state.clone()).collect();
+    assert!(
+        states[..3]
+            .iter()
+            .all(|state| *state == proposal::StepState::Done),
+        "{states:?}"
+    );
+    assert!(
+        matches!(&states[3], proposal::StepState::Failed(error) if error.contains("Conflict; no overwrite")),
+        "{states:?}"
+    );
+    assert_eq!(states[4], proposal::StepState::NotRun);
+    assert_eq!(report.failed_at(), Some(3));
+    let summary = report.summary();
+    assert!(
+        summary.starts_with("AI changes: 3 of 5 steps done; stopped at step 4 (Move: ")
+            && summary.ends_with("; 1 not run"),
+        "{summary}"
+    );
+    let rows = report.rows();
+    assert!(rows[3].starts_with("4. FAILED: Move: "), "{rows:?}");
+    assert!(
+        rows[4].starts_with("   ERROR: Not started; nothing changed by this step: Conflict"),
+        "{rows:?}"
+    );
+    assert!(
+        rows.iter().any(|row| row.starts_with("5. NOT RUN: Move: ")),
+        "{rows:?}"
+    );
+    let year = downloads.join("Texts\\2026");
+    assert_eq!(fs::read(year.join("a.txt")).unwrap(), b"a");
+    assert_eq!(
+        fs::read(&b).unwrap(),
+        b"b",
+        "The failed step changed nothing."
+    );
+    assert_eq!(
+        fs::read(docs.join("b.txt")).unwrap(),
+        b"appeared after review"
+    );
+    assert_eq!(fs::read(&c).unwrap(), b"c", "Later steps never ran.");
+    assert_eq!(record_texts(&journal_root).len(), 3);
+    fixture.own(&[
+        downloads.join("Texts"),
+        year.clone(),
+        year.join("a.txt"),
+        docs.join("b.txt"),
+    ]);
+    fixture.own(&records_in(&journal_root));
+}
+
+#[test]
+fn ai_batch_cancellation_stops_between_steps_and_reports_what_did_not_run() {
+    use tomas_commander::{journal::Journal, proposal};
+    let mut fixture = Fixture::new("ai-batch-cancel");
+    let files_root = fixture.directory("Files");
+    let downloads = canonical(&fixture.directory("Files\\Downloads"));
+    let a = fixture.file("Files\\Downloads\\a.txt", b"a");
+    let b = fixture.file("Files\\Downloads\\b.txt", b"b");
+    let journal_root = fixture.directory("Journal");
+    let journal = Journal::new(journal_root.clone());
+    journal.initialize().unwrap();
+    let (settings, settings_path) = ai_settings(&mut fixture, &files_root);
+    let scope = fixture.scope();
+    let cancel = AtomicBool::new(false);
+    let proposal = ai_proposal(&settings, &[&a, &b], |ids| {
+        serde_json::json!([
+            {"op":"rename","source":ids[0],"name":"a1.txt","reason":"x"},
+            {"op":"rename","source":ids[1],"name":"b1.txt","reason":"x"}
+        ])
+    });
+    let batch = proposal::Batch::new(&proposal, &[true; 2], 1, settings, settings_path).unwrap();
+    proposal::dry_run(&scope, &batch, &cancel).unwrap();
+    let report = proposal::execute(
+        &scope,
+        &journal,
+        &batch,
+        &cancel,
+        &files::Hooks::default(),
+        &mut |_, _| cancel.store(true, std::sync::atomic::Ordering::Release),
+    );
+    assert!(report.cancelled);
+    assert_eq!(report.steps[0].state, proposal::StepState::Done);
+    assert_eq!(report.steps[1].state, proposal::StepState::NotRun);
+    assert_eq!(
+        report.summary(),
+        "AI changes: 1 of 2 steps done; cancelled; 1 not run"
+    );
+    assert!(downloads.join("a1.txt").exists() && b.exists());
+    assert_eq!(record_texts(&journal_root).len(), 1);
+    fixture.own(&[downloads.join("a1.txt")]);
+    fixture.own(&records_in(&journal_root));
+}
+
+#[test]
+fn ai_batch_dry_run_reports_every_problem_and_settings_changes_without_effects() {
+    use tomas_commander::{journal::Journal, proposal};
+    let mut fixture = Fixture::new("ai-batch-dry-run");
+    let files_root = canonical(&fixture.directory("Files"));
+    let docs = canonical(&fixture.directory("Files\\Docs"));
+    let a = fixture.file("Files\\a.txt", b"a");
+    let b = fixture.file("Files\\b.txt", b"b");
+    let c = fixture.file("Files\\c.txt", b"c");
+    let journal_root = fixture.directory("Journal");
+    let journal = Journal::new(journal_root.clone());
+    journal.initialize().unwrap();
+    let (mut settings, settings_path) = ai_settings(&mut fixture, &files_root);
+    let scope = fixture.scope();
+    let cancel = AtomicBool::new(false);
+    let proposal = ai_proposal(&settings, &[&docs, &a, &b, &c], |ids| {
+        serde_json::json!([
+            {"op":"move","source":ids[1],"destination":ids[0],"reason":"x"},
+            {"op":"rename","source":ids[2],"name":"b2.txt","reason":"x"},
+            {"op":"new_folder","parent":ids[0],"name":"New","reason":"x"},
+            {"op":"move","source":ids[3],"destination":"f1","reason":"x"}
+        ])
+    });
+    let batch = proposal::Batch::new(
+        &proposal,
+        &[true; 4],
+        1,
+        settings.clone(),
+        settings_path.clone(),
+    )
+    .unwrap();
+    // Reviewed state changes: a source is edited and a planned folder appears.
+    fs::write(&a, b"edited after the proposal").unwrap();
+    fixture.directory("Files\\Docs\\New");
+    let before = hash_inventory(&files_root);
+    let problems = proposal::dry_run(&scope, &batch, &cancel).unwrap_err();
+    assert_eq!(problems.len(), 3, "{problems:?}");
+    assert!(
+        problems[0].starts_with("Step 1 (Move: ")
+            && problems[0].contains("Changed since the proposal"),
+        "{problems:?}"
+    );
+    assert!(
+        problems[1].starts_with("Step 3 (New folder: ") && problems[1].contains("already exists"),
+        "{problems:?}"
+    );
+    assert!(
+        problems[2].starts_with("Step 4 (Move: ") && problems[2].contains("(step 3)"),
+        "{problems:?}"
+    );
+    assert_eq!(hash_inventory(&files_root), before);
+    assert!(record_texts(&journal_root).is_empty());
+
+    // Changed access settings stop the check and every step.
+    fs::remove_dir(docs.join("New")).unwrap();
+    settings.allow_cloud_download = false;
+    settings.save(&settings_path).unwrap();
+    assert!(
+        proposal::dry_run(&scope, &batch, &cancel).unwrap_err()[0]
+            .contains("AI access settings changed")
+    );
+    let report = proposal::execute(
+        &scope,
+        &journal,
+        &batch,
+        &cancel,
+        &files::Hooks::default(),
+        &mut |_, _| (),
+    );
+    assert!(
+        matches!(&report.steps[0].state, proposal::StepState::Failed(error) if error.contains("settings changed")),
+        "{:?}",
+        report.rows()
+    );
+    assert_eq!(report.done(), 0);
+    assert_eq!(fs::read(&b).unwrap(), b"b");
+    assert!(record_texts(&journal_root).is_empty());
+    fixture.own(&records_in(&journal_root));
+}
