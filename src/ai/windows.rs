@@ -1,9 +1,16 @@
 use super::*;
 use ::windows::{
     Win32::{
-        Foundation::{CloseHandle, HANDLE},
+        Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE},
         Networking::WinHttp::*,
-        System::JobObjects::*,
+        System::{
+            IO::{CreateIoCompletionPort, GetQueuedCompletionStatus},
+            JobObjects::*,
+            SystemServices::{
+                JOB_OBJECT_MSG_ACTIVE_PROCESS_ZERO, JOB_OBJECT_MSG_JOB_MEMORY_LIMIT,
+                JOB_OBJECT_MSG_PROCESS_MEMORY_LIMIT,
+            },
+        },
     },
     core::{PCWSTR, w},
 };
@@ -12,11 +19,48 @@ use std::{
     os::windows::{io::AsRawHandle, process::CommandExt},
 };
 
-pub(super) struct JobHandle(HANDLE);
+pub(super) struct JobHandle {
+    job: HANDLE,
+    /// Receives job notifications when a memory limit is configured.
+    port: Option<HANDLE>,
+}
 impl Drop for JobHandle {
     fn drop(&mut self) {
         unsafe {
-            let _ = CloseHandle(self.0);
+            let _ = CloseHandle(self.job);
+            if let Some(port) = self.port {
+                let _ = CloseHandle(port);
+            }
+        }
+    }
+}
+impl JobHandle {
+    /// Whether Windows reported that a process in this job hit its memory
+    /// limit, waiting up to `wait` for the job's processes to finish.
+    pub(super) fn exceeded_memory(&self, wait: Duration) -> bool {
+        let Some(port) = self.port else {
+            return false;
+        };
+        let deadline = Instant::now() + wait;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let (mut message, mut key, mut overlapped) = (0u32, 0usize, std::ptr::null_mut());
+            let received = unsafe {
+                GetQueuedCompletionStatus(
+                    port,
+                    &mut message,
+                    &mut key,
+                    &mut overlapped,
+                    remaining.as_millis().min(u32::MAX as u128) as u32,
+                )
+            };
+            match (received, message) {
+                (Err(_), _) | (Ok(()), JOB_OBJECT_MSG_ACTIVE_PROCESS_ZERO) => return false,
+                (Ok(()), JOB_OBJECT_MSG_PROCESS_MEMORY_LIMIT | JOB_OBJECT_MSG_JOB_MEMORY_LIMIT) => {
+                    return true;
+                }
+                _ => (),
+            }
         }
     }
 }
@@ -25,13 +69,25 @@ pub(super) struct Contained {
     pub job: JobHandle,
 }
 
-pub(super) fn spawn_contained(command: &mut Command) -> Result<Contained> {
+/// Spawns `command` in a kill-on-close job; `memory_limit` additionally caps
+/// each process's committed memory and enables limit notifications.
+pub(super) fn spawn_contained(
+    command: &mut Command,
+    memory_limit: Option<usize>,
+) -> Result<Contained> {
     unsafe {
         let handle = CreateJobObjectW(None, PCWSTR::null())
             .map_err(|_| "Could not create AI worker containment.")?;
-        let job = JobHandle(handle);
+        let mut job = JobHandle {
+            job: handle,
+            port: None,
+        };
         let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
         limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        if let Some(bytes) = memory_limit {
+            limits.BasicLimitInformation.LimitFlags |= JOB_OBJECT_LIMIT_PROCESS_MEMORY;
+            limits.ProcessMemoryLimit = bytes;
+        }
         SetInformationJobObject(
             handle,
             JobObjectExtendedLimitInformation,
@@ -39,6 +95,22 @@ pub(super) fn spawn_contained(command: &mut Command) -> Result<Contained> {
             std::mem::size_of_val(&limits) as u32,
         )
         .map_err(|_| "Could not bind AI worker termination policy.")?;
+        if memory_limit.is_some() {
+            let port = CreateIoCompletionPort(INVALID_HANDLE_VALUE, None, 0, 1)
+                .map_err(|_| "Could not create AI worker limit notifications.")?;
+            job.port = Some(port);
+            let association = JOBOBJECT_ASSOCIATE_COMPLETION_PORT {
+                CompletionKey: std::ptr::null_mut(),
+                CompletionPort: port,
+            };
+            SetInformationJobObject(
+                handle,
+                JobObjectAssociateCompletionPortInformation,
+                &association as *const _ as *const c_void,
+                std::mem::size_of_val(&association) as u32,
+            )
+            .map_err(|_| "Could not bind AI worker limit notifications.")?;
+        }
         // The worker cannot start auth/network work until its parent writes stdin after assignment.
         let mut child = command
             .creation_flags(0x08000000)
@@ -871,6 +943,56 @@ pub(super) fn execute(job: Job, cache: &mut AuthCache) -> Result<Completion> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn memory_capped_jobs_kill_on_close_and_report_the_cap() {
+        let python = || {
+            let mut command =
+                Command::new(r"C:\Program Files\Microsoft SDKs\Azure\CLI2\python.exe");
+            command
+                .args([
+                    "-I",
+                    "-c",
+                    "import sys; sys.stdin.buffer.readline(); bytearray(256 * 1024 * 1024)",
+                ])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            command
+        };
+        for capped in [true, false] {
+            let cap = 64 * 1024 * 1024;
+            let mut contained = spawn_contained(&mut python(), capped.then_some(cap)).unwrap();
+            let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+            unsafe {
+                QueryInformationJobObject(
+                    Some(contained.job.job),
+                    JobObjectExtendedLimitInformation,
+                    &mut limits as *mut _ as *mut c_void,
+                    std::mem::size_of_val(&limits) as u32,
+                    None,
+                )
+                .unwrap();
+            }
+            let flags = limits.BasicLimitInformation.LimitFlags;
+            assert!(flags.contains(JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE));
+            assert_eq!(flags.contains(JOB_OBJECT_LIMIT_PROCESS_MEMORY), capped);
+            assert_eq!(limits.ProcessMemoryLimit, if capped { cap } else { 0 });
+            if !capped {
+                // Without a cap the allocation is not attempted under test.
+                let _ = contained.child.kill();
+                contained.child.wait().unwrap();
+                assert!(!contained.job.exceeded_memory(Duration::from_millis(100)));
+                continue;
+            }
+            let mut input = contained.child.stdin.take().unwrap();
+            input.write_all(b"\n").unwrap();
+            drop(input);
+            assert!(!contained.child.wait().unwrap().success());
+            assert!(contained.job.exceeded_memory(Duration::from_secs(5)));
+        }
+    }
+
     #[test]
     fn real_winhttp_rejects_invalid_tls_redirect_and_delayed_local_response() {
         use std::net::TcpListener;

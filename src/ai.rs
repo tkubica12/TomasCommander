@@ -20,6 +20,9 @@ pub(crate) mod windows;
 pub type Result<T> = std::result::Result<T, String>;
 const INSTRUCTIONS: &str = "Answer only the user's explicit prompt. No file access, tools, actions, or private data. Be concise.";
 pub const MAX_RESPONSE_BYTES: usize = 65_536;
+/// Reported instead of a closed pipe when Windows stopped a worker at its memory cap.
+pub(crate) const MEMORY_LIMIT_EXCEEDED: &str =
+    "Worker exceeded its memory limit and was stopped; no retry.";
 pub const SESSION_FRESHNESS: Duration = Duration::from_secs(60);
 pub const CMD_PILOT_PROMPTS: [&str; 4] = [
     "Najdi prezentaci z Penta hackathonu a vytvoř její kopii ve složce Kosik.",
@@ -697,16 +700,23 @@ struct Worker {
 
 impl Worker {
     fn spawn(command: Command) -> Result<Self> {
-        Self::spawn_with_limit(command, MAX_RESPONSE_BYTES)
+        Self::spawn_with_limit(command, MAX_RESPONSE_BYTES, None)
     }
 
-    fn spawn_with_limit(mut command: Command, maximum: usize) -> Result<Self> {
+    fn spawn_with_limit(
+        mut command: Command,
+        maximum: usize,
+        memory_limit: Option<usize>,
+    ) -> Result<Self> {
         #[cfg(windows)]
-        let contained = windows::spawn_contained(&mut command)?;
+        let contained = windows::spawn_contained(&mut command, memory_limit)?;
         #[cfg(windows)]
         let mut child = contained.child;
         #[cfg(not(windows))]
-        let mut child = command.spawn().map_err(|_| "Could not start AI worker.")?;
+        let mut child = {
+            let _ = memory_limit;
+            command.spawn().map_err(|_| "Could not start AI worker.")?
+        };
         let input = child.stdin.take().ok_or("Worker input unavailable.")?;
         let stdout = child.stdout.take().ok_or("Worker output unavailable.")?;
         let (sender, results) = mpsc::sync_channel(1);
@@ -731,6 +741,20 @@ impl Worker {
             #[cfg(windows)]
             job: Some(contained.job),
         })
+    }
+
+    /// Whether Windows stopped this worker at its job memory cap.
+    fn exceeded_memory(&self) -> bool {
+        #[cfg(windows)]
+        {
+            self.job
+                .as_ref()
+                .is_some_and(|job| job.exceeded_memory(Duration::from_millis(500)))
+        }
+        #[cfg(not(windows))]
+        {
+            false
+        }
     }
 
     fn stop(&mut self) -> Result<()> {
@@ -781,16 +805,20 @@ pub(crate) fn contained_exchange(
         timeout,
         cancel,
         16_384,
+        None,
         |_| Ok(true),
     )
 }
 
+/// `memory_limit` caps each worker process's committed memory (Windows job);
+/// hitting it is reported as [`MEMORY_LIMIT_EXCEEDED`].
 pub(crate) fn contained_exchange_progress(
     argument: &str,
     encoded: Vec<u8>,
     timeout: Duration,
     cancel: Arc<AtomicBool>,
     maximum: usize,
+    memory_limit: Option<usize>,
     terminal: impl FnMut(&[u8]) -> Result<bool>,
 ) -> Result<Vec<u8>> {
     if encoded.len() > maximum || cancel.load(Ordering::Acquire) {
@@ -803,7 +831,15 @@ pub(crate) fn contained_exchange_progress(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
-    exchange_progress_command(command, encoded, timeout, cancel, maximum, terminal)
+    exchange_progress_command(
+        command,
+        encoded,
+        timeout,
+        cancel,
+        maximum,
+        memory_limit,
+        terminal,
+    )
 }
 
 fn exchange_progress_command(
@@ -812,13 +848,15 @@ fn exchange_progress_command(
     timeout: Duration,
     cancel: Arc<AtomicBool>,
     maximum: usize,
+    memory_limit: Option<usize>,
     mut terminal: impl FnMut(&[u8]) -> Result<bool>,
 ) -> Result<Vec<u8>> {
     if encoded.len() > maximum || cancel.load(Ordering::Acquire) {
         return Err("Cancelled or oversized connected-source request; nothing sent.".into());
     }
     let started = Instant::now();
-    let mut worker = Worker::spawn_with_limit(command, maximum.max(MAX_RESPONSE_BYTES))?;
+    let mut worker =
+        Worker::spawn_with_limit(command, maximum.max(MAX_RESPONSE_BYTES), memory_limit)?;
     let input = worker.input.clone();
     let sender = worker.sender.clone();
     thread::spawn(move || {
@@ -855,6 +893,8 @@ fn exchange_progress_command(
                     Ok(false) => (),
                     Err(error) => break Err(error),
                 },
+                // A worker killed at its memory cap only shows up as a closed pipe.
+                Err(_) if worker.exceeded_memory() => break Err(MEMORY_LIMIT_EXCEEDED.into()),
                 Err(error) => break Err(error),
             },
             Ok(_) => break Err("Cancelled as source result arrived; result discarded.".into()),
@@ -1747,6 +1787,7 @@ mod tests {
                 Duration::from_secs(1),
                 flag,
                 2 * 1024 * 1024,
+                None,
                 |bytes| {
                     assert_eq!(bytes, b"progress");
                     received = true;
@@ -1764,6 +1805,33 @@ mod tests {
             );
             assert!(started.elapsed() < Duration::from_secs(3));
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn worker_stopped_at_its_memory_cap_is_reported_not_a_closed_pipe() {
+        let mut command = Command::new(r"C:\Program Files\Microsoft SDKs\Azure\CLI2\python.exe");
+        command
+            .args([
+                "-I",
+                "-c",
+                "import sys; sys.stdin.buffer.readline(); bytearray(256 * 1024 * 1024)",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        let started = Instant::now();
+        let result = exchange_progress_command(
+            command,
+            b"synthetic".to_vec(),
+            Duration::from_secs(20),
+            Arc::new(AtomicBool::new(false)),
+            2 * 1024 * 1024,
+            Some(64 * 1024 * 1024),
+            |_| Ok(true),
+        );
+        assert_eq!(result.unwrap_err(), MEMORY_LIMIT_EXCEEDED);
+        assert!(started.elapsed() < Duration::from_secs(15));
     }
 
     #[cfg(windows)]

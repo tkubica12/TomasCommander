@@ -23,9 +23,32 @@ roots in one call. Globs support one brace group such as `*.{pptx,pdf,html,htm}`
 and an optional literal full-path/name query. Filename/type/path filtering happens
 before unrelated file metadata is opened; directory containment is still checked
 before traversal. The model ranks these candidates before reading their content.
-Supported content is UTF-8/BOM-marked
-UTF-16 text, DOCX main-body text and PPTX slide text. External Office relationships, macros
-and embedded objects are not followed. PDF/OCR, images, XLSX and legacy Office
+Supported content is UTF-8/BOM-marked UTF-16 text, DOCX main-body text, PPTX
+slide text, XLSX/XLSM cell values and PDF text. External Office relationships,
+macros, VBA projects and embedded objects are not followed. Spreadsheets list
+each sheet as `[sheet name]` (hidden sheets marked) followed by tab-separated
+rows aligned to their columns; empty rows are skipped, formulas contribute only
+their cached value, numbers/dates stay raw serial values, and chart/macro sheets
+are not read. PDFs are parsed with `lopdf` in a panic-contained, time-bounded
+helper thread of the contained worker: `[page N]` text in content order, with
+ToUnicode, font encodings, form XObjects and word/line spacing reconstructed
+from positions; JavaScript, forms, annotations and attachments are ignored.
+Owner-password-only PDFs are readable; PDFs needing a user password,
+password-protected Office files and OLE files mislabeled as Open XML fail
+explicitly. Pages without a usable text layer (images or undecodable fonts)
+are rendered with Windows.Data.Pdf and recognized by Windows.Media.Ocr as
+`[page N, OCR]`, for at most 10 pages, 2 seconds per page and 20 seconds per
+document; `grep` never runs OCR and marks such pages instead. Missing OCR
+languages are reported in the text. Limits: 500 pages, 20-second text-layer
+budget, 16 MiB per decompressed stream, 32 MiB per page content and extracted
+text. The text budget is enforced while decoding each string and spreadsheet
+cell, not after a page or row: ToUnicode CMaps are parsed by a bounded in-house
+parser that never expands code ranges (at most 16 UTF-16 units per code,
+131,072 entries per CMap, 1,048,576 per document, each shared stream parsed
+once; lopdf never parses ToUnicode), at most 4,096 fonts are decoded per
+document, and spreadsheet shared strings are borrowed (at most 500,000) with
+cells beyond column XFD skipped. Extracted PDF/Office/spreadsheet text is cached per file
+identity/size/time for one harness run (64 MiB total). Images and legacy Office
 content are explicitly unsupported; images can still be found by names.
 Reads are limited to 32 MiB files and 6,000 characters per page. Full supported
 documents may be read over successive pages bound to the returned file version.

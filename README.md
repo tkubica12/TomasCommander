@@ -63,7 +63,9 @@ The binary is unsigned; this project does not provide code-signing or support.
 - Source editing with guarded Save; ZIP browsing, creation, insertion and
   extraction with reviewed operation plans.
 - Ask for AI prompts and slash commands, and Open with choices for VS Code, GitHub Copilot CLI and
-  GitHub Copilot App, when installed.
+  GitHub Copilot App, when installed. The read-only `/ai-search` file harness
+  reads text, DOCX/PPTX, XLSX/XLSM cell values and PDF text (scanned pages via
+  Windows OCR) inside approved roots.
 - Light/dark mode, four accent choices, proportional UI zoom and internal
   drag-and-drop: Move by default, Ctrl for Copy.
 - Native Windows dragging of real files to external applications, offering Copy
@@ -167,7 +169,11 @@ Copilot CLI is launched with `--yolo`, allowing that external agent to act
 without its usual permission prompts. Only use it in a folder you trust.
 
 The read-only Foundry file harness requires separately approved roots and
-supports names, metadata, text and DOCX/PPTX extraction. It has ten calls /
+supports names, metadata, text, DOCX/PPTX text, XLSX/XLSM cached cell values
+(never macros or formula evaluation) and PDF text layers. Up to 10 scanned PDF
+pages per read get local Windows OCR (an installed OCR language is needed);
+grep never OCRs. Encrypted PDFs/Office files, legacy .doc/.xls/.ppt and images
+are not read as content. It has ten calls /
 two minutes per segment, explicit continuation and no lifetime spending cap.
 It uses the standard Responses tool loop with explicit medium reasoning, not
 subagents. Batched candidate globs can search approved roots and file types in

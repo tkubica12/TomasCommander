@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+- AI file harness reads PDF and XLSX/XLSM content. PDFs use the pure-Rust
+  `lopdf` parser (new pinned dependency, default features off) in a
+  panic-contained, time-bounded thread of the contained worker: `[page N]`
+  text with ToUnicode/Identity-H (Czech diacritics), lenient `/Differences`
+  encodings, form XObjects and position-based word/line spacing. Pages without
+  a usable text layer are rendered with Windows.Data.Pdf and recognized with
+  Windows.Media.Ocr as `[page N, OCR]` (read_file only; at most 10 pages,
+  2 seconds per page, 20 seconds per document; missing OCR languages are
+  reported). Encrypted PDFs needing a user password fail explicitly;
+  owner-password-only PDFs are read. Limits: 500 pages, 32 MiB input/text,
+  bounded stream decompression. XLSX/XLSM output lists `[sheet name]` and
+  tab-separated cached cell values (shared/inline strings, numbers, booleans,
+  errors) without macros or formula evaluation, with the same 4 MiB part,
+  entity and cancellation limits as DOCX/PPTX. Password-protected or mislabeled
+  OLE Office files and legacy .doc/.xls/.ppt report clear errors. Extracted
+  document text is cached per file version for one harness run (64 MiB).
+  Credential-marker blocking applies to extracted text. Text budgets are
+  enforced per decoded string and spreadsheet cell; ToUnicode CMaps use a
+  bounded parser that never expands code ranges, and the file-agent worker's
+  job object caps committed memory at 1 GiB, reported as a memory-limit stop
+  with results so far kept.
 - Local usage log, on by default: commands with how they were invoked
   (shortcut, button, context menu, drag, Ask palette or typed slash command),
   unhandled keys such as F5 or Ctrl+C on a file row, navigation and its route,

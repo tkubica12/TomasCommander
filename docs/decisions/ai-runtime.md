@@ -12,6 +12,12 @@ persisted separately. `ai-file-agent-usage.json` records cumulative attempts;
 prompts, paths or contents. Old counters/grants are not reset. The existing
 `ai-budget.lock` serializes both routes; an uncertain lease remains blocking.
 No automatic retry, stronger-model fallback, shell or filesystem mutation.
+All file reading and parsing, including PDF/XLSX extraction and local Windows
+OCR, runs inside the contained worker process (no extra process or network
+call); only the bounded tool results reach the model. Its job object also caps
+committed memory at 1 GiB per process as a backstop to the parsers' own
+bounds; a worker stopped there is reported as exceeding its memory limit, and
+results found so far are kept.
 See [AI file discovery](ai-search.md) for scope, formats and controls.
 
 Ask uses Medium reasoning on the configured primary deployment. Headless file

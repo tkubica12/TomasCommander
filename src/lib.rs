@@ -13,6 +13,7 @@ mod html;
 pub mod journal;
 pub mod naming;
 pub mod pdf;
+mod pdf_text;
 pub mod platform;
 pub mod preferences;
 pub mod recent;
@@ -21,6 +22,7 @@ pub mod text_preview;
 pub mod undo;
 pub mod usage;
 pub mod viewer;
+mod xlsx;
 
 #[cfg(windows)]
 pub const APP_ICON_RGBA: &[u8] = include_bytes!("..\\assets\\app-icon.rgba");

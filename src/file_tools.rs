@@ -2,16 +2,19 @@ use crate::{ai, files, search};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
-    collections::BTreeSet,
+    cell::{Cell, RefCell},
+    collections::{BTreeSet, VecDeque},
     fs::{self, File, OpenOptions},
     io::Read,
     path::{Component, Path, PathBuf},
+    sync::Arc,
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
 pub const MAX_TOOL_BYTES: usize = 32_768;
 const MAX_TEXT_BYTES: usize = 32 * 1024 * 1024;
 const MAX_ITEMS: usize = 100_000;
+const CACHE_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -217,6 +220,108 @@ pub struct Tools {
     pub examined: usize,
     pub skipped: usize,
     pub truncated: bool,
+    cache: RefCell<TextCache>,
+    /// Number of PDF/Office/spreadsheet extractions that missed the cache.
+    pub(crate) extractions: Cell<usize>,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct CacheKey {
+    path: PathBuf,
+    identity: (u32, u64),
+    size: u64,
+    modified: Option<SystemTime>,
+}
+
+/// Extracted document text for one harness run, bounded to 64 MiB in total.
+#[derive(Default)]
+struct TextCache {
+    entries: VecDeque<(CacheKey, Arc<str>, bool)>,
+    bytes: usize,
+}
+
+impl TextCache {
+    /// `with_ocr` requires an entry whose OCR-eligible pages were not skipped.
+    fn get(&mut self, key: &CacheKey, with_ocr: bool) -> Option<Arc<str>> {
+        let index = self
+            .entries
+            .iter()
+            .position(|(cached, _, complete)| cached == key && (*complete || !with_ocr))?;
+        let entry = self.entries.remove(index)?;
+        let text = entry.1.clone();
+        self.entries.push_back(entry);
+        Some(text)
+    }
+
+    fn insert(&mut self, key: CacheKey, text: Arc<str>, complete: bool) {
+        if let Some(index) = self.entries.iter().position(|(cached, ..)| *cached == key)
+            && let Some((_, old, _)) = self.entries.remove(index)
+        {
+            self.bytes -= old.len();
+        }
+        if text.len() > CACHE_BYTES {
+            return;
+        }
+        while self.bytes + text.len() > CACHE_BYTES {
+            match self.entries.pop_front() {
+                Some((_, old, _)) => self.bytes -= old.len(),
+                None => break,
+            }
+        }
+        self.bytes += text.len();
+        self.entries.push_back((key, text, complete));
+    }
+}
+
+enum Format {
+    Text,
+    Office,
+    Spreadsheet,
+    Pdf,
+}
+
+fn content_format(extension: &str) -> ai::Result<Format> {
+    Ok(match extension {
+        "docx" | "pptx" => Format::Office,
+        "xlsx" | "xlsm" => Format::Spreadsheet,
+        "pdf" => Format::Pdf,
+        "doc" | "xls" | "ppt" => {
+            return Err(format!(
+                "Legacy binary Office format .{extension} is not text extraction; only names and metadata are available."
+            ));
+        }
+        "txt" | "md" | "markdown" | "csv" | "json" | "xml" | "html" | "htm" | "rs" | "py"
+        | "js" | "ts" | "tsx" | "jsx" | "css" | "toml" | "yaml" | "yml" | "log" | "ini" | "cfg"
+        | "sql" | "ps1" | "sh" | "go" | "c" | "cpp" | "h" | "cs" | "java" | "r" | "bat" => {
+            Format::Text
+        }
+        _ => {
+            return Err(format!(
+                "Unsupported content format .{extension}; images and other binary formats are not text extraction."
+            ));
+        }
+    })
+}
+
+fn read_all(file: &mut File, stopped: &impl Fn() -> bool) -> ai::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    let mut block = [0u8; 16_384];
+    loop {
+        if stopped() {
+            return Err("Cancelled or time limit reached during read.".into());
+        }
+        let n = file
+            .read(&mut block)
+            .map_err(|e| format!("Read content: {e}"))?;
+        if n == 0 {
+            break;
+        }
+        if bytes.len() + n > MAX_TEXT_BYTES {
+            return Err("Content exceeds 32 MiB.".into());
+        }
+        bytes.extend_from_slice(&block[..n]);
+    }
+    Ok(bytes)
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -241,6 +346,8 @@ impl Tools {
             examined: 0,
             skipped: 0,
             truncated: false,
+            cache: RefCell::default(),
+            extractions: Cell::new(0),
         })
     }
 
@@ -339,14 +446,17 @@ impl Tools {
     }
 
     pub fn text(&self, path: &Path, stopped: &impl Fn() -> bool) -> ai::Result<String> {
-        self.bound_text(path, stopped).map(|(text, _guards)| text)
+        self.bound_text(path, true, stopped)
+            .map(|(text, _guards)| text.to_string())
     }
 
+    /// Reads supported content; `ocr` allows bounded OCR of scanned PDF pages.
     fn bound_text(
         &self,
         path: &Path,
+        ocr: bool,
         stopped: &impl Fn() -> bool,
-    ) -> ai::Result<(String, Vec<File>)> {
+    ) -> ai::Result<(Arc<str>, Vec<File>)> {
         if !self.settings.allow_content {
             return Err("Content reads are not approved.".into());
         }
@@ -378,72 +488,57 @@ impl Tools {
             .and_then(|s| s.to_str())
             .unwrap_or("")
             .to_ascii_lowercase();
-        let text = if matches!(extension.as_str(), "docx" | "pptx") {
-            office_text(&mut file, &extension, stopped)?
+        let format = content_format(&extension)?;
+        let mut pending = None;
+        let text: Arc<str> = if let Format::Text = format {
+            decode_text(&read_all(&mut file, stopped)?)?.into()
         } else {
-            if !matches!(
-                extension.as_str(),
-                "txt"
-                    | "md"
-                    | "markdown"
-                    | "csv"
-                    | "json"
-                    | "xml"
-                    | "html"
-                    | "htm"
-                    | "rs"
-                    | "py"
-                    | "js"
-                    | "ts"
-                    | "tsx"
-                    | "jsx"
-                    | "css"
-                    | "toml"
-                    | "yaml"
-                    | "yml"
-                    | "log"
-                    | "ini"
-                    | "cfg"
-                    | "sql"
-                    | "ps1"
-                    | "sh"
-                    | "go"
-                    | "c"
-                    | "cpp"
-                    | "h"
-                    | "cs"
-                    | "java"
-                    | "r"
-                    | "bat"
-            ) {
-                return Err(format!(
-                    "Unsupported content format .{extension}; PDF/OCR, images and legacy Office are not text extraction."
-                ));
+            #[cfg(windows)]
+            let identity = crate::platform::file_identity(&file)?;
+            #[cfg(not(windows))]
+            let identity = (0, 0);
+            let key = CacheKey {
+                path: resolved.clone(),
+                identity,
+                size: before.len(),
+                modified: before.modified().ok(),
+            };
+            let cached = self.cache.borrow_mut().get(&key, ocr);
+            match cached {
+                Some(text) => text,
+                None => {
+                    self.extractions.set(self.extractions.get() + 1);
+                    let (text, complete) = match format {
+                        Format::Office => (office_text(&mut file, &extension, stopped)?, true),
+                        Format::Spreadsheet => {
+                            (crate::xlsx::text(&mut file, MAX_TEXT_BYTES, stopped)?, true)
+                        }
+                        _ => {
+                            let bytes: Arc<[u8]> = read_all(&mut file, stopped)?.into();
+                            let mut engine = crate::pdf_text::system_ocr(bytes.clone());
+                            let extracted = crate::pdf_text::extract(
+                                bytes,
+                                ocr.then_some(engine.as_mut()),
+                                &crate::pdf_text::Limits::default(),
+                                stopped,
+                            )?;
+                            (extracted.text, extracted.complete)
+                        }
+                    };
+                    let text: Arc<str> = text.into();
+                    pending = Some((key, text.clone(), complete));
+                    text
+                }
             }
-            let mut bytes = Vec::new();
-            let mut block = [0u8; 16_384];
-            loop {
-                if stopped() {
-                    return Err("Cancelled or time limit reached during read.".into());
-                }
-                let n = file
-                    .read(&mut block)
-                    .map_err(|e| format!("Read content: {e}"))?;
-                if n == 0 {
-                    break;
-                }
-                if bytes.len() + n > MAX_TEXT_BYTES {
-                    return Err("Content exceeds 32 MiB.".into());
-                }
-                bytes.extend_from_slice(&block[..n]);
-            }
-            decode_text(&bytes)?
         };
         let after = file
             .metadata()
             .map_err(|e| format!("Recheck read metadata: {e}"))?;
         if before.len() != after.len() || before.modified().ok() != after.modified().ok() {
             return Err("File changed during reading; content discarded.".into());
+        }
+        if let Some((key, text, complete)) = pending {
+            self.cache.borrow_mut().insert(key, text, complete);
         }
         if contains_secret(&text) {
             return Err("Possible credential material blocked; no content sent.".into());
@@ -529,7 +624,7 @@ impl Tools {
                         if name == "grep" {
                             if is_directory { self.observed.truncate(previous_count); continue; }
                             let before_matches = values.len();
-                            match self.bound_text(&path, &stopped) {
+                            match self.bound_text(&path, false, &stopped) {
                                 Ok((text, _guards)) => {
                                     if let Some((line, matched)) = text.lines().enumerate()
                                         .find(|(_, line)| search::fold(line).contains(&search::fold(&args.query)))
@@ -564,7 +659,7 @@ impl Tools {
                 if args.offset > 0 && args.version_id.is_none() {
                     return Err("Paged reads require the file.id returned by the first page as version_id.".into());
                 }
-                let (text, _guards) = self.bound_text(Path::new(&args.path), &stopped)?;
+                let (text, _guards) = self.bound_text(Path::new(&args.path), true, &stopped)?;
                 let total = text.chars().count();
                 if args.offset > total { return Err("Read offset exceeds document length.".into()); }
                 let fragment: String = text.chars().skip(args.offset).take(args.length).collect();
@@ -654,6 +749,9 @@ fn office_text(
     extension: &str,
     stopped: &impl Fn() -> bool,
 ) -> ai::Result<String> {
+    if crate::xlsx::ole_container(file) {
+        return Err(crate::xlsx::OLE.into());
+    }
     let mut archive =
         zip::ZipArchive::new(file).map_err(|e| format!("Read Office package: {e}"))?;
     if archive.len() > 10_000 {
@@ -812,9 +910,9 @@ pub fn tool_definitions() -> Vec<Value> {
         "required":["path","pattern","query","recursive","limit"],"additionalProperties":false});
     ["list_directory","glob","grep"].into_iter().map(|name| json!({"type":"function","name":name,
         "description":match name { "list_directory"=>"List real files and folders. Use recursive=false to inspect a directory.",
-            "glob"=>"Find actual paths matching a glob recursively.",_=>"Search literal text in supported documents; returns matching excerpt and real path." },
+            "glob"=>"Find actual paths matching a glob recursively.",_=>"Search literal text in supported documents (text, DOCX/PPTX, XLSX/XLSM cell values, PDF text layer without OCR); returns matching excerpt and real path." },
         "parameters":walk,"strict":true})).chain(std::iter::once(json!({"type":"function","name":"read_file",
-        "description":"Read UTF-8/UTF-16 text or extracted DOCX/PPTX text in pages of characters. Use version_id=null at offset 0, then returned file.id as version_id with next_offset for later pages. Changed files require restart; other binary formats explicitly fail.",
+        "description":"Read UTF-8/UTF-16 text, extracted DOCX/PPTX text, XLSX/XLSM cached cell values ([sheet name], tab-separated rows) or PDF text ([page N]; up to 10 scanned pages get Windows OCR as [page N, OCR]) in pages of characters. Use version_id=null at offset 0, then returned file.id as version_id with next_offset for later pages. Changed files require restart; encrypted PDFs, legacy .doc/.xls/.ppt and other binary formats explicitly fail.",
         "parameters":{"type":"object","properties":{"path":{"type":"string"},"offset":{"type":"integer","minimum":0},
             "length":{"type":"integer","minimum":1,"maximum":6000},
             "version_id":{"type":["integer","null"],"minimum":1,"maximum":1000}},"required":["path","offset","length","version_id"],
@@ -825,6 +923,7 @@ pub fn tool_definitions() -> Vec<Value> {
 pub(crate) mod tests {
     use super::*;
     use std::{
+        cell::Cell,
         io::Write,
         sync::atomic::{AtomicUsize, Ordering},
     };
@@ -874,13 +973,23 @@ pub(crate) mod tests {
             path
         }
         pub fn office(&self, name: &str, member: &str, xml: &str) -> PathBuf {
+            self.package(name, &[(member, xml.as_bytes())])
+        }
+        pub fn package(&self, name: &str, members: &[(&str, &[u8])]) -> PathBuf {
             let path = self.root.join(name);
             let mut writer = zip::ZipWriter::new(File::create(&path).unwrap());
-            writer
-                .start_file(member, zip::write::SimpleFileOptions::default())
-                .unwrap();
-            writer.write_all(xml.as_bytes()).unwrap();
+            for (member, bytes) in members {
+                writer
+                    .start_file(*member, zip::write::SimpleFileOptions::default())
+                    .unwrap();
+                writer.write_all(bytes).unwrap();
+            }
             writer.finish().unwrap();
+            path
+        }
+        pub fn write_bytes(&self, name: &str, bytes: &[u8]) -> PathBuf {
+            let path = self.root.join(name);
+            fs::write(&path, bytes).unwrap();
             path
         }
     }
@@ -941,12 +1050,12 @@ pub(crate) mod tests {
         fs::create_dir(&directory).unwrap();
         let path = fixture.write("nested\\bound.txt", "Synthetic bound contents.");
         let mut tools = fixture.tools();
-        let (text, guards) = tools.bound_text(&path, &|| false).unwrap();
+        let (text, guards) = tools.bound_text(&path, true, &|| false).unwrap();
         assert!(fs::write(&path, "Changed").is_err());
         assert!(fs::rename(&path, directory.join("renamed.txt")).is_err());
         assert!(fs::rename(&directory, fixture.root.join("renamed")).is_err());
         let metadata = tools.observe(&path, "bound read").unwrap();
-        assert_eq!(text, "Synthetic bound contents.");
+        assert_eq!(&*text, "Synthetic bound contents.");
         assert_eq!(metadata["size"], text.len());
         assert!(crate::file_agent::locate(&fixture.settings, &tools.observed[0]).is_ok());
         drop(guards);
@@ -1112,15 +1221,30 @@ pub(crate) mod tests {
         let secret = fixture.write("secret.txt", "password=synthetic-do-not-send");
         let env = fixture.write(".env", "synthetic");
         let pdf = fixture.write("test.pdf", "Not an actual PDF");
+        let legacy = fixture.write("budget.xls", "Legacy binary workbook");
+        let image = fixture.write("scan.png", "Not text");
+        let secret_pdf = fixture.write_bytes(
+            "keys.pdf",
+            &crate::pdf_text::fixtures::simple(&[&["client_secret synthetic"]]),
+        );
         let mut tools = fixture.tools();
-        for path in [secret, env, pdf] {
+        let mut errors = Vec::new();
+        for path in [secret, env, pdf, legacy, image, secret_pdf] {
             let result = tools.dispatch(
                 "read_file",
-                &json!({"path":path,"offset":0,"length":100}).to_string(),
+                &json!({"path":path,"offset":0,"length":100,"version_id":null}).to_string(),
                 || false,
             );
-            assert!(result.is_err());
+            errors.push(result.unwrap_err());
         }
+        assert!(
+            errors[2].contains("PDF could not be parsed"),
+            "{}",
+            errors[2]
+        );
+        assert!(errors[3].contains("Legacy binary Office format .xls"));
+        assert!(errors[4].contains("Unsupported content format .png"));
+        assert!(errors[5].contains("credential"), "{}", errors[5]);
         assert!(
             tools
                 .dispatch("shell", r#"{"command":"delete"}"#, || false)
@@ -1194,6 +1318,296 @@ pub(crate) mod tests {
                 .unwrap()
                 .contains("Srbsko hackathon")
         );
+    }
+
+    const WORKSHEET: &str =
+        "http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet";
+
+    fn workbook(sheets: &[(&str, &str)]) -> (String, String) {
+        let mut book = String::from(
+            r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets>"#,
+        );
+        let mut rels = String::from(
+            r#"<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">"#,
+        );
+        for (index, (name, state)) in sheets.iter().enumerate() {
+            let number = index + 1;
+            book.push_str(&format!(
+                r#"<sheet name="{name}" sheetId="{number}" state="{state}" r:id="rId{number}"/>"#
+            ));
+            let target = if number == 2 {
+                format!("/xl/worksheets/sheet{number}.xml")
+            } else {
+                format!("worksheets/sheet{number}.xml")
+            };
+            rels.push_str(&format!(
+                r#"<Relationship Id="rId{number}" Type="{WORKSHEET}" Target="{target}"/>"#
+            ));
+        }
+        book.push_str("</sheets></workbook>");
+        rels.push_str(r#"<Relationship Id="rId90" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/externalLink" Target="https://example.invalid/book.xlsx" TargetMode="External"/></Relationships>"#);
+        (book, rels)
+    }
+
+    const SHARED: &str = r#"<sst xmlns="urn:x" count="3"><si><t>N&#225;zev</t></si><si><r><t xml:space="preserve">Žluťoučký </t></r><r><rPr><b/></rPr><t>kůň</t></r><rPh sb="0" eb="1"><t>IGNORED-PHONETIC</t></rPh></si><si><t>Úpěl</t></si></sst>"#;
+    const SHEET1: &str = r#"<worksheet xmlns="urn:x"><dimension ref="A1:E5"/><sheetData><row r="1"><c r="A1" t="s"><v>0</v></c><c r="B1" t="inlineStr"><is><t>Inline &lt;text&gt;</t></is></c><c r="D1" t="s"><v>1</v></c></row><row r="2"><c r="A2" s="1"/><c r="B2" s="2"><v></v></c></row><row r="3"><c r="A3"><v>42.5</v></c><c r="B3" t="b"><v>1</v></c><c r="C3"><f>A3*2</f><v>85</v></c><c r="D3" t="str"><f>CONCAT("a","b")</f><v>ab</v></c><c r="E3" t="e"><v>#DIV/0!</v></c></row><row r="4"/><row r="5"><c r="B5" t="b"><v>0</v></c></row></sheetData><mergeCells count="1"><mergeCell ref="A1:B1"/></mergeCells></worksheet>"#;
+    const SHEET2: &str = r#"<worksheet><sheetData><row r="1"><c r="C1" t="s"><v>2</v></c><c r="D1"><v>7</v></c></row><row r="2"><c r="D2"><v>8</v></c></row></sheetData></worksheet>"#;
+    const SHEET3: &str = r#"<worksheet><sheetData><row r="1"><c r="A1" t="inlineStr"><is><r><t>tajn</t></r><r><t>é</t></r></is></c></row></sheetData></worksheet>"#;
+
+    #[test]
+    fn xlsx_and_xlsm_values_are_extracted_per_sheet_without_formulas_or_macros() {
+        let fixture = Fixture::new();
+        let (book, rels) = workbook(&[
+            ("Přehled", "visible"),
+            ("Data &amp; čísla", "visible"),
+            ("Skrytý", "hidden"),
+        ]);
+        let members: Vec<(&str, &[u8])> = vec![
+            ("[Content_Types].xml", b"<Types/>"),
+            ("xl/workbook.xml", book.as_bytes()),
+            ("xl/_rels/workbook.xml.rels", rels.as_bytes()),
+            ("xl/sharedStrings.xml", SHARED.as_bytes()),
+            ("xl/worksheets/sheet1.xml", SHEET1.as_bytes()),
+            ("xl/worksheets/sheet2.xml", SHEET2.as_bytes()),
+            ("xl/worksheets/sheet3.xml", SHEET3.as_bytes()),
+            (
+                "xl/vbaProject.bin",
+                b"Sub AutoOpen(): Shell \"calc\": End Sub",
+            ),
+        ];
+        let expected = "[sheet Přehled]\nNázev\tInline <text>\t\tŽluťoučký kůň\n42.5\tTRUE\t85\tab\t#DIV/0!\n\tFALSE\n\n[sheet Data & čísla]\nÚpěl\t7\n\t8\n\n[sheet Skrytý (hidden)]\ntajné\n";
+        let tools = fixture.tools();
+        for name in ["Rozpočet.xlsx", "Makra.xlsm"] {
+            let path = fixture.package(name, &members);
+            assert_eq!(tools.text(&path, &|| false).unwrap(), expected);
+        }
+        let mut tools = fixture.tools();
+        let result = tools
+            .dispatch(
+                "grep",
+                &json!({"path":null,"pattern":"*.xlsx","query":"zlutoucky","recursive":true,"limit":10})
+                    .to_string(),
+                || false,
+            )
+            .unwrap();
+        assert_eq!(result["items"].as_array().unwrap().len(), 1);
+        assert!(
+            result["items"][0]["excerpt"]
+                .as_str()
+                .unwrap()
+                .contains("Žluťoučký kůň")
+        );
+    }
+
+    #[test]
+    fn xlsx_refuses_entities_oversized_parts_and_cancellation() {
+        let fixture = Fixture::new();
+        let (book, rels) = workbook(&[("One", "visible"), ("Two", "visible")]);
+        let doctype = format!(r#"<!DOCTYPE workbook [<!ENTITY x "y">]>{book}"#);
+        let entity = fixture.package(
+            "entity.xlsx",
+            &[
+                ("xl/workbook.xml", doctype.as_bytes()),
+                ("xl/_rels/workbook.xml.rels", rels.as_bytes()),
+            ],
+        );
+        let tools = fixture.tools();
+        assert!(
+            tools
+                .text(&entity, &|| false)
+                .unwrap_err()
+                .contains("entities")
+        );
+        let huge = format!(
+            "<sst><si><t>{}</t></si></sst>",
+            "x".repeat(crate::xlsx::MAX_PART_BYTES)
+        );
+        let oversized_strings = fixture.package(
+            "strings.xlsx",
+            &[
+                ("xl/workbook.xml", book.as_bytes()),
+                ("xl/_rels/workbook.xml.rels", rels.as_bytes()),
+                ("xl/sharedStrings.xml", huge.as_bytes()),
+                ("xl/worksheets/sheet1.xml", SHEET2.as_bytes()),
+            ],
+        );
+        assert!(
+            tools
+                .text(&oversized_strings, &|| false)
+                .unwrap_err()
+                .contains("exceeds 4 MiB")
+        );
+        let oversized_sheet = fixture.package(
+            "sheet.xlsx",
+            &[
+                ("xl/workbook.xml", book.as_bytes()),
+                ("xl/_rels/workbook.xml.rels", rels.as_bytes()),
+                ("xl/worksheets/sheet1.xml", huge.as_bytes()),
+                ("xl/worksheets/sheet2.xml", SHEET3.as_bytes()),
+            ],
+        );
+        assert_eq!(
+            tools.text(&oversized_sheet, &|| false).unwrap(),
+            "[sheet One]\n(worksheet XML exceeds 4 MiB; sheet skipped)\n\n[sheet Two]\ntajné\n"
+        );
+        let calls = Cell::new(0);
+        let stopped = || {
+            calls.set(calls.get() + 1);
+            calls.get() > 2
+        };
+        assert!(
+            fixture
+                .tools()
+                .text(&oversized_sheet, &stopped)
+                .unwrap_err()
+                .contains("Cancel")
+        );
+        let mut ole = vec![0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1];
+        ole.resize(4096, 0);
+        for name in ["protected.xlsx", "protected.docx"] {
+            let path = fixture.write_bytes(name, &ole);
+            assert_eq!(tools.text(&path, &|| false).unwrap_err(), crate::xlsx::OLE);
+        }
+    }
+
+    #[test]
+    fn pdf_reads_page_through_versions_and_reuse_cached_extractions() {
+        let fixture = Fixture::new();
+        let pages: Vec<String> = (1..=3)
+            .map(|page| format!("Synthetic report page {page} about Kosik budget"))
+            .collect();
+        let lines: Vec<[&str; 1]> = pages.iter().map(|page| [page.as_str()]).collect();
+        let layout: Vec<&[&str]> = lines.iter().map(|line| &line[..]).collect();
+        let path = fixture.write_bytes("report.pdf", &crate::pdf_text::fixtures::simple(&layout));
+        let mut tools = fixture.tools();
+        let first = tools
+            .dispatch(
+                "read_file",
+                &json!({"path":path,"offset":0,"length":60,"version_id":null}).to_string(),
+                || false,
+            )
+            .unwrap();
+        assert!(
+            first["text"]
+                .as_str()
+                .unwrap()
+                .starts_with("[page 1]\nSynthetic report page 1")
+        );
+        let mut text = first["text"].as_str().unwrap().to_owned();
+        let mut offset = first["next_offset"].as_u64().unwrap();
+        while offset < first["total_characters"].as_u64().unwrap() {
+            let next = tools
+                .dispatch(
+                    "read_file",
+                    &json!({"path":path,"offset":offset,"length":60,"version_id":first["file"]["id"]})
+                        .to_string(),
+                    || false,
+                )
+                .unwrap();
+            text.push_str(next["text"].as_str().unwrap());
+            offset = next["next_offset"].as_u64().unwrap();
+        }
+        let positions: Vec<_> = (1..=3)
+            .map(|page| text.find(&format!("[page {page}]")).unwrap())
+            .collect();
+        assert!(positions.windows(2).all(|pair| pair[0] < pair[1]));
+        let grep = tools
+            .dispatch(
+                "grep",
+                &json!({"path":fixture.root,"pattern":"*.pdf","query":"page 3 about kosik","recursive":true,"limit":10})
+                    .to_string(),
+                || false,
+            )
+            .unwrap();
+        assert_eq!(grep["items"].as_array().unwrap().len(), 1);
+        assert_eq!(tools.extractions.get(), 1);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        fs::write(
+            &path,
+            crate::pdf_text::fixtures::simple(&[&["Rewritten single page report"]]),
+        )
+        .unwrap();
+        assert!(
+            tools
+                .text(&path, &|| false)
+                .unwrap()
+                .contains("Rewritten single page report")
+        );
+        assert_eq!(tools.extractions.get(), 2);
+        let encrypted = fixture.write_bytes(
+            "locked.pdf",
+            &crate::pdf_text::fixtures::encrypted("synthetic-user"),
+        );
+        assert_eq!(
+            tools.text(&encrypted, &|| false).unwrap_err(),
+            crate::pdf_text::ENCRYPTED
+        );
+        let czech = fixture.write_bytes("czech.pdf", &crate::pdf_text::fixtures::czech());
+        assert!(
+            tools
+                .text(&czech, &|| false)
+                .unwrap()
+                .contains(crate::pdf_text::fixtures::CZECH)
+        );
+    }
+
+    #[test]
+    fn grep_skips_ocr_but_read_file_reextracts_scanned_pdfs_once() {
+        use crate::pdf_text::fixtures::{build, gray_pixel, helvetica, image_page, text_page};
+        let fixture = Fixture::new();
+        let path = fixture.write_bytes(
+            "scan.pdf",
+            &build(
+                &helvetica(),
+                &gray_pixel(),
+                &[
+                    text_page(&["Cover of the scanned Kosik contract"]),
+                    image_page(),
+                ],
+                &[],
+            ),
+        );
+        let mut tools = fixture.tools();
+        let grep = tools
+            .dispatch(
+                "grep",
+                &json!({"path":null,"pattern":"*.pdf","query":"kosik contract","recursive":true,"limit":10})
+                    .to_string(),
+                || false,
+            )
+            .unwrap();
+        assert_eq!(grep["items"].as_array().unwrap().len(), 1);
+        assert_eq!(tools.extractions.get(), 1);
+        let read = || tools.text(&path, &|| false).unwrap();
+        let first = read();
+        assert!(first.contains("[page 2"), "{first}");
+        assert!(!first.contains("OCR runs only when read_file"));
+        assert_eq!(read(), first);
+        assert_eq!(tools.extractions.get(), 2);
+    }
+
+    #[test]
+    fn extraction_cache_is_bounded_and_prefers_complete_entries() {
+        let mut cache = TextCache::default();
+        let key = |name: &str| CacheKey {
+            path: PathBuf::from(name),
+            identity: (1, 2),
+            size: 3,
+            modified: None,
+        };
+        let big: Arc<str> = "x".repeat(CACHE_BYTES / 2).into();
+        cache.insert(key("a"), big.clone(), false);
+        assert!(cache.get(&key("a"), true).is_none());
+        assert!(cache.get(&key("a"), false).is_some());
+        cache.insert(key("a"), big.clone(), true);
+        assert!(cache.get(&key("a"), true).is_some());
+        cache.insert(key("b"), big.clone(), true);
+        cache.insert(key("c"), big.clone(), true);
+        assert!(cache.get(&key("a"), false).is_none());
+        assert!(cache.get(&key("b"), false).is_some() && cache.get(&key("c"), true).is_some());
+        assert!(cache.bytes <= CACHE_BYTES);
+        cache.insert(key("huge"), "y".repeat(CACHE_BYTES + 1).into(), true);
+        assert!(cache.get(&key("huge"), false).is_none());
     }
 
     #[test]
