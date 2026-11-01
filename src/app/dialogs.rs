@@ -8,6 +8,7 @@ pub(super) struct ZipDialog {
     pub(super) focus: bool,
 }
 pub(super) struct NameDialog {
+    pub(super) clone: bool,
     pub(super) folder: PathBuf,
     pub(super) source: Option<PathBuf>,
     pub(super) name: String,
@@ -40,21 +41,30 @@ impl Ledger {
             return;
         }
         let dialog = self.name_dialog.take().expect("name dialog present");
-        if dialog.source.is_none() {
-            // New folder executes without a review; its timing starts here.
+        if dialog.clone || dialog.source.is_none() {
+            // Clone and new folder execute from this submission without a second review.
             self.usage.operation = Some(PendingOperation::named(
-                "new_folder",
+                if dialog.clone { "clone" } else { "new_folder" },
                 1,
                 Some(&dialog.folder),
             ));
         }
         self.cancellation.store(false, Ordering::Release);
-        match self.work.try_send(Work::PrepareName {
-            id: self.next_id,
-            folder: dialog.folder,
-            source: dialog.source,
-            name: dialog.name,
-        }) {
+        let job = if dialog.clone {
+            Work::Clone {
+                id: self.next_id,
+                source: dialog.source.expect("Clone dialog has a source"),
+                name: dialog.name,
+            }
+        } else {
+            Work::PrepareName {
+                id: self.next_id,
+                folder: dialog.folder,
+                source: dialog.source,
+                name: dialog.name,
+            }
+        };
+        match self.work.try_send(job) {
             Ok(()) => {
                 self.next_id += 1;
                 self.operation_busy = true;
@@ -414,7 +424,9 @@ impl Ledger {
 
     fn name_change_dialog(&mut self, ctx: &egui::Context) -> bool {
         if let Some(dialog) = &mut self.name_dialog {
-            let usage_name = if dialog.source.is_some() {
+            let usage_name = if dialog.clone {
+                "clone"
+            } else if dialog.source.is_some() {
                 "rename"
             } else {
                 "new_folder"
@@ -423,7 +435,9 @@ impl Ledger {
             let mut close = false;
             let modal = egui::Modal::new(Id::new("name-dialog")).show(ctx, |ui| {
                 ui.set_width(500.0);
-                ui.heading(if dialog.source.is_some() {
+                ui.heading(if dialog.clone {
+                    "Clone"
+                } else if dialog.source.is_some() {
                     "Rename"
                 } else {
                     "New folder"
@@ -453,7 +467,9 @@ impl Ledger {
                 }
                 (prepare, close) = confirmation_buttons(
                     ui,
-                    if dialog.source.is_some() {
+                    if dialog.clone {
+                        "Clone"
+                    } else if dialog.source.is_some() {
                         "Review"
                     } else {
                         "Create"

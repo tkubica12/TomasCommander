@@ -42,9 +42,208 @@ pub fn validate_name(name: &str) -> FileResult<()> {
     Ok(())
 }
 
+/// Advances the rightmost version token, then a month/year, then a numeric suffix.
+pub fn next_clone_name(name: &str) -> FileResult<String> {
+    let path = Path::new(name);
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .ok_or("Filename is not valid Unicode.")?;
+    let extension = path.extension().and_then(|s| s.to_str());
+    let lower = stem.to_ascii_lowercase();
+    let bytes = lower.as_bytes();
+    let increment = |start: usize, end: usize| -> FileResult<String> {
+        let digits = &stem[start..end];
+        let number = digits
+            .parse::<u64>()
+            .ok()
+            .and_then(|n| n.checked_add(1))
+            .ok_or("Version number is too large to increment.")?;
+        Ok(format!(
+            "{}{:0width$}{}",
+            &stem[..start],
+            number,
+            &stem[end..],
+            width = digits.len()
+        ))
+    };
+    let mut version = None;
+    for (start, _) in lower.char_indices() {
+        if start > 0 && bytes[start - 1].is_ascii_alphanumeric() {
+            continue;
+        }
+        for prefix in ["version", "verze", "vers", "ver", "rev", "v", "r"] {
+            if !lower[start..].starts_with(prefix) {
+                continue;
+            }
+            let mut number = start + prefix.len();
+            while number < bytes.len() && b" -_.".contains(&bytes[number]) {
+                number += 1;
+            }
+            let mut end = number;
+            while end < bytes.len() && bytes[end].is_ascii_digit() {
+                end += 1;
+            }
+            if end > number && (end == bytes.len() || !bytes[end].is_ascii_alphanumeric()) {
+                version = Some((number, end));
+                break;
+            }
+        }
+    }
+    let months = [
+        ("january", "jan"),
+        ("february", "feb"),
+        ("march", "mar"),
+        ("april", "apr"),
+        ("may", "may"),
+        ("june", "jun"),
+        ("july", "jul"),
+        ("august", "aug"),
+        ("september", "sep"),
+        ("october", "oct"),
+        ("november", "nov"),
+        ("december", "dec"),
+    ];
+    let mut month = None;
+    if version.is_none() {
+        for (start, _) in lower.char_indices() {
+            if start > 0 && bytes[start - 1].is_ascii_alphanumeric() {
+                continue;
+            }
+            for (index, (full, short)) in months.iter().enumerate() {
+                for token in [*full, *short] {
+                    if !lower[start..].starts_with(token) {
+                        continue;
+                    }
+                    let mut year = start + token.len();
+                    while year < bytes.len() && b" -_".contains(&bytes[year]) {
+                        year += 1;
+                    }
+                    let mut end = year;
+                    while end < bytes.len() && bytes[end].is_ascii_digit() {
+                        end += 1;
+                    }
+                    if matches!(end - year, 2 | 4)
+                        && (end == bytes.len() || !bytes[end].is_ascii_alphanumeric())
+                    {
+                        month = Some((start, token.len(), year, end, index));
+                    }
+                }
+            }
+        }
+    }
+    let next = if let Some((start, end)) = version {
+        increment(start, end)?
+    } else if let Some((start, length, year, end, index)) = month {
+        let token = &stem[start..start + length];
+        let (full, short) = months[(index + 1) % 12];
+        let replacement = if length == months[index].0.len() {
+            full
+        } else {
+            short
+        };
+        let replacement = if token.bytes().all(|b| b.is_ascii_uppercase()) {
+            replacement.to_ascii_uppercase()
+        } else if token.as_bytes()[0].is_ascii_uppercase() {
+            format!(
+                "{}{}",
+                replacement[..1].to_ascii_uppercase(),
+                &replacement[1..]
+            )
+        } else {
+            replacement.to_owned()
+        };
+        let year_text = if index == 11 {
+            let value = stem[year..end]
+                .parse::<u32>()
+                .map_err(|e| format!("Read year: {e}"))?
+                + 1;
+            format!(
+                "{:0width$}",
+                value % if end - year == 2 { 100 } else { 10_000 },
+                width = end - year
+            )
+        } else {
+            stem[year..end].to_owned()
+        };
+        format!(
+            "{}{replacement}{}{year_text}{}",
+            &stem[..start],
+            &stem[start + length..year],
+            &stem[end..]
+        )
+    } else {
+        let start = stem.trim_end_matches(|c: char| c.is_ascii_digit()).len();
+        if start < stem.len() && start > 0 && matches!(bytes[start - 1], b'-' | b'_') {
+            increment(start, stem.len())?
+        } else {
+            format!("{stem}-v2")
+        }
+    };
+    let next = match extension {
+        Some(extension) => format!("{next}.{extension}"),
+        None => next,
+    };
+    validate_name(&next)?;
+    Ok(next)
+}
+
+pub fn suggest_clone_name(source: &Path) -> FileResult<String> {
+    let folder = source.parent().ok_or("Clone source has no folder.")?;
+    let mut name = source
+        .file_name()
+        .and_then(|s| s.to_str())
+        .ok_or("Filename is not valid Unicode.")?
+        .to_owned();
+    for _ in 0..10_000 {
+        name = next_clone_name(&name)?;
+        match fs::symlink_metadata(folder.join(&name)) {
+            Ok(_) => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(name),
+            Err(error) => return Err(format!("Inspect Clone destination: {error}")),
+        }
+    }
+    Err("No free Clone name found within 10000 candidates.".into())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clone_names_advance_versions_months_suffixes_and_keep_extensions() {
+        for (source, expected) in [
+            ("report-v1.docx", "report-v2.docx"),
+            ("report_v009.PDF", "report_v010.PDF"),
+            ("ver1.txt", "ver2.txt"),
+            ("verze1.txt", "verze2.txt"),
+            ("version1.txt", "version2.txt"),
+            ("report VERSION-01.xlsx", "report VERSION-02.xlsx"),
+            ("report rev_2.txt", "report rev_3.txt"),
+            ("report v1 v3.txt", "report v1 v4.txt"),
+            ("Budget-Jun26.xlsx", "Budget-Jul26.xlsx"),
+            ("Budget-DEC26.xlsx", "Budget-JAN27.xlsx"),
+            ("budget-dec99.xlsx", "budget-jan00.xlsx"),
+            ("Budget June 2026.xlsx", "Budget July 2026.xlsx"),
+            ("Budget December-2026.xlsx", "Budget January-2027.xlsx"),
+            ("report-1.txt", "report-2.txt"),
+            ("report_01.txt", "report_02.txt"),
+            ("report.txt", "report-v2.txt"),
+            ("report", "report-v2"),
+            (".gitignore", ".gitignore-v2"),
+            ("archive.part.txt", "archive.part-v2.txt"),
+            ("invoice123.txt", "invoice123-v2.txt"),
+            ("deliver1.txt", "deliver1-v2.txt"),
+            ("report-Jun26-v1.txt", "report-Jun26-v2.txt"),
+            (
+                "P\u{0159}\u{00ed}loha-v1.txt",
+                "P\u{0159}\u{00ed}loha-v2.txt",
+            ),
+        ] {
+            assert_eq!(next_clone_name(source).unwrap(), expected, "{source}");
+        }
+        assert!(next_clone_name("report-v18446744073709551615.txt").is_err());
+    }
 
     #[test]
     fn windows_names_include_device_aliases_and_utf16_limits() {

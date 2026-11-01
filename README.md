@@ -22,7 +22,7 @@ before the release cleanup.
 ## Download and run
 
 Download `tomas-commander.exe` from [GitHub Releases](https://github.com/tkubica12/TomasCommander/releases).
-The latest version is **v0.7.1**, an experimental Windows x64 release.
+The latest version is **v0.8.0**, an experimental Windows x64 release.
 No installer or Rust toolchain is needed to run the downloaded executable.
 The binary is unsigned; this project does not provide code-signing or support.
 
@@ -105,6 +105,7 @@ The binary is unsigned; this project does not provide code-signing or support.
 | Ctrl+F / Ctrl+Shift+F | Filter / recursive filename search |
 | Ctrl+Shift+S | Cycle sorting: name A-Z / newest first / largest first |
 | Ctrl+Shift+C / Ctrl+Shift+M / Ctrl+Shift+D | Copy / move / Recycle Bin |
+| Ctrl+Shift+K | Clone focused file in the same folder |
 | Ctrl+Shift+U | Undo: review the inverse of the latest undoable operation |
 | Ctrl+Shift+N / Ctrl+Shift+E / Ctrl+Shift+R | New folder / rename / refresh |
 | Ctrl+Shift+A | Create ZIP / extract ZIP by context (archive) |
@@ -139,6 +140,17 @@ Click a filename to focus it. A further slow click on the current filename
 starts in-place editing; Enter reviews the rename and Escape cancels.
 Rapid double-click opens normally; Ctrl-double-click previews and
 Shift-double-click opens the chooser.
+Clone is also available beside Copy in the bottom action bar, by right-clicking
+a regular file or using `/clone`.
+Right-click menus show action names only; shortcut hints stay in Help,
+Ask and the action bar.
+Its simple name dialog creates the copy with Enter, without another review.
+It advances version tokens (`v1`, `ver1`, `verze1`, `version1`, `rev1`, with
+optional separators), month/year tokens (`Jun26` to `Jul26`, `Dec26` to
+`Jan27`), or trailing `-1` / `_1`; otherwise it appends `-v2` before the
+extension. Existing names are skipped, and an edited name never overwrites
+an existing item. The original is kept; the copy uses the normal verified
+Copy workflow and can be undone.
 Inside a ZIP, Enter/double-click extracts a temporary file and opens its Windows
 default application; Ctrl+Enter/Ctrl-double-click stays in the internal preview.
 The bottom ZIP action creates an archive from selected files/folders, or extracts

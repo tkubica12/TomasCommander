@@ -644,6 +644,7 @@ pub struct Plan {
     policy: ConflictPolicy,
     sources: Vec<PathBuf>,
     destination: Option<PathBuf>,
+    target_name: Option<String>,
     nodes: Vec<PlannedNode>,
     destination_identity: Option<Fingerprint>,
     strategy: Option<MoveStrategy>,
@@ -1119,6 +1120,58 @@ pub fn plan_with_options(
     options: PlanOptions,
     cancelled: &AtomicBool,
 ) -> FileResult<Plan> {
+    plan_with_target_name(
+        scope,
+        id,
+        operation,
+        sources,
+        destination,
+        policy,
+        options,
+        cancelled,
+        None,
+    )
+}
+
+/// Copies one regular file to an exact new name in its current folder.
+pub fn plan_clone(
+    scope: &Scope,
+    id: u64,
+    source: &Path,
+    name: &str,
+    cancelled: &AtomicBool,
+) -> FileResult<Plan> {
+    crate::naming::validate_name(name)?;
+    let source = scope.mutation_source(source)?;
+    if fingerprint(&source)?.directory {
+        return Err("Clone requires one regular file, not a folder.".into());
+    }
+    let folder = source.parent().ok_or("Clone source has no folder.")?;
+    plan_with_target_name(
+        scope,
+        id,
+        Operation::Copy,
+        std::slice::from_ref(&source),
+        Some(folder),
+        ConflictPolicy::Fail,
+        PlanOptions::default(),
+        cancelled,
+        Some(name),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn plan_with_target_name(
+    scope: &Scope,
+    id: u64,
+    operation: Operation,
+    sources: &[PathBuf],
+    destination: Option<&Path>,
+    policy: ConflictPolicy,
+    options: PlanOptions,
+    cancelled: &AtomicBool,
+    target_name: Option<&str>,
+) -> FileResult<Plan> {
     if sources.is_empty() {
         return Err("Select or focus an item first.".into());
     }
@@ -1159,11 +1212,12 @@ pub fn plan_with_options(
             if destination.starts_with(source) {
                 return Err("A folder cannot be copied or moved into itself.".into());
             }
-            let target = destination.join(
-                source
-                    .file_name()
-                    .expect("Root sources were rejected above"),
-            );
+            let target =
+                destination.join(target_name.map(std::ffi::OsStr::new).unwrap_or_else(|| {
+                    source
+                        .file_name()
+                        .expect("Root sources were rejected above")
+                }));
             if !reserved.insert(folded(&target)) {
                 return Err("Multiple selected items have the same destination name.".into());
             }
@@ -1172,11 +1226,11 @@ pub fn plan_with_options(
     let mut nodes = Vec::new();
     for source in &sources {
         let target = destination.as_ref().map(|destination| {
-            destination.join(
+            destination.join(target_name.map(std::ffi::OsStr::new).unwrap_or_else(|| {
                 source
                     .file_name()
-                    .expect("Root sources were rejected above"),
-            )
+                    .expect("Root sources were rejected above")
+            }))
         });
         // Children of a newly created or renamed folder cannot conflict.
         let mut stack = vec![(source.clone(), target, false)];
@@ -1239,6 +1293,7 @@ pub fn plan_with_options(
         policy,
         sources,
         destination,
+        target_name: target_name.map(str::to_owned),
         nodes,
         destination_identity,
         strategy,
@@ -1372,7 +1427,7 @@ fn validate_plan(scope: &Scope, plan: &Plan, cancelled: &AtomicBool) -> FileResu
         }
     }
     // Re-enumeration detects added/removed children and new or resolved conflicts.
-    let current = self::plan_with_options(
+    let current = plan_with_target_name(
         scope,
         plan.id,
         plan.operation,
@@ -1381,6 +1436,7 @@ fn validate_plan(scope: &Scope, plan: &Plan, cancelled: &AtomicBool) -> FileResu
         plan.policy,
         plan.options,
         cancelled,
+        plan.target_name.as_deref(),
     )?;
     if current.nodes.len() != plan.nodes.len()
         || current

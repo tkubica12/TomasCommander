@@ -486,7 +486,8 @@ pub(super) fn consume_file_action(ctx: &egui::Context) -> Option<Command> {
 }
 
 /// Ctrl+Shift actions matched exactly (no Alt), shared by keyboard handling and its tests.
-pub(super) const FILE_ACTION_CHORDS: [(Key, Command); 5] = [
+pub(super) const FILE_ACTION_CHORDS: [(Key, Command); 6] = [
+    (Key::K, Command::Clone),
     (Key::E, Command::Rename),
     (Key::N, Command::NewFolder),
     (Key::R, Command::Refresh),

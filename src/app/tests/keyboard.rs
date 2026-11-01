@@ -1,6 +1,45 @@
 use super::*;
 
 #[test]
+fn clone_requires_ctrl_shift_k_without_stealing_copy() {
+    assert!(
+        COMMANDS
+            .iter()
+            .any(|(command, _, chord)| *command == Command::Clone && *chord == "Ctrl Shift K")
+    );
+    for modifiers in [
+        Modifiers::CTRL | Modifiers::SHIFT | Modifiers::ALT,
+        Modifiers::CTRL | Modifiers::SHIFT,
+        Modifiers::CTRL | Modifiers::ALT,
+        Modifiers::SHIFT | Modifiers::ALT,
+        Modifiers::CTRL,
+        Modifiers::NONE,
+    ] {
+        let ctx = egui::Context::default();
+        let clone = modifiers == (Modifiers::CTRL | Modifiers::SHIFT);
+        ctx.run_ui(
+            egui::RawInput {
+                events: vec![egui::Event::Key {
+                    key: Key::K,
+                    physical_key: Some(Key::K),
+                    pressed: true,
+                    repeat: false,
+                    modifiers,
+                }],
+                ..Default::default()
+            },
+            |_| {
+                assert_eq!(consume_file_action(&ctx), clone.then_some(Command::Clone));
+                assert_eq!(consume_file_action(&ctx), None);
+                assert_eq!(ctx.input(|input| input.events.len()), usize::from(!clone));
+            },
+        )
+        .textures_delta
+        .clear();
+    }
+}
+
+#[test]
 fn space_in_file_pane_remains_a_selection_key_not_a_filter() {
     let ctx = egui::Context::default();
     ctx.run_ui(

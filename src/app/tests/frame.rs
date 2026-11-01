@@ -64,13 +64,15 @@ fn action_columns_share_a_baseline_and_do_not_wrap_labels() {
                 let bounds = ui.max_rect();
                 for (label, hint) in [
                     ("Copy", "Ctrl Shift C"),
+                    ("Clone", "Ctrl Shift K"),
                     ("Move", "Ctrl Shift M"),
                     ("Delete", "Ctrl Shift D"),
                     ("Refresh", "Ctrl Shift R"),
                     ("Search", "Ctrl Shift F"),
-                    ("Run VS Code", ""),
-                    ("Run GitHub Copilot CLI", ""),
-                    ("Run GitHub Copilot App", ""),
+                    ("Rename", "Ctrl Shift E"),
+                    ("New folder", "Ctrl Shift N"),
+                    ("Create ZIP", "Ctrl Shift A"),
+                    ("Open with", "Shift Enter"),
                 ] {
                     let response = action_button(ui, label, hint, true);
                     assert!(

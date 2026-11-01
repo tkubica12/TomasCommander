@@ -118,7 +118,9 @@ impl Harness {
         let (id, _) = nodes
             .iter()
             .find(|(_, node)| {
-                node.role() == egui::accesskit::Role::Button && node.label() == Some(label)
+                node.role() == egui::accesskit::Role::Button
+                    && !node.is_disabled()
+                    && node.label() == Some(label)
             })
             .unwrap_or_else(|| panic!("no {label} button"));
         let request = egui::accesskit::ActionRequest {
@@ -382,6 +384,7 @@ fn a_failed_new_folder_leaves_no_pending_operation_behind() {
     let mut harness = Harness::new("new-folder");
     harness.take();
     harness.app.name_dialog = Some(NameDialog {
+        clone: false,
         folder: harness.files.clone(),
         source: None,
         name: "Gamma".into(),
@@ -420,6 +423,124 @@ fn a_failed_new_folder_leaves_no_pending_operation_behind() {
     let slow = Harness::kinds(&harness.take(), "slow_action");
     assert_eq!(slow.len(), 1, "{slow:?}");
     assert_eq!(text(&slow[0], "cmd"), "/copy");
+}
+
+#[test]
+fn clone_shortcut_and_enter_create_one_copy_without_review() {
+    let mut harness = Harness::new("clone");
+    let source = harness.files.join("alpha.txt");
+    harness.app.active = 0;
+    harness.app.rail_index = None;
+    harness.app.panes[0].focused = Some(source.clone());
+    harness.take();
+    harness.run(vec![key(Key::K, Modifiers::CTRL | Modifiers::SHIFT)]);
+    let dialog = harness.app.name_dialog.as_ref().expect("Clone name dialog");
+    assert!(dialog.clone);
+    assert_eq!(dialog.name, "alpha-v2.txt");
+    assert_eq!(dialog.folder, harness.files);
+    assert!(!harness.files.join("alpha-v2.txt").exists());
+    harness.run(vec![]);
+    harness.run(vec![key(Key::Enter, Modifiers::NONE)]);
+    assert!(harness.app.name_dialog.is_none());
+    harness.until(|app| !app.operation_busy && app.panes.iter().all(|pane| !pane.busy));
+    assert!(harness.app.error.is_none(), "{:?}", harness.app.error);
+    assert!(harness.app.plan.is_none() && harness.app.change_plan.is_none());
+    assert_eq!(
+        fs::read(harness.files.join("alpha-v2.txt")).unwrap(),
+        b"alpha"
+    );
+    assert_eq!(fs::read(&source).unwrap(), b"alpha");
+    let events = harness.take();
+    assert!(
+        Harness::kinds(&events, "command")
+            .iter()
+            .any(|event| text(event, "cmd") == "/clone" && text(event, "via") == "shortcut")
+    );
+    assert!(
+        Harness::kinds(&events, "dialog")
+            .iter()
+            .any(|event| text(event, "name") == "clone")
+    );
+    harness.app.panes[0].focused = Some(source);
+    harness.app.dispatch(Via::ContextMenu, Command::Clone);
+    assert_eq!(
+        harness.app.name_dialog.as_ref().unwrap().name,
+        "alpha-v3.txt"
+    );
+    harness.run(vec![]);
+    harness.run(vec![key(Key::Escape, Modifiers::NONE)]);
+    assert!(harness.app.name_dialog.is_none());
+    assert!(!harness.files.join("alpha-v3.txt").exists());
+}
+
+#[test]
+fn file_context_menu_has_clone_without_shortcut_hints() {
+    let mut harness = Harness::new("clone-menu");
+    let output = harness.run(vec![]);
+    let nodes = output.platform_output.accesskit_update.unwrap().nodes;
+    let bounds = nodes
+        .iter()
+        .find(|(_, node)| {
+            node.role() == egui::accesskit::Role::Button && node.label() == Some("alpha.txt")
+        })
+        .unwrap()
+        .1
+        .bounds()
+        .unwrap();
+    let pos = egui::pos2(
+        ((bounds.x0 + bounds.x1) / 2.0) as f32,
+        ((bounds.y0 + bounds.y1) / 2.0) as f32,
+    );
+    for pressed in [true, false] {
+        harness.run(vec![
+            egui::Event::PointerMoved(pos),
+            egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Secondary,
+                pressed,
+                modifiers: Modifiers::NONE,
+            },
+        ]);
+    }
+    let output = harness.run(vec![]);
+    let nodes = output.platform_output.accesskit_update.unwrap().nodes;
+    let labels: Vec<_> = nodes.iter().filter_map(|(_, node)| node.label()).collect();
+    assert!(labels.contains(&"Clone"));
+    assert!(labels.contains(&"Open with"));
+    assert!(!labels.contains(&"Clone / Ctrl Shift K"));
+    assert!(!labels.contains(&"Open with / Shift Enter"));
+    harness.click("Clone");
+    let dialog = harness
+        .app
+        .name_dialog
+        .as_ref()
+        .expect("Context-menu Clone");
+    assert!(dialog.clone);
+    assert_eq!(
+        dialog.source.as_deref(),
+        Some(harness.files.join("alpha.txt").as_path())
+    );
+    assert_eq!(dialog.name, "alpha-v2.txt");
+}
+
+#[test]
+fn clone_action_button_opens_the_same_name_dialog() {
+    let mut harness = Harness::new("clone-button");
+    let source = harness.files.join("alpha.txt");
+    harness.app.panes[0].focused = Some(source.clone());
+    harness.app.active = 0;
+    harness.app.rail_index = None;
+    harness.take();
+    harness.click("Clone");
+    let dialog = harness.app.name_dialog.as_ref().expect("Clone button");
+    assert!(dialog.clone);
+    assert_eq!(dialog.name, "alpha-v2.txt");
+    assert_eq!(dialog.source, Some(source));
+    assert!(
+        Harness::kinds(&harness.take(), "command")
+            .iter()
+            .any(|event| text(event, "cmd") == "/clone" && text(event, "via") == "button")
+    );
 }
 
 #[test]

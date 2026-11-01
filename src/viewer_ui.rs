@@ -1124,14 +1124,14 @@ impl ReaderPanel {
                                         if index != 0 {
                                             response.context_menu(|ui| {
                                                 if !rows[index - 1].directory
-                                                    && ui.button("Open / Enter").clicked()
+                                                    && ui.button("Open").clicked()
                                                 {
                                                     self.open_entry =
                                                         Some(rows[index - 1].path.clone());
                                                     ui.close();
                                                 }
                                                 if !rows[index - 1].directory
-                                                    && ui.button("Preview / Ctrl Enter").clicked()
+                                                    && ui.button("Preview").clicked()
                                                 {
                                                     self.preview_entry =
                                                         Some(rows[index - 1].path.clone());

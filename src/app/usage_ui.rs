@@ -117,12 +117,13 @@ impl NavVia {
 }
 
 /// Modal dialogs tracked for `dialog` events, in [`Ledger::usage_open_dialogs`] order.
-pub(super) const DIALOG_NAMES: [&str; 26] = [
+pub(super) const DIALOG_NAMES: [&str; 27] = [
     "drive_picker",
     "place_name",
     "settings",
     "operations",
     "open_with",
+    "clone",
     "rename",
     "new_folder",
     "inline_rename",
@@ -967,7 +968,8 @@ impl Ledger {
             self.settings_open,
             self.operations_open,
             self.open_with.is_some(),
-            name.is_some_and(|dialog| !dialog.inline && dialog.source.is_some()),
+            name.is_some_and(|dialog| dialog.clone),
+            name.is_some_and(|dialog| !dialog.clone && !dialog.inline && dialog.source.is_some()),
             name.is_some_and(|dialog| !dialog.inline && dialog.source.is_none()),
             name.is_some_and(|dialog| dialog.inline),
             self.zip_dialog.is_some(),

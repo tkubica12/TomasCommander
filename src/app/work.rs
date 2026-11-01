@@ -199,6 +199,11 @@ impl Change {
 }
 
 pub(super) enum Work {
+    Clone {
+        id: u64,
+        source: PathBuf,
+        name: String,
+    },
     Change(Change),
     PrepareUndo {
         id: u64,
@@ -365,6 +370,29 @@ pub(super) fn prepare_name_work(
             editor: false,
         },
         result => WorkResult::NamePrepared(result),
+    }
+}
+
+pub(super) fn clone_work(
+    scope: &Scope,
+    journal: &tomas_commander::journal::Journal,
+    id: u64,
+    source: &std::path::Path,
+    name: &str,
+    cancel: &AtomicBool,
+) -> WorkResult {
+    match journal
+        .initialize()
+        .and_then(|()| files::plan_clone(scope, id, source, name, cancel))
+    {
+        Ok(plan) => WorkResult::Executed(journal.execute(scope, &plan, true, cancel)),
+        Err(error) => WorkResult::Executed(Outcome {
+            id,
+            incomplete: vec![source.to_owned()],
+            error: Some(error),
+            cancelled: cancel.load(Ordering::Acquire),
+            ..Default::default()
+        }),
     }
 }
 

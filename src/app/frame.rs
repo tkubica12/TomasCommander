@@ -382,6 +382,7 @@ impl Ledger {
             ui.horizontal_wrapped(|ui| {
                 for (command, label, hint) in [
                     (Command::Copy, "Copy", "Ctrl Shift C"),
+                    (Command::Clone, "Clone", "Ctrl Shift K"),
                     (Command::Move, "Move", "Ctrl Shift M"),
                     (Command::Recycle, "Delete", "Ctrl Shift D"),
                     (Command::Refresh, "Refresh", "Ctrl Shift R"),

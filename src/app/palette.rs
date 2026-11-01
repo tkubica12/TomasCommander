@@ -2,6 +2,7 @@ use super::*;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Command {
+    Clone,
     Rename,
     NewFolder,
     OpenWith,
@@ -56,6 +57,7 @@ pub(super) enum Command {
 impl Command {
     pub(super) fn slash(self) -> &'static str {
         match self {
+            Self::Clone => "/clone",
             Self::Rename => "/rename",
             Self::NewFolder => "/new-folder",
             Self::OpenWith => "/open-with",
@@ -178,7 +180,12 @@ pub(super) fn palette_submission(
     }
 }
 
-pub(super) const COMMANDS: [(Command, &str, &str); 49] = [
+pub(super) const COMMANDS: [(Command, &str, &str); 50] = [
+    (
+        Command::Clone,
+        "Clone focused file in the same folder",
+        "Ctrl Shift K",
+    ),
     (
         Command::Rename,
         "Rename focused file / folder",

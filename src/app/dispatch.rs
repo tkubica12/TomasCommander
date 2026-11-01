@@ -258,7 +258,7 @@ impl Ledger {
                     .unwrap_or_else(|| pane.path.clone());
                 self.open_with = Some(OpenWith { folder, index: 0 });
             }
-            Command::Rename | Command::NewFolder => {
+            Command::Clone | Command::Rename | Command::NewFolder => {
                 if self.operation_busy
                     || self.plan.is_some()
                     || self.reader.dirty()
@@ -268,21 +268,48 @@ impl Ledger {
                     return;
                 }
                 let pane = &self.panes[self.active];
-                let source = if matches!(command, Command::Rename) {
+                let clone = matches!(command, Command::Clone);
+                let source = if matches!(command, Command::Clone | Command::Rename) {
                     let Some(path) = pane.focused.clone() else {
-                        self.fail("Focus one file or folder to rename.");
+                        self.fail(if clone {
+                            "Focus one regular file to clone."
+                        } else {
+                            "Focus one file or folder to rename."
+                        });
                         return;
                     };
+                    if clone
+                        && !pane
+                            .entries
+                            .iter()
+                            .any(|entry| entry.path == path && !entry.directory && !entry.link)
+                    {
+                        self.fail("Focus one regular file to clone.");
+                        return;
+                    }
                     Some(path)
                 } else {
                     None
                 };
-                let name = source
-                    .as_ref()
-                    .and_then(|path| path.file_name())
-                    .map(|name| name.to_string_lossy().into_owned())
-                    .unwrap_or_default();
+                let name = if clone {
+                    match tomas_commander::naming::suggest_clone_name(
+                        source.as_deref().expect("Clone source"),
+                    ) {
+                        Ok(name) => name,
+                        Err(error) => {
+                            self.fail(error);
+                            return;
+                        }
+                    }
+                } else {
+                    source
+                        .as_ref()
+                        .and_then(|path| path.file_name())
+                        .map(|name| name.to_string_lossy().into_owned())
+                        .unwrap_or_default()
+                };
                 self.name_dialog = Some(NameDialog {
+                    clone,
                     folder: pane.path.clone(),
                     source,
                     name,

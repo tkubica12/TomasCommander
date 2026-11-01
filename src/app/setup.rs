@@ -388,6 +388,9 @@ fn spawn_file_worker(
         }
         while let Ok(job) = jobs.recv() {
             let result = match job {
+                Work::Clone { id, source, name } => {
+                    clone_work(&worker_scope, &journal, id, &source, &name, &cancel)
+                }
                 Work::PrepareName {
                     id,
                     folder,

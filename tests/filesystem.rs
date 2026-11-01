@@ -44,6 +44,81 @@ struct Fixture {
 }
 
 #[test]
+fn clone_exact_copy_collision_race_and_undo() {
+    use tomas_commander::{journal::Journal, naming, undo};
+    let mut fixture = Fixture::new("clone");
+    let folder = fixture.directory("Work");
+    let source = fixture.file("Work\\report-v1.txt", b"exact clone bytes\r\n");
+    fixture.file("Work\\report-v2.txt", b"do not replace");
+    let journal_root = fixture.directory("Journal");
+    let journal = Journal::new(journal_root.clone());
+    journal.initialize().unwrap();
+    let scope = fixture.scope();
+    let cancel = AtomicBool::new(false);
+    assert_eq!(
+        naming::suggest_clone_name(&source).unwrap(),
+        "report-v3.txt"
+    );
+    for name in [
+        "report-v1.txt",
+        "report-v2.txt",
+        "..\\escape.txt",
+        "NUL.txt",
+    ] {
+        assert!(files::plan_clone(&scope, 1, &source, name, &cancel).is_err());
+    }
+    assert!(files::plan_clone(&scope, 1, &folder, "folder-copy", &cancel).is_err());
+    let plan = files::plan_clone(&scope, 2, &source, "report-v3.txt", &cancel).unwrap();
+    assert!(
+        journal
+            .execute(&scope, &plan, false, &cancel)
+            .error
+            .is_some()
+    );
+    assert!(!folder.join("report-v3.txt").exists());
+    let outcome = journal.execute(&scope, &plan, true, &cancel);
+    fixture.own(&outcome.created);
+    assert!(outcome.error.is_none(), "{:?}", outcome.error);
+    let copy = folder.join("report-v3.txt");
+    assert_eq!(fs::read(&copy).unwrap(), fs::read(&source).unwrap());
+    assert_eq!(
+        fs::metadata(&copy).unwrap().modified().unwrap(),
+        fs::metadata(&source).unwrap().modified().unwrap()
+    );
+    assert_eq!(outcome.effects.kind, Some(undo::Kind::Copy));
+    assert!(
+        journal
+            .execute(&scope, &plan, true, &cancel)
+            .error
+            .is_some(),
+        "No replay"
+    );
+    let inverse = undo::prepare(&scope, &journal, 3, None, &cancel).unwrap();
+    let undone = inverse.execute(&scope, &journal, true, &cancel);
+    assert!(undone.error.is_none(), "{:?}", undone.error);
+    assert!(!copy.exists());
+    assert_eq!(fs::read(&source).unwrap(), b"exact clone bytes\r\n");
+    let race = files::plan_clone(&scope, 4, &source, "race.txt", &cancel).unwrap();
+    let raced = fixture.file("Work\\race.txt", b"created after approval");
+    assert!(
+        journal
+            .execute(&scope, &race, true, &cancel)
+            .error
+            .is_some()
+    );
+    assert_eq!(fs::read(raced).unwrap(), b"created after approval");
+    let cancelled = files::plan_clone(&scope, 5, &source, "cancelled.txt", &cancel).unwrap();
+    cancel.store(true, std::sync::atomic::Ordering::Release);
+    assert!(journal.execute(&scope, &cancelled, true, &cancel).cancelled);
+    assert!(!folder.join("cancelled.txt").exists());
+    let records: Vec<_> = fs::read_dir(&journal_root)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    fixture.own(&records);
+}
+
+#[test]
 fn naming_exact_rename_new_folder_guards_and_durable_replay() {
     use tomas_commander::{journal::Journal, naming::Plan};
     let mut fixture = Fixture::new("naming");

@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+## v0.8.0 - 2026-11-01
+
+Same-folder file cloning and cleaner context menus for Windows x64.
+
+- Clone a focused file in its current folder with Ctrl+Shift+K,
+  the bottom action bar beside Copy, the file's context menu or `/clone`.
+  A single name dialog confirms with Enter; version numbers, month/year
+  tokens and numeric suffixes advance
+  automatically, falling back to `-v2`. Existing names are skipped,
+  overwrites are refused, and the verified copy supports Undo.
+- Right-click menus show only action names, without keyboard-shortcut hints,
+  for both regular files and ZIP entries.
+
+Unsigned, unsupported and provided at your own risk.
+
 ## v0.7.1 - 2026-11-01
 
 Shortcut fix for Windows x64.

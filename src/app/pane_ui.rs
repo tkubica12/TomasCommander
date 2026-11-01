@@ -834,7 +834,11 @@ impl Ledger {
                             if !navigation {
                                 response.context_menu(|ui| {
                                     copy_path_menu_item(ui, pane, &path);
-                                    for (command, label) in [(Command::OpenWith, "Open with / Shift Enter"), (Command::Preview, "Internal preview"), (Command::Rename, "Rename"), (Command::Copy, "Copy"), (Command::Move, "Move"), (Command::Recycle, "Recycle")] {
+                                    if !entry.directory && !entry.link && ui.button("Clone").clicked() {
+                                        pane.focused = Some(path.clone()); self.active = index;
+                                        row_command = Some((Command::Clone, Via::ContextMenu)); ui.close();
+                                    }
+                                    for (command, label) in [(Command::OpenWith, "Open with"), (Command::Preview, "Internal preview"), (Command::Rename, "Rename"), (Command::Copy, "Copy"), (Command::Move, "Move"), (Command::Recycle, "Recycle")] {
                                         if ui.button(label).clicked() {
                                             if !pane.selected.contains(&path) {
                                                 pane.selected.clear();
