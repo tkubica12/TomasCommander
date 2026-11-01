@@ -2,127 +2,49 @@
 
 ## Unreleased
 
-- AI change proposals. For Ask prompts such as "Utřiď Downloads podle typu do
-  podsložek" or "přesuň faktury z Downloads do Documents\Faktury\2026", the
-  read-only file harness may end with a new `propose_changes` tool call: up to
-  500 ordered new folder, move, copy, rename and recycle (Recycle Bin) steps
-  that reference real-file IDs from the run. The proposal is validated outside
-  the model (known and unchanged IDs, approved roots, Windows names,
-  case-insensitive target collisions, no overwrite, no folder into itself, one
-  change per item, refs defined before use, no protected credential paths); an
-  invalid proposal returns its problems and can be continued. The bell shows
-  "Proposal ready: N changes" and opens a review grouped into New folders,
-  Moves, Copies, Renames and Deletes; deletes start unchecked, unchecking a new
-  folder unchecks the changes that need it, and Enter runs only from the focused
-  Run button (held Enter never runs). Run first checks every selected step
-  against the current files and starts nothing if any check fails; then each
-  step runs in order as a normal operation (Stop-on-conflict policy), planned
-  again just before it runs and journaled with a shared `batch=` key. The batch
-  stops at the first failure and Cancel work stops it between steps; Operations
-  lists every step and offers per-step Undo plus a reviewed Undo batch.
-  `ai_proposal` and `ai_batch` usage events record counts and outcomes.
-- AI file harness reads PDF and XLSX/XLSM content. PDFs use the pure-Rust
-  `lopdf` parser (new pinned dependency, default features off) in a
-  panic-contained, time-bounded thread of the contained worker: `[page N]`
-  text with ToUnicode/Identity-H (Czech diacritics), lenient `/Differences`
-  encodings, form XObjects and position-based word/line spacing. Pages without
-  a usable text layer are rendered with Windows.Data.Pdf and recognized with
-  Windows.Media.Ocr as `[page N, OCR]` (read_file only; at most 10 pages,
-  2 seconds per page, 20 seconds per document; missing OCR languages are
-  reported). Encrypted PDFs needing a user password fail explicitly;
-  owner-password-only PDFs are read. Limits: 500 pages, 32 MiB input/text,
-  bounded stream decompression. XLSX/XLSM output lists `[sheet name]` and
-  tab-separated cached cell values (shared/inline strings, numbers, booleans,
-  errors) without macros or formula evaluation, with the same 4 MiB part,
-  entity and cancellation limits as DOCX/PPTX. Password-protected or mislabeled
-  OLE Office files and legacy .doc/.xls/.ppt report clear errors. Extracted
-  document text is cached per file version for one harness run (64 MiB).
-  Credential-marker blocking applies to extracted text. Text budgets are
-  enforced per decoded string and spreadsheet cell; ToUnicode CMaps use a
-  bounded parser that never expands code ranges, and the file-agent worker's
-  job object caps committed memory at 1 GiB, reported as a memory-limit stop
-  with results so far kept.
-- Local usage log, on by default: commands with how they were invoked
-  (shortcut, button, context menu, drag, Ask palette or typed slash command),
-  unhandled keys such as F5 or Ctrl+C on a file row, navigation and its route,
-  filter and search sessions, Ask texts that matched nothing or were cancelled,
-  AI task prompts and outcomes (no answers), dialog outcomes, operations, errors,
-  slow frames, folders and preparation, plus 5-minute aggregated input counts.
-  Recording only queues a small event (never blocks or writes on the UI thread);
-  one background writer appends `usage\YYYY-MM-DD.jsonl` beside preferences with
-  90-day retention, a 20 MB daily and 200 MB total cap and a final flush of at
-  most 300 ms at exit. Nothing is sent anywhere; paths and Ask texts are
-  included, file contents, clipboard, AI answers and credentials never.
-  Settings > Usage log toggles it, shows the folder and size, opens the folder
-  and deletes the usage data after confirmation; fixture runs record nothing
-  without `--settings`. Preferences move to v7 (`usage_log=`; v1-v6 stay
-  readable).
-- Usage insights (`/usage`): a background report for the last 7, 30 or 90 days
-  with keyboard/mouse share per command, shortcut opportunities, unhandled keys,
-  unmet Ask texts, cancelled dialogs, errors, slow work, most visited folders,
-  Places candidates and session time; Export Markdown report writes
-  `usage\report-YYYY-MM-DD.md`. `--usage-report [--days N] [--settings <file>]
-  [--out <file>]` writes the same report without opening a window.
-- Pane tabs: Ctrl+T opens the current folder in a new tab, Ctrl+W closes the
-  active tab (never the last one), Ctrl+Tab / Ctrl+Shift+Tab cycle tabs; also
-  `/new-tab`, `/close-tab`, `/next-tab`, `/previous-tab`. Each tab keeps its
-  folder, sort, filter, focus, selection and history; only the active tab of a
-  pane is loaded. With two or more tabs a compact strip appears at the top of
-  the pane header (click, middle-click or `×` to close, `+`, drop files on a
-  tab). Tab folders and the active tab are saved in preferences v6 (v1-v5 stay
-  readable) and restored at launch. Folders are checked in the background, so
-  an offline network folder never freezes the window; a missing or unreachable
-  one falls back to its nearest existing parent with a status message. `--root`
-  runs and `--fixture-root` runs without `--settings` neither restore nor
-  overwrite saved tabs.
-- Folder history per tab: Alt+Left / Alt+Right, mouse side buttons, the
-  header's `‹` `›` buttons, `/back` and `/forward`. Up to 50 folders each way;
-  a missing folder falls back to its nearest existing parent, which replaces
-  it in the history.
-- Closing right after a settings change now closes once the save finishes
-  instead of leaving the window open.
-- Reviewed Undo: Ctrl+Shift+U or `/undo` prepares the inverse of the latest
-  undoable operation as an exact plan ("Undo Move: 3 items back to D:\x") with
-  every path and Recycle Bin restore under Details; Enter confirms, Escape
-  cancels. Operations lists recent operations with Undo or a short reason
-  (Undone, Not undoable: ZIP insert, Changed since: path), so older operations
-  can be undone too. Rename and same-drive Move move items back; Copy, New
-  folder and ZIP create/extract recycle unchanged results; Delete, replaced
-  files and cross-drive Move originals are restored from the Recycle Bin into a
-  new staging folder and renamed into place without overwriting. A cross-drive
-  copy whose original was kept is recycled only while that original is still
-  present and unchanged. Partial operations undo only what completed. Undo is
-  journaled with `undo_of`, cannot run twice (also after a restart) and cannot
-  itself be undone. ZIP insertion, moving out of a ZIP and source Save are not
-  undoable; records from older versions are shown as not undoable. Operations
-  rows use quick checks only; folder contents are verified when preparing.
-- Journal records now add claim/completion times, an operation kind and
-  fingerprints of created and moved results and of kept cross-drive originals
-  (`undo_*` lines); older records stay readable.
-- Copy/Move conflict handling: the review shows new items, merged folders and
-  file conflicts (source newer / older or same) with examples, and offers Skip
-  (default), Replace older, Replace all or Keep both. Changing the choice
-  prepares a new exact plan; confirmation waits for it. Plans without conflicts
-  are unchanged.
-- Same-name folders are merged; Move moves merged contents individually and
-  removes only emptied source folders. Keep both picks the first free
-  `name (2).ext` case-insensitively.
-- Replacement never overwrites in place: originals go to the Recycle Bin after
-  a staged, verified copy or a verified move. Validation fails if
-  any conflict changed after review; receipts record the policy, resolutions and
-  replaced/merged/skipped paths.
-- Copy now preserves each file's modification time. AI commands and ZIP flows
-  keep refusing existing destinations.
-- Move across drives (panes, shortcuts and drag-and-drop): copy, verify each
-  file's CRC-32 by re-reading it, recheck the sources, then send each original
-  to the Recycle Bin as one item (or only the moved files when conflicts skipped
-  some; emptied folders are removed). The review adds "Across drives: copy,
-  verify, then send originals to the Recycle Bin"; Details shows the strategy.
-  Removable and network drives have no Recycle Bin, so originals are kept.
-  Mismatches, changed sources, Recycle Bin failures and cancellation keep the
-  affected originals; Operations reports e.g. "5 moved across drives (verified),
-  2 skipped, originals in Recycle Bin". No permanent-delete fallback; AI command
-  moves stay on one drive.
+## v0.7.0 - 2026-11-01
+
+Safer file operations, pane tabs, reviewed Undo, AI change proposals, PDF/XLSX
+content for AI search and a local usage log for Windows x64.
+
+- Copy/Move conflicts: the review offers Skip (default), Replace older, Replace
+  all or Keep both, and same-name folders merge. Replaced files go to the
+  Recycle Bin after a staged, verified copy; nothing is overwritten in place.
+  Copies now keep each file's modification time. AI commands and ZIP flows still
+  refuse existing destinations.
+- Move across drives: copy, CRC-32 re-read verification and a source recheck,
+  then originals go to the Recycle Bin. Removable and network drives have no
+  Recycle Bin, so their originals are kept; there is no permanent-delete fallback.
+- Reviewed Undo (Ctrl+Shift+U, `/undo` or Operations) shows the inverse of a
+  recent operation as an exact plan: items move back, unchanged results are
+  recycled and originals are restored from the Recycle Bin through staging,
+  never overwriting. Undo is journaled, never automatic and cannot run twice.
+  ZIP insertion, moving out of a ZIP and source Save are not undoable.
+- Pane tabs (Ctrl+T, Ctrl+W, Ctrl+Tab / Ctrl+Shift+Tab, `/new-tab` ...) with
+  per-tab folder history (Alt+Left/Right, mouse side buttons, header `‹` `›`,
+  `/back`, `/forward`). The tab strip appears with two or more tabs and accepts
+  drops. Tabs persist in preferences v6; missing or offline folders fall back to
+  the nearest existing parent in the background, without freezing the window.
+- AI change proposals: for prompts such as "Utřiď Downloads podle typu", the
+  read-only file harness can propose up to 500 new folder, move, copy, rename
+  and recycle steps that reference only files it inspected inside approved
+  roots. The review has per-row checkboxes (deletes start unchecked); selected
+  steps are checked first, then run as normal journaled operations that stop on
+  any conflict. Operations offers Undo per step or for the whole batch.
+- The AI file harness reads PDF text layers (Czech ToUnicode fonts included),
+  local Windows OCR for up to 10 scanned pages per read, and XLSX/XLSM cached
+  cell values. Parsers are bounded against hostile files and the worker has a
+  1 GiB memory cap.
+- Local usage log, on by default and never uploaded: commands and how they were
+  invoked, unhandled keys, navigation routes, filters, Ask texts, dialogs,
+  operations, errors and slow work, written by a background thread to daily
+  JSONL files with 90-day retention. `/usage` shows insights and exports a
+  Markdown report; `--usage-report --out report.md` writes it without a window.
+  Settings > Usage log turns it off or deletes the data (preferences v7).
+- `src\app.rs` is split into focused modules. Closing right after a settings
+  change no longer leaves the window open.
+
+Unsigned, unsupported and provided at your own risk.
 
 ## v0.6.0 - 2026-10-31
 
