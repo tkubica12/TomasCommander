@@ -388,7 +388,7 @@ impl Ledger {
                     (Command::Search, "Search", "Ctrl Shift F"),
                     (Command::Rename, "Rename", "Ctrl Shift E"),
                     (Command::NewFolder, "New folder", "Ctrl Shift N"),
-                    (Command::CreateZip, zip_label, "Ctrl Shift P"),
+                    (Command::CreateZip, zip_label, "Ctrl Shift A"),
                     (Command::OpenWith, "Open with", "Shift Enter"),
                 ] {
                     let response = action_button(ui, label, hint, !self.operation_busy && self.plan.is_none());

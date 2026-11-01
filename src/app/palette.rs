@@ -294,7 +294,7 @@ pub(super) const COMMANDS: [(Command, &str, &str); 49] = [
     (
         Command::CreateZip,
         "Create ZIP / extract ZIP by context",
-        "Ctrl Shift P",
+        "Ctrl Shift A",
     ),
     (
         Command::EditSource,

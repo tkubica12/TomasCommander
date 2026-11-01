@@ -489,7 +489,8 @@ impl ReaderPanel {
     }
 
     pub fn archive_keys(&mut self, context: &egui::Context) -> bool {
-        if context.input_mut(|input| input.consume_key(egui::Modifiers::CTRL, egui::Key::A)) {
+        // Exact Ctrl+A: Ctrl+Shift+A is the ZIP command, never select all.
+        if crate::app::consume_prompt_key(context, egui::Modifiers::CTRL, egui::Key::A) {
             self.selected_archive = self
                 .archive_rows()
                 .iter()

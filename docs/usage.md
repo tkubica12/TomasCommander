@@ -337,7 +337,7 @@ members, or the current file/folder, to the folder in the other pane.
 subfolder or filtering. Both show the destination in the existing confirmation
 before writing; neither removes or overwrites source files.
 
-**Ctrl+Shift+P**, the bottom **Create ZIP / Extract ZIP** box and `/zip` share
+**Ctrl+Shift+A**, the bottom **Create ZIP / Extract ZIP** box and `/zip` share
 one context-aware command. On regular selected files/folders it asks for a ZIP
 filename and writes to the other pane's folder. On a single ZIP it prepares
 extraction of the entire archive without first opening it. Inside ZIP it
@@ -368,7 +368,7 @@ the separate Alt+Up chooser while the rail is collapsed.
 Settings has separate Appearance, Recent activity, AI connections and Usage log
 tabs; appearance controls stay immediate, while watched-folder changes use Apply.
 
-Ctrl+Space opens Ask, with multiline input for AI and commands. Every existing action has a
+Ctrl+Space (or Ctrl+Shift+P, as in other command palettes) opens Ask, with multiline input for AI and commands. Every existing action has a
 slash command, for example `/rename`, `/preview`, `/settings` or `/copilot-cli`.
 Typing words still filters commands by name; `/` filters slash commands.
 Enter submits ordinary text to AI; slash input runs the highlighted command.

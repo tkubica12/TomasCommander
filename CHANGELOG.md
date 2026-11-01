@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- The ZIP command (create or extract by context) moves from Ctrl+Shift+P to
+  Ctrl+Shift+A (archive). Ctrl+Shift+P now opens Ask like Ctrl+Space, matching
+  the command-palette habit from other tools. Ctrl+A select all now requires
+  exactly Ctrl, so Ctrl+Shift+A never selects all, also in ZIP views.
+
 ## v0.7.0 - 2026-11-01
 
 Safer file operations, pane tabs, reviewed Undo, AI change proposals, PDF/XLSX

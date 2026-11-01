@@ -97,11 +97,11 @@ impl Ledger {
             shift: true,
             ..Default::default()
         };
-        if consume_prompt_key(ctx, Modifiers::CTRL, Key::Space) {
+        if let Some(label) = consume_ask_key(ctx) {
             if self.palette {
                 self.usage_ask_cancelled();
             } else {
-                self.usage_action("/ask", Via::Shortcut, "Ctrl Space");
+                self.usage_action("/ask", Via::Shortcut, label);
             }
             self.palette = !self.palette;
             self.palette_focus = self.palette;
@@ -277,7 +277,7 @@ impl Ledger {
             self.dispatch(Via::Shortcut, Command::Move);
             return;
         }
-        if consume_prompt_key(ctx, chord, Key::P) {
+        if consume_prompt_key(ctx, chord, Key::A) {
             self.dispatch(Via::Shortcut, Command::CreateZip);
             return;
         }
@@ -394,7 +394,8 @@ impl Ledger {
         if ctx.input_mut(|input| input.consume_key(Modifiers::NONE, Key::Escape)) {
             pane.selected.clear();
         }
-        if ctx.input_mut(|input| input.consume_key(Modifiers::CTRL, Key::A)) {
+        // Exact Ctrl+A: Ctrl+Shift+A is the ZIP command, never select all.
+        if consume_prompt_key(ctx, Modifiers::CTRL, Key::A) {
             pane.selected = pane
                 .visible
                 .iter()
@@ -459,6 +460,20 @@ pub(crate) fn consume_prompt_key(ctx: &egui::Context, chord: Modifiers, key: Key
     })
 }
 
+/// Ask toggle: Ctrl+Space, or Ctrl+Shift+P as in command palettes elsewhere. Returns the
+/// chord's label for the usage log.
+pub(crate) fn consume_ask_key(ctx: &egui::Context) -> Option<&'static str> {
+    if consume_prompt_key(ctx, Modifiers::CTRL, Key::Space) {
+        return Some("Ctrl Space");
+    }
+    let palette = Modifiers {
+        ctrl: true,
+        shift: true,
+        ..Modifiers::NONE
+    };
+    consume_prompt_key(ctx, palette, Key::P).then_some("Ctrl Shift P")
+}
+
 pub(super) fn consume_file_action(ctx: &egui::Context) -> Option<Command> {
     let chord = Modifiers {
         ctrl: true,
@@ -475,7 +490,7 @@ pub(super) const FILE_ACTION_CHORDS: [(Key, Command); 5] = [
     (Key::E, Command::Rename),
     (Key::N, Command::NewFolder),
     (Key::R, Command::Refresh),
-    (Key::P, Command::CreateZip),
+    (Key::A, Command::CreateZip),
     (Key::U, Command::Undo),
 ];
 

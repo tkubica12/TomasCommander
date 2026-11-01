@@ -421,7 +421,7 @@ impl FileAgentPanel {
             self.hide();
             return Some(action);
         }
-        if crate::app::consume_prompt_key(ctx, Modifiers::CTRL, Key::Space) {
+        if crate::app::consume_ask_key(ctx).is_some() {
             self.hide();
             return None;
         }

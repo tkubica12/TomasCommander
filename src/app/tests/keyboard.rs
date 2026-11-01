@@ -29,18 +29,24 @@ fn space_in_file_pane_remains_a_selection_key_not_a_filter() {
 #[test]
 fn ask_shortcut_uses_ctrl_space_without_consuming_selection_or_modified_variants() {
     let ctx = egui::Context::default();
-    for (modifiers, opens) in [
-        (Modifiers::CTRL, true),
-        (Modifiers::NONE, false),
-        (Modifiers::SHIFT, false),
-        (Modifiers::CTRL | Modifiers::SHIFT, false),
-        (Modifiers::CTRL | Modifiers::ALT, false),
+    let palette = Modifiers::CTRL | Modifiers::SHIFT;
+    for (key, modifiers, opens) in [
+        (Key::Space, Modifiers::CTRL, Some("Ctrl Space")),
+        (Key::Space, Modifiers::NONE, None),
+        (Key::Space, Modifiers::SHIFT, None),
+        (Key::Space, palette, None),
+        (Key::Space, Modifiers::CTRL | Modifiers::ALT, None),
+        // Ctrl+Shift+P opens Ask too, as the command palette does elsewhere.
+        (Key::P, palette, Some("Ctrl Shift P")),
+        (Key::P, Modifiers::CTRL, None),
+        (Key::P, palette | Modifiers::ALT, None),
+        (Key::P, Modifiers::NONE, None),
     ] {
         ctx.run_ui(
             egui::RawInput {
                 events: vec![egui::Event::Key {
-                    key: Key::Space,
-                    physical_key: Some(Key::Space),
+                    key,
+                    physical_key: Some(key),
                     pressed: true,
                     repeat: false,
                     modifiers,
@@ -48,13 +54,43 @@ fn ask_shortcut_uses_ctrl_space_without_consuming_selection_or_modified_variants
                 ..Default::default()
             },
             |_| {
-                assert_eq!(consume_prompt_key(&ctx, Modifiers::CTRL, Key::Space), opens);
-                assert_eq!(ctx.input(|input| input.events.len()), usize::from(!opens));
+                assert_eq!(consume_ask_key(&ctx), opens, "{key:?} {modifiers:?}");
+                assert_eq!(
+                    ctx.input(|input| input.events.len()),
+                    usize::from(opens.is_none())
+                );
             },
         )
         .textures_delta
         .clear();
     }
+}
+
+#[test]
+fn ctrl_shift_a_creates_a_zip_and_never_selects_all() {
+    let ctx = egui::Context::default();
+    let zip = Modifiers::CTRL | Modifiers::SHIFT;
+    ctx.run_ui(
+        egui::RawInput {
+            events: vec![egui::Event::Key {
+                key: Key::A,
+                physical_key: Some(Key::A),
+                pressed: true,
+                repeat: false,
+                modifiers: zip,
+            }],
+            ..Default::default()
+        },
+        |_| {
+            assert!(
+                !consume_prompt_key(&ctx, Modifiers::CTRL, Key::A),
+                "Select all matches Ctrl+A exactly."
+            );
+            assert_eq!(consume_file_action(&ctx), Some(Command::CreateZip));
+        },
+    )
+    .textures_delta
+    .clear();
 }
 
 #[test]
@@ -154,7 +190,7 @@ fn file_action_shortcuts_require_ctrl_shift_and_have_distinct_commands() {
         (Key::E, Command::Rename, "Ctrl Shift E"),
         (Key::N, Command::NewFolder, "Ctrl Shift N"),
         (Key::R, Command::Refresh, "Ctrl Shift R"),
-        (Key::P, Command::CreateZip, "Ctrl Shift P"),
+        (Key::A, Command::CreateZip, "Ctrl Shift A"),
     ] {
         assert!(
             COMMANDS
@@ -566,7 +602,8 @@ fn undo_shortcut_is_ctrl_shift_u_and_reuses_no_other_chord() {
         .iter()
         .chain(&FILE_PANE_CHORDS)
         .map(|(key, _)| key.name())
-        .chain(["H"])
+        // H toggles the rail; P opens Ask.
+        .chain(["H", "P"])
         .collect();
     assert_eq!(
         keys.iter().collect::<BTreeSet<_>>().len(),

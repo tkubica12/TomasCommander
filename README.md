@@ -99,7 +99,7 @@ The binary is unsigned; this project does not provide code-signing or support.
 | Space / Shift+arrows / Ctrl+A | Toggle / range / select all |
 | Ctrl+Enter | Toggle preview; a different file replaces it |
 | Shift+Enter | Open with menu |
-| Ctrl+Space | Ask / AI prompts and slash commands |
+| Ctrl+Space / Ctrl+Shift+P | Ask / AI prompts and slash commands |
 | Ctrl+Shift+H | Toggle workspace rail, opening on Recent |
 | Alt+Up | Saved places, including Add current folder |
 | Ctrl+F / Ctrl+Shift+F | Filter / recursive filename search |
@@ -107,7 +107,7 @@ The binary is unsigned; this project does not provide code-signing or support.
 | Ctrl+Shift+C / Ctrl+Shift+M / Ctrl+Shift+D | Copy / move / Recycle Bin |
 | Ctrl+Shift+U | Undo: review the inverse of the latest undoable operation |
 | Ctrl+Shift+N / Ctrl+Shift+E / Ctrl+Shift+R | New folder / rename / refresh |
-| Ctrl+Shift+P | Create ZIP / extract ZIP by context |
+| Ctrl+Shift+A | Create ZIP / extract ZIP by context (archive) |
 | Ctrl+plus / Ctrl+minus / Ctrl+wheel | Global UI zoom |
 | Ctrl+0 | Reset zoom |
 | ? / status-bar Help | Shortcut help |

@@ -527,7 +527,10 @@ impl Ledger {
                             .striped(true)
                             .show(ui, |ui| {
                                 for (key, label) in [
-                                    ("Ctrl Space", "Ask / AI and slash commands"),
+                                    (
+                                        "Ctrl Space / Ctrl Shift P",
+                                        "Ask / AI and slash commands",
+                                    ),
                                     ("Tab", "Switch file pane"),
                                     ("Type in file pane", "Filter immediately"),
                                     ("Down from filter", "Focus first matching file"),

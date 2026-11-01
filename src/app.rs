@@ -51,7 +51,7 @@ pub(crate) use self::{
     dialogs::confirmation_buttons,
     drag::{DragItems, DropLocation, register_drop_zone, remember_drag_reveal},
     frame::action_button,
-    keyboard::{accessible_text_value, consume_prompt_key},
+    keyboard::{accessible_text_value, consume_ask_key, consume_prompt_key},
 };
 pub(super) use self::{
     keyboard::take_filter_text,
