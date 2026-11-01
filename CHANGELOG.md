@@ -2,10 +2,16 @@
 
 ## Unreleased
 
+## v0.7.1 - 2026-11-01
+
+Shortcut fix for Windows x64.
+
 - The ZIP command (create or extract by context) moves from Ctrl+Shift+P to
   Ctrl+Shift+A (archive). Ctrl+Shift+P now opens Ask like Ctrl+Space, matching
   the command-palette habit from other tools. Ctrl+A select all now requires
   exactly Ctrl, so Ctrl+Shift+A never selects all, also in ZIP views.
+
+Unsigned, unsupported and provided at your own risk.
 
 ## v0.7.0 - 2026-11-01
 

@@ -22,7 +22,7 @@ before the release cleanup.
 ## Download and run
 
 Download `tomas-commander.exe` from [GitHub Releases](https://github.com/tkubica12/TomasCommander/releases).
-The latest version is **v0.7.0**, an experimental Windows x64 release.
+The latest version is **v0.7.1**, an experimental Windows x64 release.
 No installer or Rust toolchain is needed to run the downloaded executable.
 The binary is unsigned; this project does not provide code-signing or support.
 
