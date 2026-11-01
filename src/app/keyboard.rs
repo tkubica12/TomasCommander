@@ -35,6 +35,7 @@ impl Ledger {
             || self.places_popup.is_some()
             || self.drives_popup.is_some()
             || self.place_edit.is_some()
+            || self.usage.insights.is_some()
         {
             return;
         }
@@ -96,6 +97,11 @@ impl Ledger {
             ..Default::default()
         };
         if consume_prompt_key(ctx, Modifiers::CTRL, Key::Space) {
+            if self.palette {
+                self.usage_ask_cancelled();
+            } else {
+                self.usage_action("/ask", Via::Shortcut, "Ctrl Space");
+            }
             self.palette = !self.palette;
             self.palette_focus = self.palette;
             self.palette_query.clear();
@@ -113,7 +119,7 @@ impl Ledger {
                 }
                 memory.move_focus(egui::FocusDirection::None);
             });
-            self.dispatch(Command::Recent);
+            self.dispatch(Via::Shortcut, Command::Recent);
             return;
         }
         if self.reader.target.is_some()
@@ -145,7 +151,7 @@ impl Ledger {
             }
             for (key, command) in [(Key::S, Command::SaveSource), (Key::E, Command::EditSource)] {
                 if ctx.input_mut(|input| input.consume_key(Modifiers::CTRL, key)) {
-                    self.dispatch(command);
+                    self.dispatch(Via::Shortcut, command);
                     return;
                 }
             }
@@ -179,7 +185,7 @@ impl Ledger {
                 memory.move_focus(egui::FocusDirection::None);
             });
             self.rail_index = None;
-            self.dispatch(command);
+            self.dispatch(Via::Shortcut, command);
             self.file_focus_requested = true;
             return;
         }
@@ -187,7 +193,7 @@ impl Ledger {
             return;
         }
         if consume_help(ctx) {
-            self.dispatch(Command::Help);
+            self.dispatch(Via::Shortcut, Command::Help);
             return;
         }
         if self.rail_keys(ctx, copy) {
@@ -240,7 +246,7 @@ impl Ledger {
             (Key::ArrowRight, Command::RotateRight),
         ] {
             if ctx.input_mut(|input| input.consume_key(Modifiers::CTRL, key)) {
-                self.dispatch(command);
+                self.dispatch(Via::Shortcut, command);
                 return;
             }
         }
@@ -263,15 +269,15 @@ impl Ledger {
             return;
         }
         if copy || ctx.input_mut(|input| input.consume_key(chord, Key::C)) {
-            self.dispatch(Command::Copy);
+            self.dispatch(Via::Shortcut, Command::Copy);
             return;
         }
         if ctx.input_mut(|input| input.consume_key(chord, Key::M)) {
-            self.dispatch(Command::Move);
+            self.dispatch(Via::Shortcut, Command::Move);
             return;
         }
         if consume_prompt_key(ctx, chord, Key::P) {
-            self.dispatch(Command::CreateZip);
+            self.dispatch(Via::Shortcut, Command::CreateZip);
             return;
         }
         if ctx.input_mut(|input| input.consume_key(chord, Key::D)) {
@@ -293,23 +299,23 @@ impl Ledger {
 
     fn file_pane_shortcuts(&mut self, ctx: &egui::Context, copy: bool, chord: Modifiers) {
         if ctx.input_mut(|input| input.consume_key(Modifiers::CTRL, Key::Enter)) {
-            self.dispatch(Command::Preview);
+            self.dispatch(Via::Shortcut, Command::Preview);
             return;
         }
         if ctx.input_mut(|input| input.consume_key(Modifiers::SHIFT, Key::Enter)) {
-            self.dispatch(Command::OpenWith);
+            self.dispatch(Via::Shortcut, Command::OpenWith);
             return;
         }
         if let Some(command) = consume_file_action(ctx) {
-            self.dispatch(command);
+            self.dispatch(Via::Shortcut, command);
             return;
         }
         if ctx.input_mut(|input| input.consume_key(Modifiers::ALT, Key::ArrowUp)) {
-            self.dispatch(Command::Places);
+            self.dispatch(Via::Shortcut, Command::Places);
             return;
         }
         if copy {
-            self.dispatch(Command::Copy);
+            self.dispatch(Via::Shortcut, Command::Copy);
             return;
         }
         for (key, command) in [
@@ -318,27 +324,30 @@ impl Ledger {
         ] {
             if ctx.input_mut(|input| input.consume_key(Modifiers::CTRL, key)) {
                 ctx.memory_mut(|memory| memory.move_focus(egui::FocusDirection::None));
-                self.dispatch(command);
+                self.dispatch(Via::Shortcut, command);
                 return;
             }
         }
         if let Some(down) = consume_file_jump(ctx) {
             ctx.memory_mut(|memory| memory.move_focus(egui::FocusDirection::None));
-            self.dispatch(if down {
-                Command::JumpDown
-            } else {
-                Command::JumpUp
-            });
+            self.dispatch(
+                Via::Shortcut,
+                if down {
+                    Command::JumpDown
+                } else {
+                    Command::JumpUp
+                },
+            );
             return;
         }
         for (key, command) in FILE_PANE_CHORDS {
             if ctx.input_mut(|input| input.consume_key(chord, key)) {
-                self.dispatch(command);
+                self.dispatch(Via::Shortcut, command);
                 return;
             }
         }
         if ctx.input_mut(|input| input.consume_key(Modifiers::CTRL, Key::F)) {
-            self.dispatch(Command::Filter);
+            self.dispatch(Via::Shortcut, Command::Filter);
             return;
         }
         if ctx.input_mut(|input| input.consume_key(chord, Key::ArrowLeft)) {
@@ -372,11 +381,12 @@ impl Ledger {
             self.file_focus_requested = true;
         }
         if ctx.input_mut(|input| input.consume_key(Modifiers::NONE, Key::Enter)) {
-            self.open_focused();
+            self.open_focused(NavVia::Enter);
             return;
         }
         if ctx.input_mut(|input| input.consume_key(Modifiers::NONE, Key::Backspace)) {
-            self.parent(self.active);
+            self.usage_action("/parent", Via::Shortcut, shortcut_hint(Command::Parent));
+            self.parent(self.active, NavVia::Backspace);
             return;
         }
         let pane = &mut self.panes[self.active];

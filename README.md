@@ -55,7 +55,7 @@ The binary is unsigned; this project does not provide code-signing or support.
   Ctrl+Shift+H toggles the rail, opening on Recent; Places has no dedicated shortcut.
   Recent rows match file-pane typography and support preview, Copy path, system
   Open with, Open containing folder and dragging.
-  Settings separates Appearance, Recent activity and AI connections.
+  Settings separates Appearance, Recent activity, AI connections and Usage log.
 - Native previews for Markdown, semantic HTML, PDF, JPEG/PNG/BMP, UTF-8
   text/config/source files, formatted JSON and comma-delimited CSV.
   Code/config previews have syntax colors, selectable text, line numbers,
@@ -69,6 +69,12 @@ The binary is unsigned; this project does not provide code-signing or support.
 - Native Windows dragging of real files to external applications, offering Copy
   only. ZIP selections are automatically extracted to temporary copies for
   external opening and dragging, including multiple files and folders.
+- Local usage log for reviewing your own habits, for example with an AI
+  assistant: commands and whether they came from a shortcut, the mouse or Ask,
+  keys that did nothing, navigation routes, unmet Ask texts, cancelled dialogs,
+  errors and slow work. `/usage` shows Usage insights and exports a Markdown
+  report; `tomas-commander.exe --usage-report --out report.md` writes it without
+  a window. Recording never waits for the disk.
 
 ## Keyboard essentials
 
@@ -145,6 +151,12 @@ and ZIP create/extract, but not ZIP insertion, moving out of a ZIP or source
 Save; it refuses when results changed, originals are no longer in the Recycle
 Bin or kept originals are gone, and it cannot itself be undone.
 
+The usage log is local only and never uploaded, but it contains full folder and
+file paths and Ask texts (never file contents, clipboard, AI answers or
+credentials). It is on by default; turn it off or delete it in Settings > Usage
+log. Files live in `%LOCALAPPDATA%\TomasCommander\usage\` and are deleted after
+90 days. See [usage log](docs/decisions/usage-log.md).
+
 HTML previews are semantic, not full CSS/browser rendering; scripts and external
 assets are not loaded. ZIP support is limited to Store/Deflate and excludes
 encrypted, split and ZIP64 archives. Voice, remappable shortcuts and incoming
@@ -203,6 +215,7 @@ not evidence that the full suite is consistently green.
 [Usage and format limits](docs/usage.md) ·
 [Architecture](docs/decisions/desktop-shell.md) ·
 [File-operation policy](docs/decisions/file-operations.md) ·
+[Usage log](docs/decisions/usage-log.md) ·
 [Roadmap](docs/roadmap.md) · [Release notes](CHANGELOG.md)
 
 Licensed under [MIT](LICENSE).

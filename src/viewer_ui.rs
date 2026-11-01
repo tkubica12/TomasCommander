@@ -21,6 +21,31 @@ struct Request {
     virtual_entry: Option<String>,
 }
 
+/// A finished preview read: what was shown, how and how long it took.
+pub struct PreviewUsage {
+    pub path: PathBuf,
+    pub kind: &'static str,
+    /// `open`, `page`, `rotate` or `edit`.
+    pub action: &'static str,
+    pub ms: u64,
+    pub ok: bool,
+    /// The ZIP member name when path is its archive.
+    pub member: Option<String>,
+}
+
+fn content_kind(content: &Content) -> &'static str {
+    match content {
+        Content::Editable(_) => "editor",
+        Content::Pdf { .. } => "pdf",
+        Content::Markdown { .. } => "markdown",
+        Content::Archive(_) => "zip",
+        Content::Text(_) => "text",
+        Content::Code(_) => "code",
+        Content::Table { .. } => "table",
+        Content::Image { .. } => "image",
+    }
+}
+
 pub struct ReaderPanel {
     jobs: SyncSender<Request>,
     results: Receiver<(u64, FileResult<Preview>)>,
@@ -46,6 +71,10 @@ pub struct ReaderPanel {
     pub edit_requested: bool,
     pub save_requested: bool,
     pub recent_activity: Option<PathBuf>,
+    /// When the current read was requested and why (usage log).
+    requested: Option<(std::time::Instant, &'static str)>,
+    /// A finished read for the usage log; taken by the application.
+    pub usage: Option<PreviewUsage>,
     close_prompt: bool,
     close_prompt_focus: bool,
     virtual_entry: Option<String>,
@@ -125,6 +154,8 @@ impl ReaderPanel {
             edit_requested: false,
             save_requested: false,
             recent_activity: None,
+            requested: None,
+            usage: None,
             close_prompt: false,
             close_prompt_focus: false,
             virtual_entry: None,
@@ -171,6 +202,16 @@ impl ReaderPanel {
                     .into(),
             );
         }
+        let action = if edit {
+            "edit"
+        } else if self.target.is_some() && self.path == path && quarter_turns != self.quarter_turns
+        {
+            "rotate"
+        } else if self.target.is_some() && self.path == path && page > 0 {
+            "page"
+        } else {
+            "open"
+        };
         let generation = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
         if let Err(error) = self.jobs.try_send(Request {
             generation,
@@ -185,6 +226,7 @@ impl ReaderPanel {
                 "Could not queue preview; previous read cancelled: {error}"
             ));
         }
+        self.requested = Some((std::time::Instant::now(), action));
         self.source = source;
         self.target = Some(1 - source);
         self.path = path;
@@ -617,6 +659,18 @@ impl ReaderPanel {
             if generation != self.generation.load(Ordering::Acquire) || self.target.is_none() {
                 continue;
             }
+            if let Some((requested, action)) = self.requested.take() {
+                self.usage = Some(PreviewUsage {
+                    path: self.path.clone(),
+                    kind: result
+                        .as_ref()
+                        .map_or("error", |preview| content_kind(&preview.content)),
+                    action,
+                    ms: requested.elapsed().as_millis() as u64,
+                    ok: result.is_ok(),
+                    member: self.virtual_entry.clone(),
+                });
+            }
             match result {
                 Ok(preview) => {
                     if self.virtual_entry.is_none() {
@@ -636,6 +690,15 @@ impl ReaderPanel {
 
     pub fn show(&mut self, ui: &mut egui::Ui) -> bool {
         self.show_inner(ui, None, &mut None)
+    }
+
+    /// What the panel currently shows, for slow-frame context.
+    pub fn kind(&self) -> &'static str {
+        match (&self.preview, &self.error) {
+            (Some(preview), _) => content_kind(&preview.content),
+            (None, Some(_)) => "error",
+            (None, None) => "loading",
+        }
     }
 
     pub fn show_archive(&mut self, ui: &mut egui::Ui, active: bool) -> (bool, Option<bool>) {
@@ -1429,6 +1492,8 @@ mod tests {
             close_prompt: false,
             close_prompt_focus: false,
             recent_activity: None,
+            requested: None,
+            usage: None,
             virtual_entry: None,
             open_entry: None,
             preview_entry: None,
@@ -1991,6 +2056,8 @@ mod tests {
             close_prompt: false,
             close_prompt_focus: false,
             recent_activity: None,
+            requested: None,
+            usage: None,
             virtual_entry: None,
             open_entry: None,
             preview_entry: None,
@@ -2044,6 +2111,8 @@ mod tests {
             close_prompt: false,
             close_prompt_focus: false,
             recent_activity: None,
+            requested: None,
+            usage: None,
             virtual_entry: None,
             open_entry: None,
             preview_entry: None,
@@ -2138,6 +2207,8 @@ mod tests {
             close_prompt: false,
             close_prompt_focus: false,
             recent_activity: None,
+            requested: None,
+            usage: None,
             virtual_entry: None,
             open_entry: None,
             preview_entry: None,

@@ -15,6 +15,18 @@ pub(super) enum RecentAction {
     CopyPath,
 }
 
+impl RecentAction {
+    pub(super) fn name(self) -> &'static str {
+        match self {
+            Self::Open => "open",
+            Self::Preview => "preview",
+            Self::Locate => "locate",
+            Self::OpenWith => "open_with",
+            Self::CopyPath => "copy_path",
+        }
+    }
+}
+
 impl Ledger {
     pub(super) fn rail_keys(&mut self, ctx: &egui::Context, clipboard_copy: bool) -> bool {
         let Some(mut index) = self.rail_index else {
@@ -24,7 +36,7 @@ impl Ledger {
             && let Some(action) = consume_recent_action(ctx, clipboard_copy)
         {
             if let Some(item) = self.recent_snapshot.items.get(index) {
-                self.recent_action(ctx, item.path.clone(), action);
+                self.recent_action(ctx, item.path.clone(), action, Via::Shortcut);
             }
             return true;
         }
@@ -56,9 +68,10 @@ impl Ledger {
             self.file_focus_requested = true;
             if let Some(path) = path {
                 if self.rail == Rail::Recent {
-                    self.recent_action(ctx, path, RecentAction::Open);
+                    self.recent_action(ctx, path, RecentAction::Open, Via::Shortcut);
                 } else {
-                    self.navigate(self.active, path);
+                    self.usage_rail("place_open", Via::Shortcut);
+                    self.navigate(self.active, path, NavVia::Place);
                 }
             }
         }
@@ -72,7 +85,14 @@ impl Ledger {
         true
     }
 
-    fn recent_action(&mut self, ctx: &egui::Context, path: PathBuf, action: RecentAction) {
+    fn recent_action(
+        &mut self,
+        ctx: &egui::Context,
+        path: PathBuf,
+        action: RecentAction,
+        via: Via,
+    ) {
+        self.usage_rail(action.name(), via);
         if action == RecentAction::CopyPath {
             ctx.copy_text(files::display_path(&path));
             return;
@@ -131,6 +151,7 @@ impl Ledger {
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
                         if ui.button("<").on_hover_text("Collapse workspace").clicked() {
+                            self.usage_rail("collapse", Via::Button);
                             self.rail_open = false;
                             self.rail_index = None;
                             self.file_focus_requested = true;
@@ -157,6 +178,14 @@ impl Ledger {
                                 .clicked()
                             {
                                 self.rail_index = None;
+                                self.usage_rail(
+                                    if rail == Rail::Recent {
+                                        "tab_recent"
+                                    } else {
+                                        "tab_places"
+                                    },
+                                    Via::Button,
+                                );
                             }
                         }
                     });
@@ -177,6 +206,7 @@ impl Ledger {
                 )
                 .show(ui, |ui| {
                     if ui.button(">").on_hover_text("Expand workspace").clicked() {
+                        self.usage_rail("expand", Via::Button);
                         self.rail_open = true;
                         self.rail = Rail::Recent;
                         self.rail_index = None;
@@ -211,16 +241,16 @@ impl Ledger {
                         response.request_focus();
                         response.scroll_to_me(None);
                     }
-                    if let Some(action) = action {
-                        chosen = Some((item.path.clone(), action));
+                    if let Some((action, via)) = action {
+                        chosen = Some((item.path.clone(), action, via));
                     }
                 }
                 if self.recent_snapshot.items.is_empty() {
                     ui.label("No recent documents yet.");
                 }
             });
-        if let Some((path, action)) = chosen {
-            self.recent_action(ui.ctx(), path, action);
+        if let Some((path, action, via)) = chosen {
+            self.recent_action(ui.ctx(), path, action, via);
         }
         ui.label(RichText::new("Ctrl Shift H").small().weak());
     }
@@ -277,12 +307,13 @@ impl Ledger {
         }
         if let Some(target) = target {
             self.rail_index = None;
-            self.navigate(self.active, target);
+            self.usage_rail("place_open", Via::Rail);
+            self.navigate(self.active, target, NavVia::Place);
         }
 
         ui.add_space(25.0);
         if self.rail == Rail::Favorites && ui.button("+ Pin active folder").clicked() {
-            self.dispatch(Command::Pin);
+            self.dispatch(Via::Rail, Command::Pin);
         }
     }
 }
@@ -336,7 +367,7 @@ pub(super) fn recent_row(
     item: &recent::Item,
     selected: bool,
     enabled: bool,
-) -> (egui::Response, Option<RecentAction>) {
+) -> (egui::Response, Option<(RecentAction, Via)>) {
     let name = item
         .path
         .file_name()
@@ -349,9 +380,11 @@ pub(super) fn recent_row(
     }).inner.on_hover_text(format!("{}\n{} / {}\nClick: open containing folder / Double-click: open file\nEnter: open / Ctrl Enter: preview / Shift Enter: Open with\nAlt Enter: open containing folder / Ctrl Shift C: copy path",
         files::display_path(&item.path), item.activity.label(), recent_age(item.at_ms)));
     let mut action = if response.double_clicked_by(egui::PointerButton::Primary) {
-        Some(RecentAction::Open)
+        Some((RecentAction::Open, Via::DoubleClick))
     } else {
-        response.clicked().then_some(RecentAction::Locate)
+        response
+            .clicked()
+            .then_some((RecentAction::Locate, Via::Rail))
     };
     response.context_menu(|ui| {
         for (label, candidate) in [
@@ -368,7 +401,7 @@ pub(super) fn recent_row(
                 )
                 .clicked()
             {
-                action = Some(candidate);
+                action = Some((candidate, Via::ContextMenu));
                 ui.close();
             }
         }

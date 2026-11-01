@@ -324,6 +324,8 @@ impl Ledger {
             return;
         }
         let mut history_step = side_button_history(ui.ctx(), ui.max_rect());
+        let mut history_via = Via::MouseButton;
+        let mut header_sort = false;
         if ui.input(|input| {
             input.pointer.any_pressed()
                 && input
@@ -432,6 +434,7 @@ impl Ledger {
                             });
                             if response.clicked() {
                                 history_step = Some(forward);
+                                history_via = Via::Header;
                             }
                         }
                     });
@@ -578,6 +581,7 @@ impl Ledger {
                     pane.descending = false;
                 }
                 self.active = index;
+                header_sort = true;
                 files::sort_entries_ordered(&mut pane.entries, pane.sort, pane.descending);
                 pane.rebuild();
                 pane.scroll_to_focus = true;
@@ -835,7 +839,7 @@ impl Ledger {
                                                 pane.selected.clear();
                                             }
                                             pane.focused = Some(path.clone()); self.active = index;
-                                            row_command = Some(command); ui.close();
+                                            row_command = Some((command, Via::ContextMenu)); ui.close();
                                         }
                                     }
                                 });
@@ -879,7 +883,7 @@ impl Ledger {
                                 if let Some(command) = double_click_command(
                                     navigation, ui.input(|input| input.modifiers),
                                 ) {
-                                    row_command = Some(command);
+                                    row_command = Some((command, Via::DoubleClick));
                                 } else {
                                     open = true;
                                 }
@@ -908,6 +912,12 @@ impl Ledger {
         {
             self.active = index;
             self.rail_index = None;
+            let command = if forward {
+                Command::Forward
+            } else {
+                Command::Back
+            };
+            self.usage_action(command.slash(), history_via, shortcut_hint(command));
             self.step_history(index, forward);
             return;
         }
@@ -930,12 +940,17 @@ impl Ledger {
         }
         if inline_cancel {
             self.name_dialog = None;
+            self.usage.outcome("inline_rename", "cancelled");
         }
         if inline_submit {
+            self.usage.outcome("inline_rename", "confirmed");
             self.prepare_name_change();
         }
+        if header_sort {
+            self.usage_action("/sort", Via::Header, shortcut_hint(Command::Sort));
+        }
         if inline_start {
-            self.dispatch(Command::Rename);
+            self.dispatch(Via::Click, Command::Rename);
             if let Some(dialog) = &mut self.name_dialog {
                 dialog.inline = true;
             }
@@ -944,25 +959,30 @@ impl Ledger {
         if go {
             self.path_edits[index] = false;
             self.active = index;
-            self.navigate(index, PathBuf::from(self.panes[index].path_text.trim()));
+            self.navigate(
+                index,
+                PathBuf::from(self.panes[index].path_text.trim()),
+                NavVia::TypedPath,
+            );
         }
         if let Some(path) = breadcrumb {
             self.active = index;
-            self.navigate(index, path);
+            self.navigate(index, path, NavVia::Breadcrumb);
         }
-        if let Some(command) = row_command {
-            self.dispatch(command);
+        if let Some((command, via)) = row_command {
+            self.dispatch(via, command);
         }
         if parent {
             self.active = index;
-            self.parent(index);
+            self.usage_action("/parent", Via::Header, shortcut_hint(Command::Parent));
+            self.parent(index, NavVia::Parent);
         }
         if pin {
             self.active = index;
-            self.dispatch(Command::Pin);
+            self.dispatch(Via::Header, Command::Pin);
         }
         if open {
-            self.open_focused();
+            self.open_focused(NavVia::DoubleClick);
         }
     }
 

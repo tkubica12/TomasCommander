@@ -64,6 +64,13 @@ fn main() {
         }
         return;
     }
+    if std::env::args().nth(1).as_deref() == Some("--usage-report") {
+        if let Err(error) = usage_report() {
+            eprintln!("{error}");
+            std::process::exit(1);
+        }
+        return;
+    }
     if std::env::args().nth(1).as_deref() == Some("--ai-worker") {
         if tomas_commander::ai::worker().is_err() {
             std::process::exit(1);
@@ -137,6 +144,41 @@ fn main() {
     }
 }
 
+fn default_settings() -> Result<PathBuf, String> {
+    let root =
+        std::env::var_os("LOCALAPPDATA").ok_or("LOCALAPPDATA is not defined; pass --settings")?;
+    Ok(PathBuf::from(root)
+        .join("TomasCommander")
+        .join("preferences.txt"))
+}
+
+/// `--usage-report [--days N] [--settings <path>] [--out <file>]`: writes the Markdown usage
+/// report without opening a window. Release builds have no console, so `--out` is the reliable
+/// destination; standard output still works when redirected to a file or pipe.
+fn usage_report() -> Result<(), String> {
+    use tomas_commander::usage::{self, report};
+    let arguments = report::CliArgs::parse(std::env::args_os().skip(2))?;
+    let settings = match arguments.settings {
+        Some(path) => path,
+        None => default_settings()?,
+    };
+    let folder = usage::folder_for_settings(&settings);
+    let markdown =
+        report::Report::load(&folder, arguments.days, usage::now_ms())?.markdown(&folder);
+    match arguments.out {
+        Some(path) => std::fs::write(&path, markdown)
+            .map_err(|error| format!("Write usage report {}: {error}", path.display())),
+        None => {
+            use std::io::Write;
+            let mut stdout = std::io::stdout().lock();
+            stdout
+                .write_all(markdown.as_bytes())
+                .and_then(|()| stdout.flush())
+                .map_err(|error| format!("Write usage report to standard output: {error}"))
+        }
+    }
+}
+
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let started = Instant::now();
     let mut initial =
@@ -199,6 +241,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         .map(|path| desktop_metrics::Metrics::new(&path, started))
         .transpose()?;
     let persist_tabs = app::persist_tabs(root_argument, fixture.is_some(), settings.is_some());
+    // Fixture runs keep no usage log unless they name their own settings file.
+    let usage = app::UsageLaunch {
+        allowed: fixture.is_none() || settings.is_some(),
+        root: root_argument,
+        fixture: fixture.is_some(),
+        settings: settings.is_some(),
+    };
     let scope = match fixture {
         Some(root) => Scope::fixture(&root)?,
         None => Scope::unrestricted(),
@@ -206,13 +255,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     initial = scope.resolve(&initial)?;
     let settings = match settings {
         Some(path) => path,
-        None => {
-            let root = std::env::var_os("LOCALAPPDATA")
-                .ok_or("LOCALAPPDATA is not defined; pass --settings")?;
-            PathBuf::from(root)
-                .join("TomasCommander")
-                .join("preferences.txt")
-        }
+        None => default_settings()?,
     };
     let mut viewport = egui::ViewportBuilder::default()
         .with_inner_size([1240.0, 800.0])
@@ -236,8 +279,15 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         Box::new(move |creation| {
             // --root runs and fixture runs on the default settings file open one tab per pane
             // at the launch folder; saved tabs are neither restored nor overwritten.
-            let ledger =
-                app::Ledger::new(creation, initial, scope, settings, started, persist_tabs);
+            let ledger = app::Ledger::new(
+                creation,
+                initial,
+                scope,
+                settings,
+                started,
+                persist_tabs,
+                usage,
+            );
             #[cfg(feature = "native-desktop-tests")]
             let ledger = {
                 let mut ledger = ledger;

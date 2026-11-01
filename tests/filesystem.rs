@@ -870,6 +870,7 @@ fn actual_preferences_roundtrip_and_invalid_file_preservation() {
         recent_documents: Vec::new(),
         recent_roots: Some(vec![fixture.root.clone()]),
         tabs: Default::default(),
+        usage_log: true,
     };
     let favorite = preferences.favorites[0].clone();
     preferences
@@ -1030,7 +1031,7 @@ fn recent_documents_are_bounded_deduplicated_and_old_preferences_load() {
     assert!(
         fs::read_to_string(settings)
             .unwrap()
-            .starts_with("TomasCommander preferences v6\n")
+            .starts_with("TomasCommander preferences v7\n")
     );
 }
 
@@ -1059,7 +1060,7 @@ fn pane_tabs_preferences_v6_roundtrip_and_v5_migration() {
     preferences.save(&settings).unwrap();
     let text = fs::read_to_string(&settings).unwrap();
     assert!(
-        text.starts_with("TomasCommander preferences v6\n"),
+        text.starts_with("TomasCommander preferences v7\n"),
         "{text}"
     );
     assert_eq!(text.matches("tabs=").count(), 1, "{text}");
@@ -1100,6 +1101,41 @@ fn pane_tabs_preferences_v6_roundtrip_and_v5_migration() {
     fs::write(&settings, header).unwrap();
     assert!(too_many.save(&settings).is_err());
     assert_eq!(fs::read_to_string(&settings).unwrap(), header);
+}
+
+#[test]
+fn usage_log_preference_v7_roundtrip_and_v6_migration() {
+    let mut fixture = Fixture::new("usage-preferences");
+    let settings = fixture.file(
+        "preferences.txt",
+        b"TomasCommander preferences v6\ndark=false\naccent=2\nzoom=1.1\ntabs=[null,null]\n",
+    );
+    let migrated = Preferences::load(&settings).unwrap();
+    assert!(migrated.usage_log, "files before v7 keep the usage log on");
+    assert_eq!((migrated.dark, migrated.accent), (false, 2));
+    let mut preferences = migrated.clone();
+    preferences.save(&settings).unwrap();
+    let text = fs::read_to_string(&settings).unwrap();
+    assert!(
+        text.starts_with("TomasCommander preferences v7\n"),
+        "{text}"
+    );
+    assert_eq!(text.matches("usage_log=true\n").count(), 1, "{text}");
+    preferences.usage_log = false;
+    preferences.save(&settings).unwrap();
+    let loaded = Preferences::load(&settings).unwrap();
+    assert!(!loaded.usage_log);
+    assert_eq!((loaded.dark, loaded.accent, loaded.zoom), (false, 2, 1.1));
+    for invalid in ["usage_log=yes", "usage_log="] {
+        fs::write(
+            &settings,
+            format!("TomasCommander preferences v7\n{invalid}\n"),
+        )
+        .unwrap();
+        assert!(Preferences::load(&settings).is_err(), "{invalid}");
+    }
+    fs::write(&settings, "TomasCommander preferences v8\n").unwrap();
+    assert!(Preferences::load(&settings).is_err());
 }
 
 #[test]

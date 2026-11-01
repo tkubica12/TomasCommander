@@ -8,6 +8,7 @@ impl Ledger {
         settings: PathBuf,
         started: Instant,
         restore_tabs: bool,
+        launch: UsageLaunch,
     ) -> Self {
         let (preferences, error, preferences_writable) = match Preferences::load(&settings) {
             Ok(preferences) => (preferences, None, true),
@@ -77,6 +78,7 @@ impl Ledger {
             ),
             move || recent_context.request_repaint(),
         );
+        let usage = UsageState::start(&settings, preferences.usage_log, launch, started);
         spawn_file_worker(jobs, results, cancel, worker_scope, context, settings);
         let mut app = Self {
             reader: crate::viewer_ui::ReaderPanel::new(scope.clone(), creation.egui_ctx.clone()),
@@ -154,6 +156,7 @@ impl Ledger {
             search_results,
             search_generation,
             copy_modifiers: Modifiers::NONE,
+            usage,
             #[cfg(feature = "native-desktop-tests")]
             desktop_metrics: None,
         };
@@ -251,6 +254,7 @@ fn spawn_scan_worker(
                 continue;
             }
             let stale = || current.load(Ordering::Relaxed) != request.generation;
+            let started = Instant::now();
             let listing = if request.fallback {
                 files::list_directory_or_ancestor(&scope, &request.path, stale)
             } else {
@@ -276,6 +280,7 @@ fn spawn_scan_worker(
                     pane,
                     generation: request.generation,
                     content: ScanContent::Listing(listing),
+                    elapsed: started.elapsed(),
                 })
                 .is_err()
             {
@@ -296,6 +301,7 @@ fn spawn_scan_worker(
                         pane,
                         generation: request.generation,
                         content: ScanContent::Aggregate { path, result },
+                        elapsed: Duration::ZERO,
                     })
                     .is_err()
                 {
@@ -511,6 +517,7 @@ fn spawn_file_worker(
                 } => WorkResult::Located {
                     pane,
                     result: resolution.locate(&worker_scope, source),
+                    via: NavVia::CommandResult,
                 },
                 Work::Prepare {
                     id,
@@ -567,7 +574,20 @@ fn spawn_file_worker(
                 Work::LocateRecent { pane, path } => WorkResult::Located {
                     pane,
                     result: worker_scope.resolve(&path),
+                    via: NavVia::Recent,
                 },
+                // App-owned usage data, which may lie outside a fixture scope.
+                Work::OpenUsageFolder(folder) => WorkResult::OpenedUsageFolder(
+                    std::fs::create_dir_all(&folder)
+                        .map_err(|error| {
+                            format!(
+                                "Create usage folder {}: {error}",
+                                files::display_path(&folder)
+                            )
+                        })
+                        .and_then(|()| tomas_commander::usage::check_folder(&folder))
+                        .and_then(|_| platform::open_file(&folder)),
+                ),
                 Work::Copilot { path, app } => WorkResult::Copilot {
                     app,
                     result: worker_scope
@@ -577,6 +597,7 @@ fn spawn_file_worker(
                 Work::Locate { pane, result } => WorkResult::Located {
                     pane,
                     result: search::locate(&worker_scope, &result),
+                    via: NavVia::SearchResult,
                 },
                 Work::LocateAgent {
                     pane,

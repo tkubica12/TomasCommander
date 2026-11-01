@@ -117,8 +117,15 @@ impl Ledger {
     }
 
     pub(super) fn zoom_input(&mut self, ctx: &egui::Context) {
+        let before = self.preferences.zoom;
+        let wheel = ctx.input(|input| {
+            input.events.iter().any(|event| {
+                matches!(event, egui::Event::MouseWheel { modifiers, .. } if modifiers.ctrl)
+            })
+        });
         let requested = consume_ui_zoom(ctx, self.preferences.zoom);
         self.set_zoom(requested);
+        self.usage_zoom_input(before, wheel);
         if (ctx.zoom_factor() - self.preferences.zoom).abs() > 0.001 {
             ctx.set_zoom_factor(self.preferences.zoom);
         }

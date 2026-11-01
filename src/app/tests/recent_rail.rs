@@ -187,7 +187,7 @@ fn recent_single_click_locates_double_click_opens_and_slow_clicks_never_open() {
                 |ui| {
                     let (response, action) = recent_row(ui, &item, false, time < 0.15);
                     position = response.rect.center();
-                    actions.extend(action);
+                    actions.extend(action.map(|(action, _)| action));
                 },
             )
             .textures_delta
@@ -264,7 +264,7 @@ fn recent_row_context_menu_is_reachable_and_drag_uses_the_exact_physical_file() 
         .textures_delta
         .clear();
     }
-    assert_eq!(chosen, Some(RecentAction::Locate));
+    assert_eq!(chosen, Some((RecentAction::Locate, Via::ContextMenu)));
     for enabled in [false, true] {
         let ctx = egui::Context::default();
         let mut start = egui::pos2(30.0, 30.0);

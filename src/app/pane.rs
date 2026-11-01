@@ -539,10 +539,11 @@ impl Ledger {
     /// Opens `path` in pane `index`, recording the folder being left in Back history.
     /// Reloading the same folder (refresh, operation results) records nothing; an unavailable
     /// folder is an error unless a remembered folder is reloaded while still loading.
-    pub(super) fn navigate(&mut self, index: usize, path: PathBuf) {
+    pub(super) fn navigate(&mut self, index: usize, path: PathBuf, via: NavVia) {
         self.end_inline_edit();
-        let pane = &mut self.panes[index];
-        if pane.path != path {
+        if self.panes[index].path != path {
+            self.usage_navigate(index, &path, via);
+            let pane = &mut self.panes[index];
             let previous = pane.location();
             pane.history.record(previous);
         }
@@ -565,9 +566,19 @@ impl Ledger {
 
     /// Back (`forward == false`) or Forward in the active tab of pane `index`.
     pub(super) fn step_history(&mut self, index: usize, forward: bool) {
+        let from = self.panes[index].path.clone();
         if self.panes[index].step_history(&mut self.scans[index], forward) {
             self.end_inline_edit();
             self.file_focus_requested = true;
+            self.usage_arrived(
+                index,
+                from,
+                if forward {
+                    NavVia::HistoryForward
+                } else {
+                    NavVia::HistoryBack
+                },
+            );
         } else {
             let direction = if forward { "Forward" } else { "Back" };
             self.log(format!("{direction}: no more folders."));
@@ -611,16 +622,20 @@ impl Ledger {
         self.leave_tab(index);
         self.panes[index].open_tab();
         self.file_focus_requested = true;
+        self.usage_tab(index, "new");
     }
 
     pub(super) fn activate_tab(&mut self, index: usize, tab: usize) {
         if tab == self.panes[index].tab || tab >= self.panes[index].tabs.len() {
             return;
         }
+        let from = self.panes[index].path.clone();
         self.leave_tab(index);
         if self.panes[index].select_tab(tab) {
             self.load_active_tab(index);
         }
+        self.usage_tab(index, "switch");
+        self.usage_arrived(index, from, NavVia::TabSwitch);
     }
 
     pub(super) fn cycle_tab(&mut self, index: usize, forward: bool) {
@@ -628,10 +643,13 @@ impl Ledger {
             self.log("Only one tab is open in this pane.");
             return;
         }
+        let from = self.panes[index].path.clone();
         self.leave_tab(index);
         if self.panes[index].cycle_tab(forward) {
             self.load_active_tab(index);
         }
+        self.usage_tab(index, if forward { "next" } else { "previous" });
+        self.usage_arrived(index, from, NavVia::TabSwitch);
     }
 
     pub(super) fn close_tab(&mut self, index: usize, tab: usize) {
@@ -639,17 +657,26 @@ impl Ledger {
             self.log("The last tab cannot be closed.");
             return;
         }
+        let from = self.panes[index].path.clone();
         if tab == self.panes[index].tab {
             self.leave_tab(index);
         }
         if self.panes[index].close_tab(tab) == Some(true) {
             self.load_active_tab(index);
         }
+        self.usage_tab(index, "close");
+        self.usage_arrived(index, from, NavVia::TabSwitch);
     }
 
     pub(super) fn apply_tab_action(&mut self, index: usize, action: TabAction) {
         self.active = index;
         self.rail_index = None;
+        let (name, command) = match action {
+            TabAction::Activate(_) => ("/switch-tab", Command::NextTab),
+            TabAction::Close(_) => ("/close-tab", Command::CloseTab),
+            TabAction::New => ("/new-tab", Command::NewTab),
+        };
+        self.usage_action(name, Via::TabStrip, shortcut_hint(command));
         match action {
             TabAction::Activate(tab) => self.activate_tab(index, tab),
             TabAction::Close(tab) => self.close_tab(index, tab),
@@ -673,7 +700,7 @@ impl Ledger {
         }
     }
 
-    pub(super) fn parent(&mut self, index: usize) {
+    pub(super) fn parent(&mut self, index: usize, via: NavVia) {
         let path = self.panes[index].path.clone();
         if self.scope.root() == Some(path.as_path()) {
             self.log("Parent unavailable at fixture boundary.");
@@ -688,7 +715,7 @@ impl Ledger {
             }
         } else if let Some(parent) = path.parent() {
             let history = self.panes[index].remember_parent_return();
-            self.navigate(index, parent.to_owned());
+            self.navigate(index, parent.to_owned(), via);
             self.panes[index].parent_returns = history;
         }
     }
@@ -710,7 +737,7 @@ impl Ledger {
         };
         let mut history = std::mem::take(&mut self.panes[index].parent_returns);
         let location = history.pop().expect("Return history was checked above");
-        self.navigate(index, path);
+        self.navigate(index, path, NavVia::Return);
         let pane = &mut self.panes[index];
         pane.parent_returns = history;
         pane.focused = location.focused;
@@ -719,29 +746,44 @@ impl Ledger {
         pane.scroll_to_focus = false;
     }
 
-    pub(super) fn open_focused(&mut self) {
+    /// Enter or double-click (`via`) on the focused row: folders open in the pane, ZIPs in the
+    /// archive view, other files in their Windows application.
+    pub(super) fn open_focused(&mut self, via: NavVia) {
         let pane = &self.panes[self.active];
-        if pane.focused.is_none() {
-            self.parent(self.active);
+        let Some(path) = pane.focused.clone() else {
+            self.parent(self.active, NavVia::Parent);
+            return;
+        };
+        let Some(directory) = pane
+            .entries
+            .iter()
+            .find(|entry| entry.path == path)
+            .map(|entry| entry.directory)
+        else {
+            return;
+        };
+        if directory {
+            self.navigate(self.active, path, via);
             return;
         }
-        if let Some(path) = &pane.focused {
-            let entry = pane.entries.iter().find(|entry| &entry.path == path);
-            if let Some(entry) = entry {
-                if entry.directory {
-                    self.navigate(self.active, path.clone());
-                } else if path
-                    .extension()
-                    .is_some_and(|extension| extension.eq_ignore_ascii_case("zip"))
-                {
-                    if let Err(error) = self.archive.open_archive(self.active, path.clone()) {
-                        self.fail(error);
-                    }
-                } else {
-                    if let Err(error) = self.work.try_send(Work::Open(path.clone())) {
-                        self.fail(format!("Could not queue file opening: {error}"));
-                    }
-                }
+        let action = if via == NavVia::DoubleClick {
+            Via::DoubleClick
+        } else {
+            Via::Shortcut
+        };
+        self.usage_filter_opened(self.active);
+        if path
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("zip"))
+        {
+            self.usage_action("/open-zip", action, "Enter");
+            if let Err(error) = self.archive.open_archive(self.active, path) {
+                self.fail(error);
+            }
+        } else {
+            self.usage_action("/open", action, "Enter");
+            if let Err(error) = self.work.try_send(Work::Open(path)) {
+                self.fail(format!("Could not queue file opening: {error}"));
             }
         }
     }

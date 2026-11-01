@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+- Local usage log, on by default: commands with how they were invoked
+  (shortcut, button, context menu, drag, Ask palette or typed slash command),
+  unhandled keys such as F5 or Ctrl+C on a file row, navigation and its route,
+  filter and search sessions, Ask texts that matched nothing or were cancelled,
+  AI task prompts and outcomes (no answers), dialog outcomes, operations, errors,
+  slow frames, folders and preparation, plus 5-minute aggregated input counts.
+  Recording only queues a small event (never blocks or writes on the UI thread);
+  one background writer appends `usage\YYYY-MM-DD.jsonl` beside preferences with
+  90-day retention, a 20 MB daily and 200 MB total cap and a final flush of at
+  most 300 ms at exit. Nothing is sent anywhere; paths and Ask texts are
+  included, file contents, clipboard, AI answers and credentials never.
+  Settings > Usage log toggles it, shows the folder and size, opens the folder
+  and deletes the usage data after confirmation; fixture runs record nothing
+  without `--settings`. Preferences move to v7 (`usage_log=`; v1-v6 stay
+  readable).
+- Usage insights (`/usage`): a background report for the last 7, 30 or 90 days
+  with keyboard/mouse share per command, shortcut opportunities, unhandled keys,
+  unmet Ask texts, cancelled dialogs, errors, slow work, most visited folders,
+  Places candidates and session time; Export Markdown report writes
+  `usage\report-YYYY-MM-DD.md`. `--usage-report [--days N] [--settings <file>]
+  [--out <file>]` writes the same report without opening a window.
 - Pane tabs: Ctrl+T opens the current folder in a new tab, Ctrl+W closes the
   active tab (never the last one), Ctrl+Tab / Ctrl+Shift+Tab cycle tabs; also
   `/new-tab`, `/close-tab`, `/next-tab`, `/previous-tab`. Each tab keeps its

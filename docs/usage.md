@@ -243,6 +243,47 @@ modification time in UTC. They share a bounded watched in-memory cache.
 Refresh forces revalidation. Remote/unmonitored/partial values have warnings.
 See [cache policy](decisions/directory-cache.md).
 
+## Usage log
+
+Tomas Commander records a local usage log so you can review periodically, for
+example with an AI assistant, how you actually use it: which commands you run
+and whether by shortcut, mouse or Ask; keys that did nothing (such as F5 or
+Delete out of habit); folders you navigate to and how; filter and search
+queries; Ask texts that found nothing or were cancelled; dialogs you confirm or
+cancel; operations and their results; errors; and slow folders, actions and
+frames. Typing is only counted, never logged per key.
+
+**Nothing is sent anywhere.** The log stays in `usage\` beside the
+preferences file (`%LOCALAPPDATA%\TomasCommander\usage\`, or beside the file
+given with `--settings`) as one `YYYY-MM-DD.jsonl` file per day. It contains
+full folder/file paths and Ask texts, but never file contents, edited text,
+clipboard contents, AI answers or credentials. Files older than 90 days are
+deleted at startup; a day file stops at 20 MB and the folder at 200 MB.
+Recording never waits for the disk: a background thread writes every few
+seconds and the final write at exit waits at most 300 ms.
+
+**Settings > Usage log** turns recording on or off (on by default), shows the
+folder and its size, opens the folder and offers **Delete usage data**, which
+after confirmation permanently deletes only the usage log files and exported
+reports in that folder. Fixture runs (`--fixture-root`) record nothing unless
+they also pass `--settings`.
+
+`/usage` (Ask: *Usage insights*) shows a report for the last 7, 30 or 90 days,
+computed in the background: commands with their keyboard/mouse/Ask share and
+shortcut opportunities, unhandled keys, unmet Ask texts, most cancelled
+dialogs, errors, slow work, most visited folders and Places candidates (folders
+repeatedly reached through 3+ navigation steps), tabs/history, search, AI tasks
+and session time. **Export Markdown report** writes
+`usage\report-YYYY-MM-DD.md` and copies its path. Without opening a window:
+
+```powershell
+.\tomas-commander.exe --usage-report --days 30 --out "$env:TEMP\usage-report.md"
+```
+
+`--settings <preferences file>` reads another usage folder; without `--out`
+the report goes to standard output (redirect it, because release builds have no
+console). See [usage log](decisions/usage-log.md) for every recorded field.
+
 ## Reader
 
 Ctrl+Enter uses the opposite pane as a reader. Repeating it on the same document
@@ -324,8 +365,8 @@ The workspace rail starts collapsed on every launch. Use its `>` / `<` controls
 to expand/collapse it, or Ctrl+Shift+H to toggle it. Opening selects Recent.
 The Places tab has no dedicated shortcut; saved places remain available through
 the separate Alt+Up chooser while the rail is collapsed.
-Settings has separate Appearance, Recent activity and AI connections tabs;
-appearance controls stay immediate, while watched-folder changes use Apply.
+Settings has separate Appearance, Recent activity, AI connections and Usage log
+tabs; appearance controls stay immediate, while watched-folder changes use Apply.
 
 Ctrl+Space opens Ask, with multiline input for AI and commands. Every existing action has a
 slash command, for example `/rename`, `/preview`, `/settings` or `/copilot-cli`.
@@ -353,9 +394,10 @@ replaces it or the application closes.
 `/search query` prefills it without sending anything to a provider.
 There is no separate AI-search toolbar button.
 
-Preferences: `%LOCALAPPDATA%\TomasCommander\preferences.txt`. v1-v5 remain
-readable; v5 added watched Recent folders and v6 adds each pane's tab folders
-and active tab (`tabs=` line). Appearance, zoom, favorites/names, tabs and
+Preferences: `%LOCALAPPDATA%\TomasCommander\preferences.txt`. v1-v6 remain
+readable; v5 added watched Recent folders, v6 each pane's tab folders and
+active tab (`tabs=` line) and v7 the usage-log switch (`usage_log=`, on when
+missing). Appearance, zoom, favorites/names, tabs, the usage-log switch and
 Recent folder settings persist. Activity is stored separately in
 `recent-activity.json` beside preferences; legacy Recent entries migrate using
 known modification times, not invented opening times. Operations use a durable

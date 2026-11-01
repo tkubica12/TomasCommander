@@ -11,6 +11,8 @@ pub(super) struct ScanResult {
     pub(super) pane: usize,
     pub(super) generation: u64,
     pub(super) content: ScanContent,
+    /// Time the worker spent listing the folder (zero for aggregates).
+    pub(super) elapsed: Duration,
 }
 pub(super) enum ScanContent {
     /// The listing and, after a fallback, the requested folder that was not available.
@@ -239,6 +241,7 @@ pub(super) enum Work {
         pane: usize,
         path: PathBuf,
     },
+    OpenUsageFolder(PathBuf),
     Copilot {
         path: PathBuf,
         app: bool,
@@ -283,6 +286,7 @@ pub(super) enum WorkResult {
     Code(FileResult<()>),
     Open(FileResult<PathBuf>),
     OpenFileWith(FileResult<()>),
+    OpenedUsageFolder(FileResult<()>),
     Copilot {
         app: bool,
         result: FileResult<()>,
@@ -290,6 +294,7 @@ pub(super) enum WorkResult {
     Located {
         pane: usize,
         result: FileResult<PathBuf>,
+        via: NavVia,
     },
     AgentLocated {
         pane: usize,
@@ -375,6 +380,7 @@ impl Ledger {
     }
 
     fn finish_operation(&mut self, outcome: Outcome, activity: RecentActivity) {
+        self.usage_operation_finished(&outcome);
         self.operation_busy = false;
         self.history = None;
         if let Err(error) = self.recent.record_many(
@@ -417,7 +423,7 @@ impl Ledger {
             self.fail(error);
         }
         for index in 0..2 {
-            self.navigate(index, self.panes[index].path.clone());
+            self.navigate(index, self.panes[index].path.clone(), NavVia::Other);
         }
         self.last_outcome = Some(outcome);
         if self.operations_open {
@@ -461,7 +467,7 @@ impl Ledger {
                                 .iter()
                                 .any(|entry| changes.paths.contains(&entry.path))
                         {
-                            self.navigate(index, self.panes[index].path.clone());
+                            self.navigate(index, self.panes[index].path.clone(), NavVia::Other);
                         }
                     }
                 }
@@ -490,6 +496,7 @@ impl Ledger {
             if !self.scans[result.pane].current(result.generation) {
                 continue;
             }
+            let elapsed = result.elapsed;
             let pane = &mut self.panes[result.pane];
             let listing = match result.content {
                 ScanContent::Listing(listing) => listing,
@@ -511,6 +518,7 @@ impl Ledger {
                     if result.pane == self.active {
                         self.file_focus_requested = true;
                     }
+                    self.usage_scan_finished(result.pane, elapsed);
                     if let Some(note) = note {
                         self.log(note);
                     }
@@ -556,15 +564,23 @@ impl Ledger {
                         }
                     }
                 },
-                WorkResult::ArchiveOpened(result) => match result {
-                    Ok(path) => {
-                        if let Err(error) = self.recent.record(path, RecentActivity::Opened) {
-                            self.fail(error);
+                WorkResult::ArchiveOpened(result) => {
+                    let ok = result.is_ok();
+                    self.usage.log.record(|| {
+                        Event::new("zip")
+                            .with("action", "member_open")
+                            .with("ok", ok)
+                    });
+                    match result {
+                        Ok(path) => {
+                            if let Err(error) = self.recent.record(path, RecentActivity::Opened) {
+                                self.fail(error);
+                            }
+                            self.log("Temporary ZIP copy opened; edits in the external app do not update the archive.");
                         }
-                        self.log("Temporary ZIP copy opened; edits in the external app do not update the archive.");
+                        Err(error) => self.fail(error),
                     }
-                    Err(error) => self.fail(error),
-                },
+                }
                 WorkResult::CommandResolved(result) => {
                     self.operation_busy = false;
                     if let Some(dialog) = &mut self.command_dialog {
@@ -628,6 +644,9 @@ impl Ledger {
                 }
                 WorkResult::NamePrepared(result) => {
                     self.operation_busy = false;
+                    // A new folder executes straight from preparation, so this result means its
+                    // pending operation failed or was cancelled; renames start timing on approval.
+                    self.usage.operation = None;
                     if self.cancellation.load(Ordering::Acquire) {
                         self.log("Name change cancelled; no effects.");
                         continue;
@@ -734,6 +753,11 @@ impl Ledger {
                         self.fail(error);
                     }
                 }
+                WorkResult::OpenedUsageFolder(result) => {
+                    if let Err(error) = result {
+                        self.fail(error);
+                    }
+                }
                 WorkResult::Copilot { app, result } => match result {
                     Ok(()) => self.log(if app {
                         "GitHub Copilot App launch requested."
@@ -742,11 +766,11 @@ impl Ledger {
                     }),
                     Err(error) => self.fail(error),
                 },
-                WorkResult::Located { pane, result } => match result {
+                WorkResult::Located { pane, result, via } => match result {
                     Ok(path) => {
                         if let Some(parent) = path.parent() {
                             self.active = pane;
-                            self.navigate(pane, parent.to_owned());
+                            self.navigate(pane, parent.to_owned(), via);
                             self.panes[pane].focused = Some(path);
                             self.file_focus_requested = true;
                         }
@@ -767,10 +791,10 @@ impl Ledger {
                         let directory = path.is_dir();
                         if directory {
                             self.active = pane;
-                            self.navigate(pane, path);
+                            self.navigate(pane, path, NavVia::AiResult);
                         } else if let Some(parent) = path.parent() {
                             self.active = pane;
-                            self.navigate(pane, parent.to_owned());
+                            self.navigate(pane, parent.to_owned(), NavVia::AiResult);
                             self.panes[pane].focused = Some(path);
                         }
                     }

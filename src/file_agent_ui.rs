@@ -31,6 +31,20 @@ pub struct FileAgentPanel {
     index: usize,
     focus_prompt: bool,
     unread: bool,
+    started: Option<std::time::Instant>,
+    continuation: bool,
+    /// A finished (or refused) task for the usage log; taken by the application.
+    pub finished: Option<TaskUsage>,
+}
+
+/// Prompt, outcome and size of one AI task; no answer content.
+pub struct TaskUsage {
+    pub prompt: String,
+    pub outcome: &'static str,
+    pub calls: u32,
+    pub results: usize,
+    pub duration_ms: u64,
+    pub continuation: bool,
 }
 
 pub enum Action {
@@ -39,6 +53,8 @@ pub enum Action {
         settings: Box<Settings>,
         record: Observed,
         preview: bool,
+        /// Position of the chosen result (0 = first).
+        rank: usize,
     },
     Settings,
 }
@@ -62,6 +78,9 @@ impl FileAgentPanel {
             index: 0,
             focus_prompt: false,
             unread: false,
+            started: None,
+            continuation: false,
+            finished: None,
         }
     }
 
@@ -228,9 +247,19 @@ impl FileAgentPanel {
             Ok(request) => request,
             Err(error) => {
                 self.error = Some(error);
+                self.finished = Some(TaskUsage {
+                    prompt: self.prompt.clone(),
+                    outcome: "not_started",
+                    calls: 0,
+                    results: 0,
+                    duration_ms: 0,
+                    continuation,
+                });
                 return;
             }
         };
+        self.started = Some(std::time::Instant::now());
+        self.continuation = continuation;
         if !continuation {
             self.outcome = None;
             self.snapshot = State::default();
@@ -300,6 +329,24 @@ impl FileAgentPanel {
                         std::time::Instant::now(),
                     ));
                 }
+            }
+            if let Some(outcome) = &self.outcome {
+                self.finished = Some(TaskUsage {
+                    prompt: self.prompt.clone(),
+                    outcome: match outcome.status {
+                        Status::Done => "completed",
+                        Status::Clarify => "clarify",
+                        Status::Capped => "capped",
+                        Status::Failed => "failed",
+                        Status::Cancelled => "cancelled",
+                    },
+                    calls: outcome.state.calls,
+                    results: outcome.files.len(),
+                    duration_ms: self.started.take().map_or(outcome.elapsed_ms, |started| {
+                        started.elapsed().as_millis() as u64
+                    }),
+                    continuation: self.continuation,
+                });
             }
             self.unread = !self.open;
         }
@@ -489,6 +536,7 @@ impl FileAgentPanel {
                     settings: Box::new(settings.clone()),
                     record: record.clone(),
                     preview,
+                    rank: index,
                 });
                 close = true;
             }

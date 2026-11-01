@@ -1,6 +1,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -20,6 +20,7 @@ use tomas_commander::{
     preferences::Preferences,
     recent::{self, Activity as RecentActivity},
     search,
+    usage::{Event, UsageLog},
 };
 
 mod command_dialog;
@@ -37,11 +38,13 @@ mod setup;
 #[cfg(test)]
 mod tests;
 mod theme;
+mod usage_ui;
 mod work;
 
+pub use self::usage_ui::UsageLaunch;
 use self::{
     command_dialog::*, dialogs::*, drag::*, palette::*, pane::*, recent_rail::*, search_dialog::*,
-    theme::*, work::*,
+    theme::*, usage_ui::*, work::*,
 };
 pub(crate) use self::{
     dialogs::confirmation_buttons,
@@ -145,6 +148,7 @@ pub struct Ledger {
     search_results: Receiver<(u64, FileResult<search::Results>)>,
     search_generation: Arc<AtomicU64>,
     copy_modifiers: Modifiers,
+    usage: UsageState,
     #[cfg(feature = "native-desktop-tests")]
     desktop_metrics: Option<crate::desktop_metrics::Metrics>,
 }
@@ -160,13 +164,13 @@ impl Ledger {
     pub fn enable_answer_ui_test(&mut self) {
         self.ai.answer_test_mode = true;
         self.answers.enable_test();
-        self.dispatch(Command::Answers);
+        self.dispatch(Via::Other, Command::Answers);
     }
 
     #[cfg(feature = "native-search-tests")]
     pub fn enable_search_ui_test(&mut self) {
         self.ai.test_scenario = Some(crate::ai_ui::SearchTestScenario::Ambiguous);
-        self.dispatch(Command::AiSearch);
+        self.dispatch(Via::Other, Command::AiSearch);
         if let Some(dialog) = &mut self.search_dialog {
             dialog.query = "Synthetic failure-state test; no provider request.".into();
         }
@@ -204,10 +208,12 @@ impl Ledger {
             && self.drives_popup.is_none()
             && self.place_edit.is_none()
             && !self.reader.dirty()
+            && self.usage.insights.is_none()
     }
 
     fn fail(&mut self, message: impl Into<String>) {
         let message = message.into();
+        self.usage_error(&message);
         self.log(format!("ERROR / {message}"));
         self.error = Some(message);
     }

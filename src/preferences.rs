@@ -17,6 +17,8 @@ pub struct Preferences {
     pub recent_roots: Option<Vec<PathBuf>>,
     /// Saved tab folders of the left and right pane; `None` opens the launch folder.
     pub tabs: [Option<PaneTabs>; 2],
+    /// Whether the local usage log records (v7; earlier files mean on).
+    pub usage_log: bool,
 }
 
 impl Default for Preferences {
@@ -30,6 +32,7 @@ impl Default for Preferences {
             recent_documents: Vec::new(),
             recent_roots: None,
             tabs: [None, None],
+            usage_log: true,
         }
     }
 }
@@ -193,6 +196,7 @@ impl Preferences {
                     | "TomasCommander preferences v4"
                     | "TomasCommander preferences v5"
                     | "TomasCommander preferences v6"
+                    | "TomasCommander preferences v7"
             )
         ) {
             return Err(
@@ -247,6 +251,12 @@ impl Preferences {
                     pane.validate()?;
                 }
                 preferences.tabs = tabs;
+            } else if let Some(value) = line.strip_prefix("usage_log=") {
+                preferences.usage_log = match value {
+                    "true" => true,
+                    "false" => false,
+                    _ => return Err("Invalid usage log preference.".into()),
+                };
             } else if let Some(value) = line.strip_prefix("recent=") {
                 let path = PathBuf::from(value);
                 if !document_path(&path) || preferences.recent_documents.len() >= Self::MAX_RECENT {
@@ -279,8 +289,8 @@ impl Preferences {
             .as_nanos();
         let temporary = parent.join(format!("preferences-{nonce}.tmp"));
         let mut text = format!(
-            "TomasCommander preferences v6\ndark={}\naccent={}\nzoom={}\n",
-            self.dark, self.accent, self.zoom
+            "TomasCommander preferences v7\ndark={}\naccent={}\nzoom={}\nusage_log={}\n",
+            self.dark, self.accent, self.zoom, self.usage_log
         );
         if let Some(roots) = &self.recent_roots {
             validate_recent_roots(roots)?;

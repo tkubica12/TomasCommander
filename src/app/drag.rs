@@ -234,8 +234,22 @@ impl Ledger {
                     };
                     egui::DragAndDrop::clear_payload(ctx);
                     ctx.data_mut(|data| data.remove::<bool>(Id::new("file-drag-reveal-target")));
+                    let items = payload.count();
+                    let zip = matches!(&*payload, DragItems::Zip { .. });
                     let result = paths.and_then(|paths| {
                         platform::external_drag::copy_files(&paths, reveal_target)
+                    });
+                    let outcome = match &result {
+                        Ok(true) => "accepted",
+                        Ok(false) => "cancelled",
+                        Err(_) => "error",
+                    };
+                    self.usage.log.record(|| {
+                        Event::new("external_drag")
+                            .with("items", items)
+                            .with("zip", zip)
+                            .with("alt", reveal_target)
+                            .with("result", outcome)
                     });
                     ctx.input_mut(|input| input.pointer = Default::default());
                     ctx.request_repaint();
@@ -344,6 +358,8 @@ impl Ledger {
         }
         match drop_work(self.next_id, items, target, copy) {
             Ok(Some(job)) => {
+                let command = if copy { Command::Copy } else { Command::Move };
+                self.usage_action(command.slash(), Via::Drag, shortcut_hint(command));
                 self.reader.close();
                 self.cancellation.store(false, Ordering::Release);
                 match self.work.try_send(job) {

@@ -2,12 +2,14 @@ use super::*;
 
 impl eframe::App for Ledger {
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.usage_session_end();
         if let Err(error) = self.recent.shutdown() {
             platform::show_error(&error);
         }
     }
 
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.usage_frame_begin(ctx);
         enforce_stable_minimum_window_size(ctx, &mut self.viewport_zoom, self.preferences.zoom);
         self.zoom_input(ctx);
         #[cfg(feature = "native-desktop-tests")]
@@ -19,6 +21,7 @@ impl eframe::App for Ledger {
         self.answers.poll();
         self.reader.poll();
         self.archive.poll();
+        self.usage_panels();
         if let Some(path) = self.archive.recent_activity.take()
             && let Err(error) = self.recent.record(path, RecentActivity::Opened)
         {
@@ -75,10 +78,10 @@ impl eframe::App for Ledger {
         }
         self.poll(ctx);
         if std::mem::take(&mut self.reader.edit_requested) {
-            self.dispatch(Command::EditSource);
+            self.dispatch(Via::Button, Command::EditSource);
         }
         if std::mem::take(&mut self.reader.save_requested) {
-            self.dispatch(Command::SaveSource);
+            self.dispatch(Via::Button, Command::SaveSource);
         }
         if let Some(entry) = self.archive.preview_entry.take() {
             let (path, _) = self.archive.archive_location();
@@ -131,12 +134,14 @@ impl eframe::App for Ledger {
             || self.ai.open
             || self.file_agent.open
             || self.answers.open
+            || self.usage.insights.is_some()
         {
             ui.disable();
         }
         self.handle_close_request(&ctx);
         if self.first_frame {
             self.first_frame = false;
+            self.usage_session_start(&ctx);
             self.log(format!(
                 "Native Ledger initialized in {:.0} ms / real filesystem",
                 self.started.elapsed().as_secs_f64() * 1000.0
@@ -157,7 +162,15 @@ impl eframe::App for Ledger {
                     settings,
                     record,
                     preview,
+                    rank,
                 } => {
+                    let path = files::display_path(&record.path);
+                    self.usage.log.record(|| {
+                        Event::new("ai_result")
+                            .with("rank", rank)
+                            .with("preview", preview)
+                            .with("path", path)
+                    });
                     if let Err(error) = self.work.try_send(Work::LocateAgent {
                         pane,
                         settings,
@@ -171,6 +184,7 @@ impl eframe::App for Ledger {
         }
         self.answers.show(&ctx);
         self.finish_drag(&ctx);
+        self.usage_frame_end(&ctx);
         #[cfg(feature = "native-desktop-tests")]
         if let Some(metrics) = &mut self.desktop_metrics {
             let listing_ready = self.panes.iter().all(|pane| !pane.busy) && self.error.is_none();
@@ -248,15 +262,16 @@ impl Ledger {
                     };
                     ui.with_layout(layout, |ui| {
                         if ui.button("Settings").clicked() {
-                            self.dispatch(Command::Settings);
+                            self.dispatch(Via::Button, Command::Settings);
                         }
                         #[cfg(feature = "native-desktop-tests")]
                         if self.desktop_metrics.is_some()
                             && ui.button("Command guard tests").clicked()
                         {
-                            self.dispatch(Command::AiPlan);
+                            self.dispatch(Via::Other, Command::AiPlan);
                         }
                         if action_button(ui, "Ask", "Ctrl Space", true).clicked() {
+                            self.usage_action("/ask", Via::Button, "Ctrl Space");
                             self.palette = true;
                             self.palette_focus = true;
                             self.palette_command_selection = false;
@@ -275,7 +290,7 @@ impl Ledger {
                         )
                         .clicked()
                         {
-                            self.dispatch(Command::Theme);
+                            self.dispatch(Via::Button, Command::Theme);
                         }
                         if action_button(
                             ui,
@@ -285,7 +300,7 @@ impl Ledger {
                         )
                         .clicked()
                         {
-                            self.dispatch(Command::Accent);
+                            self.dispatch(Via::Button, Command::Accent);
                         }
                     });
                 });
@@ -309,14 +324,14 @@ impl Ledger {
                     .add_enabled(available, egui::Button::new("? Help"))
                     .clicked()
                 {
-                    self.dispatch(Command::Help);
+                    self.dispatch(Via::Button, Command::Help);
                 }
                 if ui
                     .button(format!("{:.0}%", self.preferences.zoom * 100.0))
                     .on_hover_text("UI zoom / click to reset / Ctrl +, Ctrl -, Ctrl wheel")
                     .clicked()
                 {
-                    self.dispatch(Command::ZoomReset);
+                    self.dispatch(Via::Button, Command::ZoomReset);
                 }
                 if ui
                     .button(if self.operation_busy {
@@ -330,10 +345,12 @@ impl Ledger {
                     })
                     .clicked()
                 {
+                    self.usage_action("/operations", Via::Button, "");
                     self.operations_open = true;
                     self.request_history();
                 }
                 if self.operation_busy && ui.button("Cancel work").clicked() {
+                    self.usage_action("/cancel-work", Via::Button, "");
                     self.cancellation.store(true, Ordering::Relaxed);
                 }
                 ui.add(
@@ -365,7 +382,7 @@ impl Ledger {
                 ] {
                     let response = action_button(ui, label, hint, !self.operation_busy && self.plan.is_none());
                     if response.clicked() {
-                        self.dispatch(command);
+                        self.dispatch(Via::Button, command);
                     }
                     if matches!(command, Command::CopilotCli) {
                         response.on_hover_text("Runs copilot --yolo in this folder. The CLI can act without permission prompts.");

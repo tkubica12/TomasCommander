@@ -26,6 +26,7 @@ pub(super) enum SettingsTab {
     Appearance,
     Recent,
     Connections,
+    Usage,
 }
 
 impl Ledger {
@@ -39,6 +40,14 @@ impl Ledger {
             return;
         }
         let dialog = self.name_dialog.take().expect("name dialog present");
+        if dialog.source.is_none() {
+            // New folder executes without a review; its timing starts here.
+            self.usage.operation = Some(PendingOperation::named(
+                "new_folder",
+                1,
+                Some(&dialog.folder),
+            ));
+        }
         self.cancellation.store(false, Ordering::Release);
         match self.work.try_send(Work::PrepareName {
             id: self.next_id,
@@ -51,7 +60,10 @@ impl Ledger {
                 self.operation_busy = true;
                 self.log("Preparing exact name change.");
             }
-            Err(error) => self.fail(format!("Name change was not queued: {error}")),
+            Err(error) => {
+                self.usage.operation = None;
+                self.fail(format!("Name change was not queued: {error}"))
+            }
         }
     }
 
@@ -61,6 +73,7 @@ impl Ledger {
             || self.place_edit_dialog(ctx)
             || self.settings_dialog(ctx)
             || self.operations_dialog(ctx)
+            || self.usage_insights_dialog(ctx)
             || self.open_with_dialog(ctx)
         {
             return;
@@ -96,10 +109,18 @@ impl Ledger {
             if close || selected.is_some() {
                 self.drives_popup = None;
                 self.file_focus_requested = true;
+                self.usage.outcome(
+                    "drive_picker",
+                    if selected.is_some() {
+                        "confirmed"
+                    } else {
+                        "cancelled"
+                    },
+                );
             }
             if let Some(path) = selected {
                 self.active = pane;
-                self.navigate(pane, path);
+                self.navigate(pane, path, NavVia::Drive);
             }
             return true;
         }
@@ -124,7 +145,9 @@ impl Ledger {
             if cancel || modal.should_close() {
                 self.place_edit = None;
                 self.error = None;
+                self.usage.outcome("place_name", "cancelled");
             } else if save {
+                self.usage.outcome("place_name", "confirmed");
                 let (path, name) = self.place_edit.clone().expect("place edit present");
                 match self.preferences.name_favorite(path, name) {
                     Ok(()) => {
@@ -148,7 +171,7 @@ impl Ledger {
                 ui.set_width(660.0);
                 ui.heading("Settings");
                 ui.horizontal(|ui| {
-                    for (tab, label) in [(SettingsTab::Appearance, "Appearance"), (SettingsTab::Recent, "Recent activity"), (SettingsTab::Connections, "AI connections")] {
+                    for (tab, label) in [(SettingsTab::Appearance, "Appearance"), (SettingsTab::Recent, "Recent activity"), (SettingsTab::Connections, "AI connections"), (SettingsTab::Usage, "Usage log")] {
                         ui.selectable_value(&mut self.settings_tab, tab, label);
                     }
                 });
@@ -158,13 +181,13 @@ impl Ledger {
                 SettingsTab::Appearance => {
                 ui.heading("Appearance");
                 ui.label("Theme, accent and scale for the entire application.");
-                if ui.button(if self.preferences.dark { "Switch to light mode" } else { "Switch to dark mode" }).clicked() { self.dispatch(Command::Theme); }
-                if ui.button(format!("Accent: {}", ACCENTS[self.preferences.accent].0)).clicked() { self.dispatch(Command::Accent); }
+                if ui.button(if self.preferences.dark { "Switch to light mode" } else { "Switch to dark mode" }).clicked() { self.dispatch(Via::Button, Command::Theme); }
+                if ui.button(format!("Accent: {}", ACCENTS[self.preferences.accent].0)).clicked() { self.dispatch(Via::Button, Command::Accent); }
                 ui.horizontal(|ui| {
-                    if ui.button("-").clicked() { self.dispatch(Command::ZoomOut); }
+                    if ui.button("-").clicked() { self.dispatch(Via::Button, Command::ZoomOut); }
                     ui.label(format!("UI zoom: {:.0}%", self.preferences.zoom * 100.0));
-                    if ui.button("+").clicked() { self.dispatch(Command::ZoomIn); }
-                    if ui.button("Reset").clicked() { self.dispatch(Command::ZoomReset); }
+                    if ui.button("+").clicked() { self.dispatch(Via::Button, Command::ZoomIn); }
+                    if ui.button("Reset").clicked() { self.dispatch(Via::Button, Command::ZoomReset); }
                 });
                 },
                 SettingsTab::Recent => {
@@ -199,6 +222,7 @@ impl Ledger {
                 connection = ui.button("Foundry connection / advanced pilot").clicked();
                 ui.label("Connection configuration and explicit pilot controls stay separate from everyday file work.");
                 },
+                SettingsTab::Usage => self.usage_settings_ui(ui),
                 }
                 });
                 if let Some(error) = &self.error { ui.colored_label(ui.visuals().error_fg_color, error); }
@@ -210,6 +234,7 @@ impl Ledger {
                 self.ai.open = true;
             } else if close || modal.should_close() {
                 self.settings_open = false;
+                self.usage.delete_confirm = false;
             }
             return true;
         }
@@ -295,6 +320,8 @@ impl Ledger {
             if close || modal.should_close() {
                 self.operations_open = false;
             } else if let Some(key) = undo {
+                self.usage.outcome("operations", "confirmed");
+                self.usage.last_command = "/undo";
                 self.operations_open = false;
                 self.prepare_undo(Some(key));
             }
@@ -335,7 +362,13 @@ impl Ledger {
             });
             if close || modal.should_close() {
                 self.open_with = None;
+                self.usage.outcome("open_with", "cancelled");
             } else if let Some(index) = chosen {
+                self.usage.outcome("open_with", "confirmed");
+                let choice = ["vscode", "copilot_cli", "copilot_app"][index.min(2)];
+                self.usage
+                    .log
+                    .record(|| Event::new("open_with").with("choice", choice));
                 let job = match index {
                     0 => Work::Code(folder),
                     1 => Work::Copilot {
@@ -359,6 +392,11 @@ impl Ledger {
 
     fn name_change_dialog(&mut self, ctx: &egui::Context) -> bool {
         if let Some(dialog) = &mut self.name_dialog {
+            let usage_name = if dialog.source.is_some() {
+                "rename"
+            } else {
+                "new_folder"
+            };
             let mut prepare = false;
             let mut close = false;
             let modal = egui::Modal::new(Id::new("name-dialog")).show(ctx, |ui| {
@@ -403,10 +441,12 @@ impl Ledger {
             });
             if close || modal.should_close() {
                 self.name_dialog = None;
+                self.usage.outcome(usage_name, "cancelled");
             } else if prepare {
                 if let Err(error) = tomas_commander::naming::validate_name(&dialog.name) {
                     dialog.error = Some(error);
                 } else {
+                    self.usage.outcome(usage_name, "confirmed");
                     self.prepare_name_change();
                 }
             }
@@ -436,7 +476,9 @@ impl Ledger {
             close |= modal.should_close();
             if close {
                 self.zip_dialog = None;
+                self.usage.outcome("zip_name", "cancelled");
             } else if prepare && let Some(dialog) = self.zip_dialog.take() {
+                self.usage.outcome("zip_name", "confirmed");
                 if dialog.name.is_empty() || dialog.name.contains(['/', '\\', ':']) {
                     self.fail("ZIP output must be one filename inside the displayed destination, not a path.");
                 } else {
@@ -585,20 +627,30 @@ impl Ledger {
                 self.inline_pending = None;
                 self.place_edit = edit;
             }
+            if selected.is_some() || pin || close || modal.should_close() {
+                self.usage.outcome(
+                    "places",
+                    if selected.is_some() || pin {
+                        "confirmed"
+                    } else {
+                        "cancelled"
+                    },
+                );
+            }
             if selected.is_some() || close || modal.should_close() {
                 self.places_popup = None;
                 self.file_focus_requested = true;
             }
             if let Some(path) = selected {
                 match self.scope.resolve(&path) {
-                    Ok(path) if path.is_dir() => self.navigate(self.active, path),
+                    Ok(path) if path.is_dir() => self.navigate(self.active, path, NavVia::Place),
                     Ok(_) => self.fail("Saved place is no longer a directory."),
                     Err(error) => self.fail(error),
                 }
             }
             if pin {
                 self.places_popup = None;
-                self.dispatch(Command::Pin);
+                self.dispatch(Via::Button, Command::Pin);
                 self.file_focus_requested = true;
             }
             return true;
@@ -608,6 +660,7 @@ impl Ledger {
 
     fn change_approval_dialog(&mut self, ctx: &egui::Context) {
         if let Some(plan) = &self.change_plan {
+            let usage_name = change_name(plan);
             let mut approve = false;
             let mut cancel = false;
             let undo = matches!(plan, Change::Undo(_));
@@ -623,6 +676,7 @@ impl Ledger {
             cancel |= modal.should_close();
             if cancel {
                 self.change_plan = None;
+                self.usage.outcome(usage_name, "cancelled");
                 self.log(if undo {
                     "Undo cancelled; no changes."
                 } else {
@@ -630,6 +684,17 @@ impl Ledger {
                 });
             }
             if approve && let Some(plan) = self.change_plan.take() {
+                self.usage.outcome(usage_name, "confirmed");
+                if let Change::Save(save) = &plan {
+                    let ext = save
+                        .source()
+                        .extension()
+                        .map(|ext| ext.to_string_lossy().to_lowercase());
+                    self.usage
+                        .log
+                        .record(|| Event::new("editor_save").with("ext", ext));
+                }
+                self.usage.operation = Some(PendingOperation::change(&plan));
                 self.cancellation.store(false, Ordering::Relaxed);
                 match self.work.try_send(Work::Change(plan)) {
                     Ok(()) => {
@@ -640,7 +705,10 @@ impl Ledger {
                             "Executing exactly approved source change..."
                         });
                     }
-                    Err(error) => self.fail(format!("Source change was not queued: {error}")),
+                    Err(error) => {
+                        self.usage.operation = None;
+                        self.fail(format!("Source change was not queued: {error}"))
+                    }
                 }
             }
         }
@@ -650,6 +718,7 @@ impl Ledger {
         let Some(plan) = &self.plan else {
             return;
         };
+        let usage_name = review_name(plan);
         let review = self.review.get_or_insert_with(|| PlanReview::new(plan));
         let mut action = None;
         // The first plan's id keeps the dialog and its focus stable while re-planning.
@@ -670,23 +739,38 @@ impl Ledger {
                 }
                 self.plan = None;
                 self.review = None;
+                self.usage.outcome(usage_name, "cancelled");
                 self.log("Plan cancelled. No filesystem changes.");
                 self.file_focus_requested = true;
             }
             Some(ReviewAction::Approve) => {
                 if let Some(plan) = self.plan.take() {
                     self.review = None;
+                    let pending = PendingOperation::plan(&plan);
+                    match pending.policy {
+                        Some(policy) => self.usage.outcome_with(
+                            usage_name,
+                            "confirmed",
+                            format!("policy={policy} changes={}", self.usage.policy_changes),
+                        ),
+                        None => self.usage.outcome(usage_name, "confirmed"),
+                    }
+                    self.usage.operation = Some(pending);
                     self.cancellation.store(false, Ordering::Relaxed);
                     match self.work.try_send(Work::Execute(plan)) {
                         Ok(()) => {
                             self.operation_busy = true;
                             self.log("Executing approved plan...");
                         }
-                        Err(error) => self.fail(format!("Operation was not queued: {error}")),
+                        Err(error) => {
+                            self.usage.operation = None;
+                            self.fail(format!("Operation was not queued: {error}"))
+                        }
                     }
                 }
             }
             Some(ReviewAction::Policy(policy)) => {
+                self.usage.policy_changes += 1;
                 if let (Some(plan), Some(review)) = (&self.plan, &mut self.review)
                     && let Some(policy) = review.select(policy, plan)
                 {
@@ -706,6 +790,7 @@ impl Ledger {
             return;
         };
         self.cancellation.store(false, Ordering::Relaxed);
+        self.usage.last_command = "/conflict-policy";
         let result = self.work.try_send(job);
         let Some(review) = &mut self.review else {
             return;

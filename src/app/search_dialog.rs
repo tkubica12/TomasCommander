@@ -22,6 +22,46 @@ pub(super) struct SearchDialog {
     pub(super) ai_assisted: bool,
     pub(super) interpreting: bool,
     pub(super) interpretation: Option<String>,
+    /// When the running search started (usage log).
+    pub(super) started: Option<Instant>,
+    /// The latest finished search, recorded once its result is opened or the dialog moves on.
+    pub(super) finished: Option<SearchUsage>,
+}
+
+pub(super) struct SearchUsage {
+    query: String,
+    results: usize,
+    duration: Option<Duration>,
+    truncated: bool,
+    ai: bool,
+    outcome: &'static str,
+}
+
+impl SearchDialog {
+    fn usage(&mut self, results: usize, truncated: bool, outcome: &'static str) -> SearchUsage {
+        SearchUsage {
+            query: self.query.clone(),
+            results,
+            duration: self.started.take().map(|started| started.elapsed()),
+            truncated,
+            ai: self.ai_assisted,
+            outcome,
+        }
+    }
+}
+
+fn record_search(log: &UsageLog, root: &Path, usage: SearchUsage, opened: Option<usize>) {
+    log.record(|| {
+        Event::new("search")
+            .with("root", files::display_path(root))
+            .with("query", usage.query)
+            .with("results", usage.results)
+            .with("duration_ms", usage.duration)
+            .with("truncated", usage.truncated)
+            .with("ai", usage.ai)
+            .with("outcome", usage.outcome)
+            .with("opened_rank", opened)
+    });
 }
 
 impl Ledger {
@@ -49,10 +89,12 @@ impl Ledger {
                     match intent.status {
                         search::IntentStatus::Ambiguous => {
                             dialog.busy = false;
+                            dialog.finished = Some(dialog.usage(0, false, "ambiguous"));
                             dialog.error = Some("Ambiguous prompt. Specify filename concepts, folder terms or a file type. No scan started.".into());
                         }
                         search::IntentStatus::Unsupported => {
                             dialog.busy = false;
+                            dialog.finished = Some(dialog.usage(0, false, "unsupported"));
                             dialog.error = Some("Unsupported request. Only filename/folder/type discovery is available. No scan started.".into());
                         }
                         search::IntentStatus::Ready => {
@@ -70,6 +112,7 @@ impl Ledger {
                                 Ok(()) => (),
                                 Err(error) => {
                                     dialog.busy = false;
+                                    dialog.finished = Some(dialog.usage(0, false, "error"));
                                     dialog.error =
                                         Some(format!("Local search was not queued: {error}"));
                                 }
@@ -79,6 +122,7 @@ impl Ledger {
                 }
                 Err(error) => {
                     dialog.busy = false;
+                    dialog.finished = Some(dialog.usage(0, false, "interpretation_failed"));
                     dialog.error = Some(error);
                 }
             }
@@ -90,8 +134,15 @@ impl Ledger {
             if let Some(dialog) = &mut self.search_dialog {
                 dialog.busy = false;
                 match result {
-                    Ok(results) => dialog.results = Some(results),
-                    Err(error) => dialog.error = Some(error),
+                    Ok(results) => {
+                        dialog.finished =
+                            Some(dialog.usage(results.matches.len(), results.truncated, "results"));
+                        dialog.results = Some(results);
+                    }
+                    Err(error) => {
+                        dialog.finished = Some(dialog.usage(0, false, "error"));
+                        dialog.error = Some(error);
+                    }
                 }
             }
         }
@@ -214,22 +265,26 @@ impl Ledger {
                                 .min_size(Vec2::new(ui.available_width(), ROW_HEIGHT)).truncate())
                                 .on_hover_text(format!("{}\n{} / score {}", result.relative.display(), result.explanation, result.score));
                             if response.clicked() { dialog.index = index; }
-                            if response.double_clicked() { activate = Some(result.clone()); }
+                            if response.double_clicked() { activate = Some((index, result.clone())); }
                             if (down || up) && index == dialog.index { response.request_focus(); }
                         }
                     });
                     dialog.scroll_offset = output.state.offset.y;
                     if activate_enter {
-                        activate = results.matches.get(dialog.index).cloned();
+                        activate = results.matches.get(dialog.index).cloned().map(|result| (dialog.index, result));
                     }
                     if ui.add_enabled(!results.matches.is_empty(), egui::Button::new("Show result in pane / Enter")).clicked() {
-                        activate = results.matches.get(dialog.index).cloned();
+                        activate = results.matches.get(dialog.index).cloned().map(|result| (dialog.index, result));
                     }
                 }
                 close = ui.button("Close").on_hover_text("Escape").clicked();
             });
             close |= modal.should_close();
             if cancel || close {
+                if dialog.started.is_some() {
+                    let usage = dialog.usage(0, false, "cancelled");
+                    record_search(&self.usage.log, &dialog.root, usage, None);
+                }
                 if dialog.interpreting {
                     self.ai.disconnect();
                     dialog.interpreting = false;
@@ -240,6 +295,10 @@ impl Ledger {
                 dialog.error = Some("Search cancelled.".into());
             }
             if start {
+                if let Some(usage) = dialog.finished.take() {
+                    record_search(&self.usage.log, &dialog.root, usage, None);
+                }
+                dialog.started = Some(Instant::now());
                 dialog.index = 0;
                 dialog.scroll_offset = 0.0;
                 dialog.results = None;
@@ -249,6 +308,7 @@ impl Ledger {
                     dialog.interpreting = self.ai.start_search(ctx, &dialog.query);
                     dialog.busy = dialog.interpreting;
                     if !dialog.busy {
+                        dialog.started = None;
                         dialog.error = Some(self.ai.status().to_owned());
                     }
                 } else {
@@ -263,6 +323,7 @@ impl Ledger {
                     }) {
                         Ok(()) => dialog.busy = true,
                         Err(error) => {
+                            dialog.started = None;
                             dialog.error = Some(format!("Search was not queued: {error}"))
                         }
                     }
@@ -273,15 +334,24 @@ impl Ledger {
                 self.ai.open = true;
             }
             let pane = dialog.pane;
-            if let Some(result) = activate {
+            if let Some((rank, result)) = activate {
                 match self.work.try_send(Work::Locate { pane, result }) {
-                    Ok(()) => close = true,
+                    Ok(()) => {
+                        if let Some(usage) = dialog.finished.take() {
+                            record_search(&self.usage.log, &dialog.root, usage, Some(rank));
+                        }
+                        self.usage.outcome("search", "confirmed");
+                        close = true;
+                    }
                     Err(error) => {
                         dialog.error = Some(format!("Result activation was not queued: {error}"))
                     }
                 }
             }
             if close {
+                if let Some(usage) = dialog.finished.take() {
+                    record_search(&self.usage.log, &dialog.root, usage, None);
+                }
                 if dialog.ai_assisted && !configure {
                     self.ai.disconnect();
                 }

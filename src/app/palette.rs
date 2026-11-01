@@ -50,6 +50,7 @@ pub(super) enum Command {
     PreviousTab,
     Back,
     Forward,
+    Usage,
 }
 
 impl Command {
@@ -103,6 +104,7 @@ impl Command {
             Self::PreviousTab => "/previous-tab",
             Self::Back => "/back",
             Self::Forward => "/forward",
+            Self::Usage => "/usage",
         }
     }
 }
@@ -176,7 +178,7 @@ pub(super) fn palette_submission(
     }
 }
 
-pub(super) const COMMANDS: [(Command, &str, &str); 48] = [
+pub(super) const COMMANDS: [(Command, &str, &str); 49] = [
     (
         Command::Rename,
         "Rename focused file / folder",
@@ -283,6 +285,11 @@ pub(super) const COMMANDS: [(Command, &str, &str); 48] = [
         "",
     ),
     (Command::Theme, "Toggle light and dark theme", ""),
+    (
+        Command::Usage,
+        "Usage insights / local usage log report",
+        "",
+    ),
     (Command::Accent, "Cycle accent color", ""),
     (
         Command::CreateZip,
@@ -368,6 +375,7 @@ impl Ledger {
                     })
                     .collect();
                 self.palette_index = self.palette_index.min(matches.len().saturating_sub(1));
+                self.usage.ask_candidates = matches.len();
                 egui::ScrollArea::vertical()
                     .id_salt("palette-commands")
                     .max_height(300.0)
@@ -418,6 +426,11 @@ impl Ledger {
                 self.file_focus_requested = true;
             }
             if !dismiss && (chosen.is_some() || submit) {
+                let via = if self.palette_query.trim().starts_with('/') {
+                    Via::Slash
+                } else {
+                    Via::Palette
+                };
                 let submission = if let Some(command) = chosen
                     && !submit
                     && !self.palette_query.trim().starts_with('/')
@@ -434,6 +447,7 @@ impl Ledger {
                             #[cfg(not(feature = "native-search-tests"))]
                             let legacy_test = false;
                             if !legacy_test {
+                                self.usage_ask("ai");
                                 self.palette = false;
                                 self.file_agent.prepare(
                                     prompt,
@@ -445,10 +459,11 @@ impl Ledger {
                                 return true;
                             }
                         }
+                        self.usage_ask_command(command);
                         if matches!(command, Command::Search | Command::AiSearch)
                             && !prompt.is_empty()
                         {
-                            self.dispatch(Command::Search);
+                            self.dispatch(via, Command::Search);
                             if let Some(dialog) = &mut self.search_dialog {
                                 dialog.ai_assisted = command == Command::AiSearch;
                                 dialog.query = prompt;
@@ -461,10 +476,15 @@ impl Ledger {
                                 }
                             }
                         } else {
-                            self.dispatch(command);
+                            self.dispatch(via, command);
                         }
                     }
                     Err(error) => {
+                        self.usage_ask(if error.starts_with("Unknown") {
+                            "no_match"
+                        } else {
+                            "invalid"
+                        });
                         self.palette = false;
                         self.fail(error);
                     }

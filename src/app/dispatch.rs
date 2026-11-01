@@ -95,7 +95,12 @@ impl Ledger {
         }
     }
 
-    pub(super) fn dispatch(&mut self, command: Command) {
+    /// Runs `command` and records how it was invoked (`via`) in the usage log.
+    pub(super) fn dispatch(&mut self, via: Via, command: Command) {
+        self.usage_dispatch(via, command, |app| app.dispatch_command(command));
+    }
+
+    fn dispatch_command(&mut self, command: Command) {
         self.inline_pending = None;
         self.palette = false;
         if matches!(
@@ -174,6 +179,7 @@ impl Ledger {
                     | Command::Answers
                     | Command::Activity
                     | Command::Balance
+                    | Command::Usage
                     // Tab commands close the ZIP view first (see `leave_tab`).
                     | Command::NewTab
                     | Command::CloseTab
@@ -197,6 +203,7 @@ impl Ledger {
                     | Command::Answers
                     | Command::Activity
                     | Command::Balance
+                    | Command::Usage
                     | Command::RotateLeft
                     | Command::RotateRight
                     | Command::EditSource
@@ -334,6 +341,7 @@ impl Ledger {
                 let path = self.panes[self.active].focused.clone();
                 match path {
                     Some(path) => {
+                        self.usage_filter_opened(self.active);
                         if let Err(error) = self.reader.toggle(self.active, path) {
                             self.fail(error);
                         }
@@ -341,8 +349,9 @@ impl Ledger {
                     None => self.fail("Choose a regular file, not the parent row, for preview."),
                 }
             }
-            Command::Parent => self.parent(self.active),
+            Command::Parent => self.parent(self.active, NavVia::Parent),
             Command::ReturnInside => self.return_inside(self.active),
+            Command::Usage => self.open_usage_insights(),
             Command::Back | Command::Forward => {
                 self.step_history(self.active, matches!(command, Command::Forward));
             }
@@ -444,7 +453,11 @@ impl Ledger {
                     self.fail(error);
                     return;
                 }
-                self.navigate(self.active, self.panes[self.active].path.clone());
+                self.navigate(
+                    self.active,
+                    self.panes[self.active].path.clone(),
+                    NavVia::Other,
+                );
             }
             Command::Favorites => {
                 self.rail_open = true;
@@ -509,6 +522,8 @@ impl Ledger {
                     ai_assisted: matches!(command, Command::AiSearch),
                     interpreting: false,
                     interpretation: None,
+                    started: None,
+                    finished: None,
                 });
             }
             Command::Balance => self.balance_requested = true,
