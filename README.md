@@ -22,7 +22,7 @@ before the release cleanup.
 ## Download and run
 
 Download `tomas-commander.exe` from [GitHub Releases](https://github.com/tkubica12/TomasCommander/releases).
-The latest version is **v0.8.0**, an experimental Windows x64 release.
+The latest version is **v0.9.0**, an experimental Windows x64 release.
 No installer or Rust toolchain is needed to run the downloaded executable.
 The binary is unsigned; this project does not provide code-signing or support.
 
@@ -97,7 +97,7 @@ The binary is unsigned; this project does not provide code-signing or support.
 | Ctrl+Tab / Ctrl+Shift+Tab | Next / previous tab in the active pane |
 | PageUp / PageDown or Ctrl+Up / Ctrl+Down | Jump ten rows |
 | Space / Shift+arrows / Ctrl+A | Toggle / range / select all |
-| Ctrl+Enter | Toggle preview; a different file replaces it |
+| Ctrl+Enter | Toggle internal preview; it follows the source file cursor |
 | Shift+Enter | Open with menu |
 | Ctrl+Space / Ctrl+Shift+P | Ask / AI prompts and slash commands |
 | Ctrl+Shift+H | Toggle workspace rail, opening on Recent |

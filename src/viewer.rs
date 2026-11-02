@@ -6,8 +6,10 @@ use std::{
 };
 
 pub const MAX_TEXT_BYTES: usize = 1_048_576;
-pub const MAX_IMAGE_BYTES: usize = 16_777_216;
+pub const MAX_IMAGE_BYTES: usize = 64 * 1_048_576;
+pub const MAX_PDF_BYTES: usize = 16 * 1_048_576;
 pub const MAX_IMAGE_EDGE: u32 = 4096;
+const MAX_IMAGE_DECODE_BYTES: u64 = 256 * 1_048_576;
 pub const MAX_CSV_ROWS: usize = 10_000;
 pub const MAX_CSV_COLUMNS: usize = 64;
 pub const MAX_CSV_CELLS: usize = 50_000;
@@ -107,8 +109,10 @@ pub fn load_transformed(
     if quarter_turns != 0 && !image && !pdf {
         return Err("Rotation is available only for images and PDF pages.".into());
     }
-    let limit = if image || pdf {
+    let limit = if image {
         MAX_IMAGE_BYTES
+    } else if pdf {
+        MAX_PDF_BYTES
     } else {
         MAX_TEXT_BYTES
     };
@@ -193,8 +197,10 @@ pub(crate) fn decode_snapshot(
         );
     }
     if bytes.len()
-        > if image || pdf {
+        > if image {
             MAX_IMAGE_BYTES
+        } else if pdf {
+            MAX_PDF_BYTES
         } else {
             MAX_TEXT_BYTES
         }
@@ -215,19 +221,29 @@ pub(crate) fn decode_snapshot(
             .with_guessed_format()
             .map_err(|error| format!("Identify image: {error}"))?;
         let mut limits = image::Limits::default();
-        limits.max_image_width = Some(MAX_IMAGE_EDGE);
-        limits.max_image_height = Some(MAX_IMAGE_EDGE);
-        limits.max_alloc = Some(64 * 1_048_576);
+        limits.max_alloc = Some(MAX_IMAGE_DECODE_BYTES);
         reader.limits(limits);
         use image::ImageDecoder;
         let mut decoder = reader
             .into_decoder()
             .map_err(|error| format!("Create image decoder: {error}"))?;
+        if decoder.total_bytes() > MAX_IMAGE_DECODE_BYTES {
+            let (width, height) = decoder.dimensions();
+            return Err(format!(
+                "Image {width} x {height} needs more than 256 MiB to decode safely."
+            ));
+        }
         let orientation = decoder
             .orientation()
             .map_err(|error| format!("Read image orientation: {error}"))?;
         let mut decoded = image::DynamicImage::from_decoder(decoder)
             .map_err(|error| format!("Decode image: {error}"))?;
+        if cancelled() {
+            return Err("Preview cancelled.".into());
+        }
+        if decoded.width() > MAX_IMAGE_EDGE || decoded.height() > MAX_IMAGE_EDGE {
+            decoded = decoded.thumbnail(MAX_IMAGE_EDGE, MAX_IMAGE_EDGE);
+        }
         decoded.apply_orientation(orientation);
         decoded = match quarter_turns {
             0 => decoded,
@@ -492,6 +508,85 @@ fn push_csv_field(row: &mut Vec<String>, field: &mut String, cells: &mut usize) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn large_images_are_downscaled_and_rotated_without_modifying_original_files() {
+        let root = std::env::temp_dir().join(format!(
+            "tc-large-image-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let scope = Scope::fixture(&root).unwrap();
+        for (extension, width, height, turns) in [
+            ("png", 6000, 4000, 0),
+            ("bmp", 5000, 1800, 1),
+            ("jpeg", 3200, 4800, 0),
+        ] {
+            let path = root.join(format!("large.{extension}"));
+            image::RgbImage::from_pixel(width, height, image::Rgb([20, 40, 60]))
+                .save(&path)
+                .unwrap();
+            let before = crc32fast::hash(&std::fs::read(&path).unwrap());
+            if extension == "bmp" {
+                assert!(std::fs::metadata(&path).unwrap().len() > 16 * 1_048_576);
+            }
+            let Content::Image {
+                width: shown_width,
+                height: shown_height,
+                rgba,
+            } = load_transformed(&scope, &path, 0, turns, || false)
+                .unwrap()
+                .content
+            else {
+                panic!("Expected a downscaled image");
+            };
+            assert_eq!(shown_width.max(shown_height), MAX_IMAGE_EDGE);
+            assert_eq!(rgba.len(), shown_width as usize * shown_height as usize * 4);
+            let ratio = if turns == 1 {
+                height as f64 / width as f64
+            } else {
+                width as f64 / height as f64
+            };
+            assert!((shown_width as f64 - shown_height as f64 * ratio).abs() <= 2.0);
+            for (actual, expected) in rgba[..4].iter().zip([20_u8, 40, 60, 255]) {
+                assert!(actual.abs_diff(expected) <= 3);
+            }
+            assert_eq!(crc32fast::hash(&std::fs::read(&path).unwrap()), before);
+            std::fs::remove_file(path).unwrap();
+        }
+        std::fs::remove_dir(root).unwrap();
+    }
+
+    #[test]
+    fn image_decode_still_rejects_excessive_allocations_and_honors_cancellation() {
+        let mut bytes = Cursor::new(Vec::new());
+        image::DynamicImage::new_rgba8(1, 1)
+            .write_to(&mut bytes, image::ImageFormat::Png)
+            .unwrap();
+        let bytes = bytes.into_inner();
+        assert!(
+            decode_snapshot(PathBuf::from("cancelled.png"), bytes.clone(), 0, 0, || true)
+                .err()
+                .unwrap()
+                .contains("cancelled")
+        );
+        let mut oversized = bytes;
+        oversized[16..20].copy_from_slice(&32_768_u32.to_be_bytes());
+        oversized[20..24].copy_from_slice(&32_768_u32.to_be_bytes());
+        let crc = crc32fast::hash(&oversized[12..29]);
+        oversized[29..33].copy_from_slice(&crc.to_be_bytes());
+        let error = decode_snapshot(PathBuf::from("huge.png"), oversized, 0, 0, || false)
+            .err()
+            .unwrap();
+        assert!(
+            error.contains("limit") || error.contains("256 MiB"),
+            "{error}"
+        );
+    }
 
     #[test]
     fn markdown_is_bounded_and_removes_assets_while_intercepting_all_link_schemes() {

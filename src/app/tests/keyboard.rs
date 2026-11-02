@@ -1,6 +1,16 @@
 use super::*;
 
 #[test]
+fn internal_preview_toggle_and_following_are_listed_in_shortcut_help() {
+    assert!(COMMANDS.iter().any(|(command, label, key)| {
+        *command == Command::Preview
+            && *key == "Ctrl Enter"
+            && label.contains("internal preview")
+            && label.contains("follows source cursor")
+    }));
+}
+
+#[test]
 fn clone_requires_ctrl_shift_k_without_stealing_copy() {
     assert!(
         COMMANDS

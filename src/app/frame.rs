@@ -153,6 +153,7 @@ impl eframe::App for Ledger {
         self.actions_panel(ui);
         self.context_rail(ui);
         self.file_panes(ui, &ctx);
+        self.follow_reader_selection(&ctx);
         self.dialogs(&ctx);
         self.ai.show(&ctx);
         if let Some(action) = self.file_agent.show(&ctx) {
@@ -208,6 +209,34 @@ impl eframe::App for Ledger {
 }
 
 impl Ledger {
+    fn follow_reader_selection(&mut self, ctx: &egui::Context) {
+        if self.reader.target.is_none() {
+            return;
+        }
+        let source = self.reader.source;
+        let selection = if self.archive.target == Some(source) {
+            self.archive.focused_preview_target()
+        } else {
+            let pane = &self.panes[source];
+            pane.focused
+                .as_ref()
+                .filter(|path| {
+                    pane.entries
+                        .iter()
+                        .any(|entry| &entry.path == *path && !entry.directory)
+                })
+                .map(|path| crate::viewer_ui::PreviewTarget {
+                    path: path.clone(),
+                    member: None,
+                })
+        };
+        match self.reader.follow_selection(selection) {
+            Ok(true) => ctx.request_repaint(),
+            Ok(false) => {}
+            Err(error) => self.fail(error),
+        }
+    }
+
     fn handle_close_request(&mut self, ctx: &egui::Context) {
         if self.operation_busy && ctx.input(|input| input.viewport().close_requested()) {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);

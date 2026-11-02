@@ -224,7 +224,7 @@ pub(super) const COMMANDS: [(Command, &str, &str); 50] = [
     (Command::ZoomReset, "Reset UI zoom to 100%", "Ctrl 0"),
     (
         Command::Preview,
-        "Internal file preview / reading pane",
+        "Toggle internal preview / follows source cursor",
         "Ctrl Enter",
     ),
     (Command::Parent, "Parent folder", "Ctrl Left / Backspace"),

@@ -4,7 +4,7 @@ use std::{
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
-        mpsc::{self, Receiver, SyncSender, TryRecvError},
+        mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError},
     },
 };
 use tomas_commander::{
@@ -19,6 +19,12 @@ struct Request {
     quarter_turns: u8,
     edit: bool,
     virtual_entry: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PreviewTarget {
+    pub path: PathBuf,
+    pub member: Option<String>,
 }
 
 /// A finished preview read: what was shown, how and how long it took.
@@ -48,6 +54,7 @@ fn content_kind(content: &Content) -> &'static str {
 
 pub struct ReaderPanel {
     jobs: SyncSender<Request>,
+    pending: Option<Request>,
     results: Receiver<(u64, FileResult<Preview>)>,
     generation: Arc<AtomicU64>,
     pub target: Option<usize>,
@@ -78,6 +85,8 @@ pub struct ReaderPanel {
     close_prompt: bool,
     close_prompt_focus: bool,
     virtual_entry: Option<String>,
+    followed: Option<Option<PreviewTarget>>,
+    editing: bool,
     pub open_entry: Option<String>,
     pub preview_entry: Option<String>,
     selected_archive: std::collections::BTreeSet<String>,
@@ -131,6 +140,7 @@ impl ReaderPanel {
         });
         Self {
             jobs,
+            pending: None,
             results,
             generation,
             target: None,
@@ -159,6 +169,8 @@ impl ReaderPanel {
             close_prompt: false,
             close_prompt_focus: false,
             virtual_entry: None,
+            followed: None,
+            editing: false,
             open_entry: None,
             preview_entry: None,
             selected_archive: Default::default(),
@@ -188,6 +200,33 @@ impl ReaderPanel {
         }
     }
 
+    pub fn follow_selection(&mut self, selection: Option<PreviewTarget>) -> FileResult<bool> {
+        if self.target.is_none() || self.target == Some(self.source) || self.editing || self.dirty()
+        {
+            return Ok(false);
+        }
+        let previous = self.followed.replace(selection.clone());
+        if previous.is_none() || previous == Some(selection.clone()) {
+            return Ok(false);
+        }
+        if let Some(target) = &selection {
+            if self.path == target.path && self.virtual_entry == target.member {
+                return Ok(false);
+            }
+            if let Some(member) = &target.member {
+                self.start_virtual(self.source, target.path.clone(), member.clone())?;
+            } else {
+                self.start(self.source, target.path.clone())?;
+            }
+        } else {
+            let source = self.source;
+            self.close();
+            self.target = Some(1 - source);
+        }
+        self.followed = Some(selection);
+        Ok(true)
+    }
+
     fn start_page(
         &mut self,
         source: usize,
@@ -213,7 +252,8 @@ impl ReaderPanel {
             "open"
         };
         let generation = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
-        if let Err(error) = self.jobs.try_send(Request {
+        self.pending = None;
+        match self.jobs.try_send(Request {
             generation,
             path: path.clone(),
             page,
@@ -221,10 +261,12 @@ impl ReaderPanel {
             edit,
             virtual_entry: self.virtual_entry.clone(),
         }) {
-            self.close();
-            return Err(format!(
-                "Could not queue preview; previous read cancelled: {error}"
-            ));
+            Ok(()) => {}
+            Err(TrySendError::Full(request)) => self.pending = Some(request),
+            Err(TrySendError::Disconnected(_)) => {
+                self.close();
+                return Err("Reader worker stopped. Close preview and restart the app.".into());
+            }
         }
         self.requested = Some((std::time::Instant::now(), action));
         self.source = source;
@@ -245,6 +287,8 @@ impl ReaderPanel {
         self.text_view = Default::default();
         self.inspected_link = None;
         self.quarter_turns = quarter_turns;
+        self.followed = None;
+        self.editing = edit;
         self.close_prompt = false;
         self.selected_archive.clear();
         self.open_entry = None;
@@ -306,6 +350,16 @@ impl ReaderPanel {
     }
     pub fn is_virtual(&self) -> bool {
         self.virtual_entry.is_some()
+    }
+
+    pub fn focused_preview_target(&self) -> Option<PreviewTarget> {
+        self.archive_rows()
+            .get(self.archive_cursor.checked_sub(1)?)
+            .filter(|entry| !entry.directory)
+            .map(|entry| PreviewTarget {
+                path: self.path.clone(),
+                member: Some(entry.path.clone()),
+            })
     }
 
     pub fn archive_targets(&self) -> Vec<String> {
@@ -625,6 +679,8 @@ impl ReaderPanel {
             return;
         }
         self.generation.fetch_add(1, Ordering::AcqRel);
+        self.pending = None;
+        self.requested = None;
         self.target = None;
         self.preview = None;
         self.texture = None;
@@ -634,6 +690,8 @@ impl ReaderPanel {
         self.inspected_link = None;
         self.close_prompt = false;
         self.virtual_entry = None;
+        self.followed = None;
+        self.editing = false;
         self.selected_archive.clear();
         self.open_entry = None;
         self.preview_entry = None;
@@ -649,7 +707,11 @@ impl ReaderPanel {
                 Ok(result) => result,
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
-                    if self.target.is_some() && self.preview.is_none() && self.error.is_none() {
+                    if self.target.is_some()
+                        && !self.path.as_os_str().is_empty()
+                        && self.preview.is_none()
+                        && self.error.is_none()
+                    {
                         self.error = Some(
                             "Reader worker stopped. Close preview and restart the app.".into(),
                         );
@@ -685,6 +747,17 @@ impl ReaderPanel {
                     self.preview = Some(preview);
                 }
                 Err(error) => self.error = Some(error),
+            }
+        }
+        if let Some(request) = self.pending.take() {
+            match self.jobs.try_send(request) {
+                Ok(()) => {}
+                Err(TrySendError::Full(request)) => self.pending = Some(request),
+                Err(TrySendError::Disconnected(_)) => {
+                    self.error =
+                        Some("Reader worker stopped. Close preview and restart the app.".into());
+                    self.requested = None;
+                }
             }
         }
     }
@@ -845,6 +918,10 @@ impl ReaderPanel {
             }
         }
         let Some(preview) = &self.preview else {
+            if self.path.as_os_str().is_empty() {
+                ui.label("Select a file in the source pane to preview.");
+                return close;
+            }
             ui.spinner();
             ui.label("Reading locally...");
             return close;
@@ -1296,6 +1373,214 @@ mod tests {
     use super::*;
 
     #[test]
+    fn preview_follows_changed_selection_and_queues_only_the_latest_pending_read() {
+        for source in [0, 1] {
+            let mut panel = ReaderPanel::new(Scope::unrestricted(), egui::Context::default());
+            let (jobs, requests) = mpsc::sync_channel(1);
+            panel.jobs = jobs;
+            let (sender, results) = mpsc::sync_channel(4);
+            panel.results = results;
+            let target = |name: &str| PreviewTarget {
+                path: PathBuf::from(name),
+                member: None,
+            };
+            let first = target("first.png");
+            panel.start(source, first.path.clone()).unwrap();
+            let original = requests.recv().unwrap();
+            assert!(!panel.follow_selection(Some(first.clone())).unwrap());
+            assert!(!panel.follow_selection(Some(first)).unwrap());
+            for name in ["second.md", "third.pdf", "fourth.csv", "last.json"] {
+                assert!(panel.follow_selection(Some(target(name))).unwrap());
+                assert_eq!(panel.target, Some(1 - source));
+                assert_eq!(panel.source, source);
+            }
+            assert_eq!(
+                panel.pending.as_ref().unwrap().path,
+                PathBuf::from("last.json")
+            );
+            let obsolete = requests.recv().unwrap();
+            assert_eq!(obsolete.path, PathBuf::from("second.md"));
+            panel.poll();
+            let latest = requests.recv().unwrap();
+            assert_eq!(latest.path, PathBuf::from("last.json"));
+            assert!(requests.try_recv().is_err());
+            assert!(panel.pending.is_none());
+            for generation in [original.generation, obsolete.generation] {
+                sender
+                    .send((generation, Err("Obsolete result must not appear".into())))
+                    .unwrap();
+            }
+            sender
+                .send((
+                    latest.generation,
+                    Ok(Preview {
+                        path: latest.path.clone(),
+                        content: Content::Text(vec!["latest".into()]),
+                        notice: "TEST ONLY",
+                    }),
+                ))
+                .unwrap();
+            panel.poll();
+            assert!(panel.error.is_none());
+            assert_eq!(panel.preview.as_ref().unwrap().path, latest.path);
+            assert_eq!(panel.usage.as_ref().unwrap().path, latest.path);
+            assert!(!panel.follow_selection(Some(target("last.json"))).unwrap());
+            assert!(panel.follow_selection(None).unwrap());
+            assert!(panel.preview.is_none() && panel.error.is_none());
+            assert_eq!(panel.target, Some(1 - source));
+            assert!(!panel.follow_selection(None).unwrap());
+            assert!(
+                panel
+                    .follow_selection(Some(target("unsupported.exe")))
+                    .unwrap()
+            );
+            let unsupported = requests.recv().unwrap();
+            sender
+                .send((unsupported.generation, Err("Unsupported format".into())))
+                .unwrap();
+            panel.poll();
+            assert_eq!(panel.error.as_deref(), Some("Unsupported format"));
+            assert!(panel.preview.is_none());
+            panel.close();
+            assert!(!panel.follow_selection(Some(target("closed.txt"))).unwrap());
+            assert!(requests.try_recv().is_err());
+        }
+    }
+
+    #[test]
+    fn preview_follow_preserves_explicit_targets_and_clean_or_loading_editors() {
+        let mut panel = ReaderPanel::new(Scope::unrestricted(), egui::Context::default());
+        let (jobs, requests) = mpsc::sync_channel(1);
+        panel.jobs = jobs;
+        panel.start(0, PathBuf::from("explicit.md")).unwrap();
+        requests.recv().unwrap();
+        let selection = |path| {
+            Some(PreviewTarget {
+                path: PathBuf::from(path),
+                member: None,
+            })
+        };
+        assert!(!panel.follow_selection(selection("source.txt")).unwrap());
+        assert_eq!(panel.path, PathBuf::from("explicit.md"));
+        assert!(!panel.follow_selection(selection("source.txt")).unwrap());
+        assert!(panel.follow_selection(selection("next.txt")).unwrap());
+        requests.recv().unwrap();
+        panel.start_edit(0, PathBuf::from("edit.txt")).unwrap();
+        let edit = requests.recv().unwrap();
+        assert!(edit.edit);
+        assert!(!panel.follow_selection(selection("another.txt")).unwrap());
+        assert_eq!(panel.path, PathBuf::from("edit.txt"));
+        assert!(requests.try_recv().is_err());
+        panel.open_archive(0, PathBuf::from("source.zip")).unwrap();
+        requests.recv().unwrap();
+        assert!(
+            !panel
+                .follow_selection(selection("do-not-replace.txt"))
+                .unwrap()
+        );
+        assert_eq!(panel.path, PathBuf::from("source.zip"));
+    }
+
+    #[test]
+    fn virtual_preview_follows_archive_cursor_and_clears_on_folders_or_parent() {
+        let mut archive = archive_fixture();
+        assert!(archive.focused_preview_target().is_none());
+        archive.move_archive_cursor(2, false);
+        let first = archive.focused_preview_target().unwrap();
+        assert_eq!(first.member.as_deref(), Some("root.txt"));
+        let mut panel = ReaderPanel::new(Scope::unrestricted(), egui::Context::default());
+        let (jobs, requests) = mpsc::sync_channel(1);
+        panel.jobs = jobs;
+        panel
+            .start_virtual(0, first.path.clone(), first.member.clone().unwrap())
+            .unwrap();
+        requests.recv().unwrap();
+        assert!(!panel.follow_selection(Some(first)).unwrap());
+        archive.move_archive_cursor(1, false);
+        assert!(
+            panel
+                .follow_selection(archive.focused_preview_target())
+                .unwrap()
+        );
+        assert!(panel.preview.is_none() && panel.virtual_entry.is_none());
+        assert!(!archive.archive_enter());
+        archive.move_archive_cursor(1, false);
+        assert!(
+            panel
+                .follow_selection(archive.focused_preview_target())
+                .unwrap()
+        );
+        let member = requests.recv().unwrap();
+        assert_eq!(member.virtual_entry.as_deref(), Some("Příliš/file.txt"));
+        archive.move_archive_cursor(0, false);
+        assert!(
+            panel
+                .follow_selection(archive.focused_preview_target())
+                .unwrap()
+        );
+        assert!(panel.path.as_os_str().is_empty());
+    }
+
+    #[test]
+    fn rapid_preview_navigation_eventually_displays_the_latest_real_file() {
+        let root = std::env::temp_dir().join(format!(
+            "tc-reader-follow-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let path = root.join("latest.txt");
+        std::fs::write(&path, "Latest real file").unwrap();
+        let mut panel = ReaderPanel::new(Scope::fixture(&root).unwrap(), egui::Context::default());
+        panel.start(0, path.clone()).unwrap();
+        assert!(
+            !panel
+                .follow_selection(Some(PreviewTarget {
+                    path: path.clone(),
+                    member: None
+                }))
+                .unwrap()
+        );
+        for index in 0..100 {
+            panel
+                .follow_selection(Some(PreviewTarget {
+                    path: root.join(format!("obsolete-{index}.txt")),
+                    member: None,
+                }))
+                .unwrap();
+        }
+        panel
+            .follow_selection(Some(PreviewTarget {
+                path: path.clone(),
+                member: None,
+            }))
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while panel.preview.is_none() && panel.error.is_none() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "Latest preview did not finish"
+            );
+            panel.poll();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(panel.error.is_none(), "{:?}", panel.error);
+        assert!(
+            matches!(&panel.preview.as_ref().unwrap().content, Content::Text(lines) if lines == &["Latest real file"])
+        );
+        assert_eq!(
+            panel.preview.as_ref().unwrap().path,
+            Scope::fixture(&root).unwrap().resolve(&path).unwrap()
+        );
+        drop(panel);
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_dir(root).unwrap();
+    }
+
+    #[test]
     fn recent_preview_activity_requires_a_successful_current_physical_result() {
         let mut panel = ReaderPanel::new(Scope::unrestricted(), egui::Context::default());
         let (sender, results) = mpsc::sync_channel(4);
@@ -1390,6 +1675,15 @@ mod tests {
         assert!(panel.close_prompt && panel.dirty());
         assert_eq!(panel.target, Some(1));
         assert!(panel.toggle(0, root.join("other.txt")).is_err());
+        assert!(
+            !panel
+                .follow_selection(Some(PreviewTarget {
+                    path: root.join("other.txt"),
+                    member: None,
+                }))
+                .unwrap()
+        );
+        assert!(panel.dirty());
         let context = egui::Context::default();
         context
             .run_ui(egui::RawInput::default(), |ui| {
@@ -1446,6 +1740,7 @@ mod tests {
         let (_sender, results) = mpsc::sync_channel(1);
         ReaderPanel {
             jobs,
+            pending: None,
             results,
             generation: Arc::new(AtomicU64::new(1)),
             target: Some(0),
@@ -1496,6 +1791,8 @@ mod tests {
             requested: None,
             usage: None,
             virtual_entry: None,
+            followed: None,
+            editing: false,
             open_entry: None,
             preview_entry: None,
             selected_archive: Default::default(),
@@ -2032,6 +2329,7 @@ mod tests {
         let (sender, results) = mpsc::sync_channel(2);
         let mut panel = ReaderPanel {
             jobs,
+            pending: None,
             results,
             generation: Arc::new(AtomicU64::new(2)),
             target: Some(1),
@@ -2060,6 +2358,8 @@ mod tests {
             requested: None,
             usage: None,
             virtual_entry: None,
+            followed: None,
+            editing: false,
             open_entry: None,
             preview_entry: None,
             selected_archive: Default::default(),
@@ -2075,6 +2375,7 @@ mod tests {
         panel.poll();
         assert!(panel.target.is_none() && panel.error.is_none());
         panel.target = Some(1);
+        panel.path = PathBuf::from("synthetic.txt");
         drop(sender);
         panel.poll();
         assert!(panel.error.as_deref().unwrap().contains("worker stopped"));
@@ -2087,6 +2388,7 @@ mod tests {
         let context = egui::Context::default();
         let mut panel = ReaderPanel {
             jobs,
+            pending: None,
             results,
             generation: Arc::new(AtomicU64::new(1)),
             target: Some(1),
@@ -2115,6 +2417,8 @@ mod tests {
             requested: None,
             usage: None,
             virtual_entry: None,
+            followed: None,
+            editing: false,
             open_entry: None,
             preview_entry: None,
             selected_archive: Default::default(),
@@ -2173,6 +2477,7 @@ mod tests {
         let (_sender, results) = mpsc::sync_channel(1);
         let mut panel = ReaderPanel {
             jobs,
+            pending: None,
             results,
             generation: Arc::new(AtomicU64::new(1)),
             target: Some(1),
@@ -2211,6 +2516,8 @@ mod tests {
             requested: None,
             usage: None,
             virtual_entry: None,
+            followed: None,
+            editing: false,
             open_entry: None,
             preview_entry: None,
             selected_archive: Default::default(),

@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+## v0.9.0 - 2026-11-02
+
+Cursor-following internal previews and larger image support for Windows x64.
+
+- Internal previews now follow the source cursor across supported files and ZIP
+  members, without replacing an open source editor. Ctrl+Enter help explicitly
+  describes the toggle and cursor-following behavior.
+- Large JPEG/PNG/BMP previews are proportionally downscaled instead of rejected
+  above a 4096-pixel edge. Local image input now allows 64 MiB with a bounded
+  decode budget; original files stay unchanged.
+
+Unsigned, unsupported and provided at your own risk.
+
 ## v0.8.0 - 2026-11-01
 
 Same-folder file cloning and cleaner context menus for Windows x64.

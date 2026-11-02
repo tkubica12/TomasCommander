@@ -287,7 +287,11 @@ console). See [usage log](decisions/usage-log.md) for every recorded field.
 ## Reader
 
 Ctrl+Enter uses the opposite pane as a reader. Repeating it on the same document
-closes the preview; a different document replaces it. Escape closes with
+closes the preview; moving the source cursor to another file automatically
+replaces it, including ZIP members and all supported preview formats.
+Folders and the parent row clear the previous preview; unsupported files show
+their own preview error, never the previous file's contents. Source editing
+does not follow the cursor, even before the first edit. Escape closes with
 unsaved-edit protection. Tab switches source/reader focus; arrows and Page
 Up/Down scroll. Ctrl+Left/Right rotates image/PDF previews without changing files.
 PDF pages use Ctrl+PageUp/PageDown or the Previous/Next controls.
@@ -297,7 +301,12 @@ Document images are omitted. HTML is parsed into semantic content, not rendered
 as a web page: no CSS fidelity, scripts, remote assets or embedded controls.
 Unsupported table/list structures fail explicitly. PDF uses Windows.Data.Pdf.
 Images support JPEG/PNG/BMP, EXIF orientation, fit, zoom and quarter-turn rotation.
-Reads/decoding run off the UI thread with bounded sizes.
+Images above 4096 pixels per edge are proportionally downscaled for preview,
+then fitted to the reader window; originals are never changed. Local image
+input allows up to 64 MiB with a 256 MiB decoded-image budget; PDF input remains
+16 MiB and ZIP member limits still apply. Reads/decoding run off the UI thread
+with bounded sizes; rapid navigation cancels obsolete reads and keeps the
+latest selection.
 
 Markdown/HTML previews switch between **Rendered** and **Source** and offer
 **Copy source**. Rendered Markdown retains headings, tables, task lists and
