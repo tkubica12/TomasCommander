@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+## v0.10.0 - 2026-11-22
+
+- The status bar shows bytes written, completed items and estimated time left
+  while copying. Progress updates even within a single large file.
+- Click the drive letter at the start of either pane's path to choose another
+  drive without first navigating to the root.
+- Escape closes Saved places and dismisses the unsaved-edits prompt without
+  discarding the draft. When editing a saved place's name, Escape cancels just
+  the name edit and returns to Saved places.
+
+Unsigned, unsupported and provided at your own risk.
+
 ## v0.9.0 - 2026-11-02
 
 Cursor-following internal previews and larger image support for Windows x64.

@@ -28,7 +28,7 @@ fn compact_breadcrumbs_render_within_two_rows_even_for_long_components() {
             },
             |ui| {
                 let bounds = ui.max_rect();
-                compact_breadcrumbs(ui, &breadcrumb_paths(&path, None));
+                compact_breadcrumbs(ui, &breadcrumb_paths(&path, None), true);
                 assert!(ui.min_rect().height() > 0.0);
                 assert!(
                     ui.min_rect().height() <= 2.0 * ui.spacing().interact_size.y.max(18.0) + 4.0

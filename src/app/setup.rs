@@ -118,6 +118,7 @@ impl Ledger {
             work_results,
             cancellation,
             operation_busy: false,
+            copy_progress: None,
             plan: None,
             review: None,
             next_id: 1,
@@ -587,9 +588,16 @@ fn spawn_file_worker(
                         )
                     }),
                 },
-                Work::Execute(plan) => {
-                    WorkResult::Executed(journal.execute(&worker_scope, &plan, true, &cancel))
-                }
+                Work::Execute(plan, progress) => WorkResult::Executed(journal.execute_with(
+                    &worker_scope,
+                    &plan,
+                    true,
+                    &cancel,
+                    &files::Hooks {
+                        progress: progress.as_deref(),
+                        ..Default::default()
+                    },
+                )),
                 Work::Save(preferences) => WorkResult::Saved(preferences.save(&settings)),
                 Work::Code(path) => WorkResult::Code(platform::open_vscode(&path)),
                 Work::Open(path) => WorkResult::Open(

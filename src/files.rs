@@ -3,8 +3,11 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{Read, Write},
     path::{Path, PathBuf},
-    sync::atomic::{AtomicBool, Ordering},
-    time::SystemTime,
+    sync::{
+        OnceLock,
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+    },
+    time::{Instant, SystemTime},
 };
 
 pub type FileResult<T> = Result<T, String>;
@@ -549,7 +552,51 @@ pub struct PlanOptions {
     pub recycle_bin: Option<bool>,
 }
 
-/// Effect seams for tests; `Hooks::default()` uses the real Recycle Bin.
+/// Live counters for a single approved streaming operation. They describe transfer work,
+/// not the durable outcome (which also includes verification and journal writes).
+#[derive(Debug)]
+pub struct CopyProgress {
+    pub total_bytes: u64,
+    pub total_items: usize,
+    started: OnceLock<Instant>,
+    written: AtomicU64,
+    completed: AtomicUsize,
+}
+
+impl CopyProgress {
+    pub fn for_plan(plan: &Plan) -> Option<Self> {
+        if !plan.streams() {
+            return None;
+        }
+        let mut total_bytes = 0u64;
+        let mut total_items = 0;
+        for node in &plan.nodes {
+            if node.resolution != Resolution::Skip {
+                total_items += 1;
+                if !node.identity.directory {
+                    total_bytes = total_bytes.saturating_add(node.identity.size);
+                }
+            }
+        }
+        Some(Self {
+            total_bytes,
+            total_items,
+            started: OnceLock::new(),
+            written: AtomicU64::new(0),
+            completed: AtomicUsize::new(0),
+        })
+    }
+
+    pub fn snapshot(&self) -> Option<(Instant, u64, usize)> {
+        Some((
+            *self.started.get()?,
+            self.written.load(Ordering::Relaxed),
+            self.completed.load(Ordering::Relaxed),
+        ))
+    }
+}
+
+/// Optional progress reporting and effect seams; defaults use the real Recycle Bin.
 #[doc(hidden)]
 #[derive(Clone, Copy)]
 pub struct Hooks<'a> {
@@ -557,6 +604,7 @@ pub struct Hooks<'a> {
     pub recycle: &'a dyn Fn(&[PathBuf]) -> FileResult<()>,
     /// Runs after a verified-copy target is flushed and closed, before it is re-read.
     pub copied: &'a dyn Fn(&Path, &Path),
+    pub progress: Option<&'a CopyProgress>,
 }
 
 fn no_copy_hook(_source: &Path, _target: &Path) {}
@@ -566,6 +614,7 @@ impl Default for Hooks<'static> {
         Self {
             recycle: &crate::platform::recycle_many,
             copied: &no_copy_hook,
+            progress: None,
         }
     }
 }
@@ -1521,6 +1570,9 @@ fn stream_copy(
         output
             .write_all(&buffer[..count])
             .map_err(|e| io_error("Write destination", target, e))?;
+        if let Some(progress) = hooks.progress {
+            progress.written.fetch_add(count as u64, Ordering::Relaxed);
+        }
     }
     if finished {
         output
@@ -1792,6 +1844,9 @@ fn copy_nodes(
             }
         }
         outcome.completed.push(node.source.clone());
+        if let Some(progress) = hooks.progress {
+            progress.completed.fetch_add(1, Ordering::Relaxed);
+        }
     }
     Ok(true)
 }
@@ -2060,6 +2115,9 @@ pub fn execute_with(
         #[cfg(not(windows))]
         let mut guards = Guards::new();
         validate_plan(scope, plan, cancelled)?;
+        if let Some(progress) = hooks.progress {
+            progress.started.get_or_init(Instant::now);
+        }
         match (plan.operation, plan.strategy) {
             (Operation::Copy, _) => {
                 let all: Vec<usize> = (0..plan.nodes.len()).collect();

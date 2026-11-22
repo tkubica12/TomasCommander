@@ -670,6 +670,10 @@ impl ReaderPanel {
         self.archive_reveal_cursor = true;
     }
 
+    pub(crate) fn close_prompt_open(&self) -> bool {
+        self.close_prompt
+    }
+
     pub fn close(&mut self) {
         if self.dirty() {
             if !self.close_prompt {

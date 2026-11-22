@@ -113,6 +113,10 @@ impl Harness {
 
     /// Clicks the first accessible button with `label` through AccessKit.
     fn click(&mut self, label: &str) {
+        self.click_button(label, false);
+    }
+
+    fn click_button(&mut self, label: &str, left_pane_only: bool) {
         let output = self.run(vec![]);
         let nodes = output.platform_output.accesskit_update.unwrap().nodes;
         let (id, _) = nodes
@@ -121,6 +125,7 @@ impl Harness {
                 node.role() == egui::accesskit::Role::Button
                     && !node.is_disabled()
                     && node.label() == Some(label)
+                    && (!left_pane_only || node.bounds().is_some_and(|rect| rect.x1 < 620.0))
             })
             .unwrap_or_else(|| panic!("no {label} button"));
         let request = egui::accesskit::ActionRequest {
@@ -147,6 +152,84 @@ fn key(key: Key, modifiers: Modifiers) -> egui::Event {
         repeat: false,
         modifiers,
     }
+}
+
+#[test]
+fn escape_dismisses_saved_places_and_its_name_editor_one_at_a_time() {
+    let mut harness = Harness::new("places-escape");
+    let places = harness.app.preferences.favorites.clone();
+    harness.app.panes[0].filter = "beta".into();
+    harness.app.panes[0].rebuild();
+    harness.run(vec![key(Key::ArrowUp, Modifiers::ALT)]);
+    assert!(harness.app.places_popup.is_some());
+    harness.app.place_edit = Some((harness.files.clone(), "Draft name".into()));
+    harness.run(vec![]);
+    harness
+        .ctx
+        .memory_mut(|mem| mem.request_focus(Id::new("saved-place-name-input")));
+    harness.run(vec![key(Key::Escape, Modifiers::NONE)]);
+    assert!(harness.app.place_edit.is_none());
+    assert!(harness.app.places_popup.is_some());
+    harness.run(vec![release(Key::Escape)]);
+    harness.run(vec![key(Key::Escape, Modifiers::NONE)]);
+    assert!(harness.app.places_popup.is_none());
+    assert_eq!(harness.app.preferences.favorites, places);
+    assert_eq!(harness.app.panes[0].filter, "beta");
+    assert_eq!(harness.app.panes[0].path, harness.files);
+}
+
+#[test]
+fn escape_in_unsaved_edits_keeps_the_editor_and_its_changes() {
+    let mut harness = Harness::new("reader-escape");
+    let file = harness.files.join("beta.md");
+    harness.app.reader.start_edit(0, file.clone()).unwrap();
+    harness.app.active = 1;
+    harness.until(|app| app.reader.kind() == "editor");
+    harness
+        .ctx
+        .memory_mut(|mem| mem.request_focus(Id::new("reader-editor")));
+    harness.run(vec![egui::Event::Text("draft".into())]);
+    assert!(harness.app.reader.dirty());
+    harness.run(vec![key(Key::Escape, Modifiers::NONE)]);
+    assert!(harness.app.reader.close_prompt_open());
+    harness.run(vec![release(Key::Escape)]);
+    harness.run(vec![key(Key::Escape, Modifiers::NONE)]);
+    assert!(!harness.app.reader.close_prompt_open());
+    assert!(harness.app.reader.dirty());
+    assert_eq!(harness.app.reader.target, Some(1));
+    assert_eq!(fs::read(file).unwrap(), b"# beta");
+}
+
+#[cfg(windows)]
+#[test]
+fn drive_breadcrumb_opens_picker_without_changing_either_folder() {
+    let mut harness = Harness::new("drive-crumb");
+    // With the fixture boundary the first crumb is a folder, not a drive.
+    let child = harness.files.join("Gamma");
+    harness.app.navigate(0, child.clone(), NavVia::Other);
+    harness.until(|app| !app.panes[0].busy);
+    harness.click_button("files", true);
+    assert!(harness.app.drives_popup.is_none());
+    harness.until(|app| !app.panes[0].busy);
+    assert_eq!(harness.app.panes[0].path, harness.files);
+
+    // Show the physical breadcrumbs in the first pane while the second pane is active.
+    harness.app.scope = Scope::unrestricted();
+    harness.app.active = 1;
+    let drive = harness.files.ancestors().last().unwrap();
+    harness.click_button(&files::display_path(drive), true);
+    assert_eq!(harness.app.drives_popup.as_ref().unwrap().pane, 0);
+    assert_eq!(harness.app.active, 0);
+    harness.run(vec![]);
+    harness.run(vec![key(Key::Escape, Modifiers::NONE)]);
+    assert!(harness.app.drives_popup.is_none());
+    assert!(
+        harness
+            .app
+            .panes
+            .iter()
+            .all(|pane| pane.path == harness.files)
+    );
 }
 
 fn release(key: Key) -> egui::Event {

@@ -1,5 +1,35 @@
 use super::*;
 
+fn copy_status(progress: &files::CopyProgress) -> String {
+    let Some((started, written, items)) = progress.snapshot() else {
+        return format!("Checking copy plan / {} items", progress.total_items);
+    };
+    let total = progress.total_bytes;
+    let counts = format!("{items}/{} items", progress.total_items);
+    if items == progress.total_items || (total > 0 && written >= total) {
+        return format!(
+            "Finishing copy / {} written / {counts}",
+            format_size(written)
+        );
+    }
+    if total == 0 {
+        return format!("Copying / {counts}");
+    }
+    let percent = u128::from(written) * 100 / u128::from(total);
+    let mut status = format!(
+        "Copying {percent}% / {} of {} / {counts}",
+        format_size(written),
+        format_size(total),
+    );
+    let elapsed = started.elapsed();
+    if written > 0 && elapsed >= Duration::from_secs(1) {
+        let seconds =
+            (elapsed.as_secs_f64() * (total - written) as f64 / written as f64).ceil() as u64;
+        status.push_str(&format!(" / ~{}:{:02} left", seconds / 60, seconds % 60));
+    }
+    status
+}
+
 impl eframe::App for Ledger {
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.usage_session_end();
@@ -121,6 +151,8 @@ impl eframe::App for Ledger {
                 .as_ref()
                 .is_some_and(|dialog| !dialog.inline)
             || self.place_edit.is_some()
+            || self.places_popup.is_some()
+            || self.help_open
             || self.drives_popup.is_some()
             || self.open_with.is_some()
             || self.change_plan.is_some()
@@ -393,10 +425,17 @@ impl Ledger {
                     self.usage_action("/cancel-work", Via::Button, "");
                     self.cancellation.store(true, Ordering::Relaxed);
                 }
-                ui.add(
-                    egui::Label::new(RichText::new(&self.status).monospace().small()).truncate(),
-                )
-                .on_hover_text(&self.status);
+                let progress = self.copy_progress.as_ref().map(|progress| {
+                    ui.ctx().request_repaint_after(Duration::from_millis(200));
+                    if self.cancellation.load(Ordering::Relaxed) {
+                        "Cancelling copy...".to_owned()
+                    } else {
+                        copy_status(progress)
+                    }
+                });
+                let status = progress.as_deref().unwrap_or(&self.status);
+                ui.add(egui::Label::new(RichText::new(status).monospace().small()).truncate())
+                    .on_hover_text(status);
             });
         });
     }

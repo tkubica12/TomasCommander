@@ -731,18 +731,45 @@ fn actual_recursive_copy_preserves_bytes_and_source() {
     );
     fixture.file("Source\\presentation.pptx", &vec![0x5a; 190_000]);
     let destination = fixture.directory("Destination");
+    fixture.directory("Destination\\Source");
+    fixture.file("Source\\existing.txt", b"skip these bytes");
+    fixture.file("Destination\\Source\\existing.txt", b"original");
     let scope = fixture.scope();
-    let plan = files::plan(
+    let cancel = AtomicBool::new(false);
+    let plan = files::plan_with_policy(
         &scope,
         1,
         Operation::Copy,
         std::slice::from_ref(&source),
         Some(&destination),
+        ConflictPolicy::Skip,
+        &cancel,
     )
     .unwrap();
-    let result = files::execute(&scope, &plan, true, &AtomicBool::new(false));
+    let progress = files::CopyProgress::for_plan(&plan).unwrap();
+    assert_eq!(
+        progress.total_bytes,
+        190_000 + "Dovolená Srbsko".len() as u64
+    );
+    assert_eq!(progress.total_items, 4);
+    assert!(progress.snapshot().is_none());
+    let result = files::execute_with(
+        &scope,
+        &plan,
+        true,
+        &cancel,
+        &files::Hooks {
+            progress: Some(&progress),
+            ..Default::default()
+        },
+    );
     fixture.own(&result.created);
     assert!(result.error.is_none(), "{:?}", result.error);
+    let (_, written, items) = progress.snapshot().unwrap();
+    assert_eq!(
+        (written, items),
+        (progress.total_bytes, progress.total_items)
+    );
     assert_eq!(
         fs::read(source.join("presentation.pptx")).unwrap(),
         fs::read(destination.join("Source\\presentation.pptx")).unwrap()
@@ -1997,9 +2024,26 @@ fn cancellation_during_real_copy_reports_partial_destination_without_deleting_it
     .unwrap();
     let cancelled = Arc::new(AtomicBool::new(false));
     let worker_cancelled = cancelled.clone();
-    let worker = std::thread::spawn(move || files::execute(&scope, &plan, true, &worker_cancelled));
+    let progress = Arc::new(files::CopyProgress::for_plan(&plan).unwrap());
+    assert_eq!((progress.total_bytes, progress.total_items), (64 << 20, 1));
+    let worker_progress = progress.clone();
+    let worker = std::thread::spawn(move || {
+        files::execute_with(
+            &scope,
+            &plan,
+            true,
+            &worker_cancelled,
+            &files::Hooks {
+                progress: Some(&worker_progress),
+                ..Default::default()
+            },
+        )
+    });
     while !worker.is_finished() {
-        if target.exists() {
+        if progress
+            .snapshot()
+            .is_some_and(|(_, written, _)| written > 0)
+        {
             cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
             break;
         }
@@ -2012,6 +2056,9 @@ fn cancellation_during_real_copy_reports_partial_destination_without_deleting_it
         "Cancellation must occur while the actual large copy is in progress."
     );
     assert_eq!(result.created, vec![target.canonicalize().unwrap()]);
+    let (_, written, items) = progress.snapshot().unwrap();
+    assert_eq!(written, fs::metadata(&target).unwrap().len());
+    assert_eq!(items, 0);
     assert!(fs::metadata(&target).unwrap().len() < 64 * 1024 * 1024);
     assert_eq!(fs::metadata(source).unwrap().len(), 64 * 1024 * 1024);
     let after = hash_inventory(&fixture.root);
@@ -3386,8 +3433,6 @@ fn plan_across(
     )
 }
 
-fn no_copy_hook(_: &std::path::Path, _: &std::path::Path) {}
-
 #[test]
 fn cross_volume_move_copies_verifies_then_recycles_each_source_as_one_item() {
     let mut fixture = Fixture::new("across-tree");
@@ -3444,7 +3489,7 @@ fn cross_volume_move_copies_verifies_then_recycles_each_source_as_one_item() {
     };
     let hooks = files::Hooks {
         recycle: &recycle,
-        copied: &no_copy_hook,
+        ..Default::default()
     };
     let outcome = journal.execute_with(&scope, &plan, true, &AtomicBool::new(false), &hooks);
     fixture.own(&outcome.created);
@@ -3526,7 +3571,7 @@ fn cross_volume_move_copies_verifies_then_recycles_each_source_as_one_item() {
         &AtomicBool::new(false),
         &files::Hooks {
             recycle: &refuse,
-            copied: &no_copy_hook,
+            ..Default::default()
         },
     );
     fixture.own(&outcome.created);
@@ -3594,6 +3639,7 @@ fn cross_volume_checksum_mismatch_stops_before_recycling_and_keeps_the_source() 
         &files::Hooks {
             recycle: &recycle,
             copied: &corrupt,
+            ..Default::default()
         },
     );
     fixture.own(&outcome.created);
@@ -3656,6 +3702,7 @@ fn cross_volume_source_changed_during_the_copy_keeps_the_original() {
             &files::Hooks {
                 recycle: &recycle,
                 copied: &change,
+                ..Default::default()
             },
         );
         fixture.own(&outcome.created);
@@ -3703,6 +3750,7 @@ fn cross_volume_source_changed_during_the_copy_keeps_the_original() {
         &files::Hooks {
             recycle: &recycle,
             copied: &remove,
+            ..Default::default()
         },
     );
     fixture.own(&outcome.created);
@@ -3743,7 +3791,7 @@ fn cross_volume_skip_and_replace_older_leave_skipped_sources_and_remove_only_emp
     let recycle = |items: &[PathBuf]| bin.recycle(items);
     let hooks = files::Hooks {
         recycle: &recycle,
-        copied: &no_copy_hook,
+        ..Default::default()
     };
     let plan = plan_across(
         &scope,
@@ -3883,7 +3931,7 @@ fn cross_volume_keep_both_renames_and_merges_then_recycles_whole_sources() {
         &AtomicBool::new(false),
         &files::Hooks {
             recycle: &recycle,
-            copied: &no_copy_hook,
+            ..Default::default()
         },
     );
     fixture.own(&outcome.created);
@@ -3956,7 +4004,7 @@ fn cross_volume_without_recycle_bin_copies_verifies_and_keeps_originals() {
         &AtomicBool::new(false),
         &files::Hooks {
             recycle: &recycle,
-            copied: &no_copy_hook,
+            ..Default::default()
         },
     );
     fixture.own(&outcome.created);
@@ -4052,6 +4100,7 @@ fn cross_volume_cancellation_never_removes_originals_not_yet_recycled() {
         &files::Hooks {
             recycle: &recycle,
             copied: &cancel,
+            ..Default::default()
         },
     );
     fixture.own(&outcome.created);
@@ -4102,7 +4151,7 @@ fn cross_volume_recycle_failure_reports_exactly_which_originals_were_kept() {
         &AtomicBool::new(false),
         &files::Hooks {
             recycle: &recycle,
-            copied: &no_copy_hook,
+            ..Default::default()
         },
     );
     fixture.own(&outcome.created);
@@ -4287,7 +4336,7 @@ fn real_second_volume_move_is_planned_and_executed_across_drives() {
         &AtomicBool::new(false),
         &files::Hooks {
             recycle: &recycle,
-            copied: &no_copy_hook,
+            ..Default::default()
         },
     );
     fixture.own(&outcome.created);
@@ -4520,7 +4569,7 @@ fn undo_copy_recycles_only_created_items_and_restores_replaced_originals() {
     let recycle = |items: &[PathBuf]| bin.recycle(items);
     let file_hooks = files::Hooks {
         recycle: &recycle,
-        copied: &no_copy_hook,
+        ..Default::default()
     };
     let hooks = undo::Hooks {
         recycle: &recycle,
@@ -4636,7 +4685,7 @@ fn undo_refuses_changed_results_and_missing_or_ambiguous_recycle_bin_matches() {
     let recycle = |items: &[PathBuf]| bin.recycle(items);
     let file_hooks = files::Hooks {
         recycle: &recycle,
-        copied: &no_copy_hook,
+        ..Default::default()
     };
     let hooks = undo::Hooks {
         recycle: &recycle,
@@ -4782,7 +4831,7 @@ fn undo_same_volume_move_moves_back_recreates_emptied_folders_and_restores_repla
     let recycle = |items: &[PathBuf]| bin.recycle(items);
     let file_hooks = files::Hooks {
         recycle: &recycle,
-        copied: &no_copy_hook,
+        ..Default::default()
     };
     let hooks = undo::Hooks {
         recycle: &recycle,
@@ -4892,7 +4941,7 @@ fn undo_cross_volume_move_restores_originals_then_recycles_verified_copies() {
     let recycle = |items: &[PathBuf]| bin.recycle(items);
     let file_hooks = files::Hooks {
         recycle: &recycle,
-        copied: &no_copy_hook,
+        ..Default::default()
     };
     let hooks = undo::Hooks {
         recycle: &recycle,
@@ -4984,6 +5033,7 @@ fn undo_cross_volume_move_restores_originals_then_recycles_verified_copies() {
         &files::Hooks {
             recycle: &recycle,
             copied: &stop,
+            ..Default::default()
         },
     );
     assert!(outcome.cancelled, "{outcome:?}");
@@ -5035,7 +5085,7 @@ fn undo_cross_volume_move_recycles_copies_only_while_kept_originals_remain() {
     let recycle = |items: &[PathBuf]| bin.recycle(items);
     let file_hooks = files::Hooks {
         recycle: &recycle,
-        copied: &no_copy_hook,
+        ..Default::default()
     };
     let hooks = undo::Hooks {
         recycle: &recycle,
@@ -5224,7 +5274,7 @@ fn undo_partly_recycled_cross_volume_move_restores_recycled_and_checks_kept_orig
     let recycle = |items: &[PathBuf]| bin.recycle(items);
     let file_hooks = files::Hooks {
         recycle: &recycle,
-        copied: &no_copy_hook,
+        ..Default::default()
     };
     let hooks = undo::Hooks {
         recycle: &recycle,
@@ -5298,7 +5348,7 @@ fn undo_delete_restores_from_the_bin_and_keeps_items_whose_original_is_occupied(
     let recycle = |items: &[PathBuf]| bin.recycle(items);
     let file_hooks = files::Hooks {
         recycle: &recycle,
-        copied: &no_copy_hook,
+        ..Default::default()
     };
     let hooks = undo::Hooks {
         recycle: &recycle,
@@ -5750,7 +5800,7 @@ fn ai_batch_runs_approved_steps_as_journaled_operations_and_undoes_a_step_or_the
     let recycle = |items: &[PathBuf]| bin.recycle(items);
     let hooks = files::Hooks {
         recycle: &recycle,
-        copied: &no_copy_hook,
+        ..Default::default()
     };
     let mut seen = Vec::new();
     let report = proposal::execute(

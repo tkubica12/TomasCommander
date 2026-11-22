@@ -454,8 +454,11 @@ impl Ledger {
             .show(ui, |ui| {
                 ui.spacing_mut().item_spacing.y = 6.0;
                 if !self.path_edits[index] {
-                    let (path, edit) =
-                        compact_breadcrumbs(ui, &breadcrumb_paths(&pane.path, self.scope.root()));
+                    let (path, edit) = compact_breadcrumbs(
+                        ui,
+                        &breadcrumb_paths(&pane.path, self.scope.root()),
+                        self.scope.root().is_none(),
+                    );
                     breadcrumb = path;
                     if edit {
                         self.path_edits[index] = true;
@@ -972,7 +975,10 @@ impl Ledger {
         }
         if let Some(path) = breadcrumb {
             self.active = index;
-            self.navigate(index, path, NavVia::Breadcrumb);
+            match path {
+                Breadcrumb::Folder(path) => self.navigate(index, path, NavVia::Breadcrumb),
+                Breadcrumb::Drive(root) => self.choose_drive(index, &root),
+            }
         }
         if let Some((command, via)) = row_command {
             self.dispatch(via, command);
@@ -1169,7 +1175,23 @@ pub(super) fn file_name_label(ui: &mut egui::Ui, rect: egui::Rect, name: &str) -
     response.on_hover_cursor(egui::CursorIcon::Text)
 }
 
-pub(super) fn compact_breadcrumbs(ui: &mut egui::Ui, paths: &[PathBuf]) -> (Option<PathBuf>, bool) {
+pub(super) enum Breadcrumb {
+    Folder(PathBuf),
+    Drive(PathBuf),
+}
+
+fn is_drive_root(path: &Path) -> bool {
+    use std::path::{Component, Prefix};
+    path.parent().is_none()
+        && matches!(path.components().next(), Some(Component::Prefix(prefix))
+            if matches!(prefix.kind(), Prefix::Disk(_) | Prefix::VerbatimDisk(_)))
+}
+
+pub(super) fn compact_breadcrumbs(
+    ui: &mut egui::Ui,
+    paths: &[PathBuf],
+    allow_drives: bool,
+) -> (Option<Breadcrumb>, bool) {
     if paths.is_empty() {
         return (None, false);
     }
@@ -1253,11 +1275,19 @@ pub(super) fn compact_breadcrumbs(ui: &mut egui::Ui, paths: &[PathBuf]) -> (Opti
                     match item {
                         Some(i) if *i == paths.len() => edit |= response.clicked(),
                         Some(i) => {
-                            if response
-                                .on_hover_text(files::display_path(&paths[*i]))
-                                .clicked()
-                            {
-                                clicked = Some(paths[*i].clone());
+                            let path = &paths[*i];
+                            let drive = allow_drives && is_drive_root(path);
+                            let hint = if drive {
+                                "Choose drive".to_owned()
+                            } else {
+                                files::display_path(path)
+                            };
+                            if response.on_hover_text(hint).clicked() {
+                                clicked = Some(if drive {
+                                    Breadcrumb::Drive(path.clone())
+                                } else {
+                                    Breadcrumb::Folder(path.clone())
+                                });
                             }
                         }
                         None => {

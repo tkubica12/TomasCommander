@@ -111,6 +111,7 @@ pub struct Ledger {
     work_results: Receiver<WorkResult>,
     cancellation: Arc<AtomicBool>,
     operation_busy: bool,
+    copy_progress: Option<Arc<files::CopyProgress>>,
     plan: Option<Plan>,
     review: Option<PlanReview>,
     next_id: u64,

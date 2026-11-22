@@ -270,7 +270,7 @@ pub(super) enum Work {
         destination: PathBuf,
         policy: ConflictPolicy,
     },
-    Execute(Plan),
+    Execute(Plan, Option<Arc<files::CopyProgress>>),
     #[cfg(feature = "native-desktop-tests")]
     DesktopRejections(PathBuf),
     Save(Preferences),
@@ -491,6 +491,7 @@ impl Ledger {
     fn finish_operation(&mut self, outcome: Outcome, activity: RecentActivity) {
         self.usage_operation_finished(&outcome);
         self.operation_busy = false;
+        self.copy_progress = None;
         self.history = None;
         self.last_batch = None;
         if let Err(error) = self.recent.record_many(

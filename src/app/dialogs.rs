@@ -671,7 +671,9 @@ impl Ledger {
                 self.inline_pending = None;
                 self.place_edit = edit;
             }
-            if selected.is_some() || pin || close || modal.should_close() {
+            // should_close consumes Escape. Use the same decision for logging and closing.
+            close |= modal.should_close();
+            if selected.is_some() || pin || close {
                 self.usage.outcome(
                     "places",
                     if selected.is_some() || pin {
@@ -681,7 +683,7 @@ impl Ledger {
                     },
                 );
             }
-            if selected.is_some() || close || modal.should_close() {
+            if selected.is_some() || close {
                 self.places_popup = None;
                 self.file_focus_requested = true;
             }
@@ -801,9 +803,11 @@ impl Ledger {
                     }
                     self.usage.operation = Some(pending);
                     self.cancellation.store(false, Ordering::Relaxed);
-                    match self.work.try_send(Work::Execute(plan)) {
+                    let progress = files::CopyProgress::for_plan(&plan).map(Arc::new);
+                    match self.work.try_send(Work::Execute(plan, progress.clone())) {
                         Ok(()) => {
                             self.operation_busy = true;
+                            self.copy_progress = progress;
                             self.log("Executing approved plan...");
                         }
                         Err(error) => {

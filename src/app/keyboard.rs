@@ -22,7 +22,8 @@ impl Ledger {
             }
             return;
         }
-        if self.change_plan.is_some()
+        if self.reader.close_prompt_open()
+            || self.change_plan.is_some()
             || self.zip_dialog.is_some()
             || self.name_dialog.is_some()
             || self.open_with.is_some()

@@ -22,7 +22,7 @@ before the release cleanup.
 ## Download and run
 
 Download `tomas-commander.exe` from [GitHub Releases](https://github.com/tkubica12/TomasCommander/releases).
-The latest version is **v0.9.0**, an experimental Windows x64 release.
+The latest version is **v0.10.0**, an experimental Windows x64 release.
 No installer or Rust toolchain is needed to run the downloaded executable.
 The binary is unsigned; this project does not provide code-signing or support.
 
@@ -43,13 +43,15 @@ The binary is unsigned; this project does not provide code-signing or support.
   exact-path confirmation and durable operation receipts. Copy/Move conflicts
   offer Skip, Replace older, Replace all (originals to the Recycle Bin) or Keep
   both, and same-name folders are merged. Moves across drives copy, verify
-  (CRC-32) and then send originals to the Recycle Bin.
+  (CRC-32) and then send originals to the Recycle Bin. During a copy the status
+  bar shows bytes written, item counts and an estimated time remaining.
 - Reviewed Undo (Ctrl+Shift+U, `/undo` or Operations): the inverse of a recent
   operation is shown as an exact plan before anything changes. It moves items
   back, recycles unchanged results and restores originals from the Recycle Bin
   without overwriting; nothing is undone automatically.
 - Saved locations with editable names and removal, unified Recent activity, compact
-  clickable breadcrumbs and inline filename editing.
+  clickable breadcrumbs and inline filename editing. Click the drive at the
+  start of either pane's path to choose another drive.
 - Recent document and ZIP-file changes in configurable folders (D: and both detected OneDrive
   roots by default), Commander opens/views/saves and best-effort Windows Recent.
   Ctrl+Shift+H toggles the rail, opening on Recent; Places has no dedicated shortcut.
@@ -115,7 +117,8 @@ The binary is unsigned; this project does not provide code-signing or support.
 
 Typing in a file pane goes directly into its filter. Down from the filter
 focuses the first matching file; further arrows navigate the list. Escape clears
-the filter from the field or file list.
+the filter from the field or file list. In a dialog, Escape cancels or closes
+the dialog instead, leaving the pane behind it unchanged.
 Ask has multiline input and slash actions such as `/rename`
 and `/preview`, alongside command-name filtering. Enter runs; Shift+Enter
 inserts a newline. `/ai-search your prompt` starts the read-only Foundry file

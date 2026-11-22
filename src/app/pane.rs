@@ -705,18 +705,22 @@ impl Ledger {
         if self.scope.root() == Some(path.as_path()) {
             self.log("Parent unavailable at fixture boundary.");
         } else if path.parent().is_none() {
-            match platform::logical_drives() {
-                Ok(drives) => {
-                    self.inline_pending = None;
-                    self.rail_index = None;
-                    self.drives_popup = Some(DrivePicker::new(index, drives, &path));
-                }
-                Err(error) => self.fail(error),
-            }
+            self.choose_drive(index, &path);
         } else if let Some(parent) = path.parent() {
             let history = self.panes[index].remember_parent_return();
             self.navigate(index, parent.to_owned(), via);
             self.panes[index].parent_returns = history;
+        }
+    }
+
+    pub(super) fn choose_drive(&mut self, index: usize, root: &Path) {
+        match platform::logical_drives() {
+            Ok(drives) => {
+                self.inline_pending = None;
+                self.rail_index = None;
+                self.drives_popup = Some(DrivePicker::new(index, drives, root));
+            }
+            Err(error) => self.fail(error),
         }
     }
 
